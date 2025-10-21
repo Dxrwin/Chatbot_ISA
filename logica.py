@@ -507,6 +507,55 @@ async def calcular_financiamiento(payload: dict):
         if not linea_producto:
             await error_notify(method_name, linea_producto_notify_error, "Falta 'linea_producto' en el payload")
             raise HTTPException(status_code=400, detail="Debe incluir 'linea_producto' en el payload")
+        
+        # --- PROCESAR SEMESTRE, el dato entra como una palabra ejemplo "segundo semestre" y debe devolver el numero del semestre ---
+        semestre_texto = str(payload.get("semestre_renovación_menu", "")).strip().lower()
+        semestres_map = {
+            "primer semestre": 1,
+            "segundo semestre": 2,
+            "tercer semestre": 3,
+            "cuarto semestre": 4,
+            "quinto semestre": 5,
+            "sexto semestre": 6,
+            "séptimo semestre": 7,
+            #"septimo semestre": 7,   # variante sin tilde
+            "octavo semestre": 8,
+            "noveno semestre": 9,
+            "décimo semestre": 10
+            #"decimo semestre": 10    # variante sin tilde
+        }
+        
+        if not semestre_texto:
+            await error_notify(method_name, linea_producto_notify_error, "Falta 'semestre' en el payload")
+            raise HTTPException(status_code=400, detail="Debe incluir 'semestre' en el payload")
+        
+        numero_semestre = semestres_map.get(semestre_texto)
+        if numero_semestre is None:
+            await error_notify(method_name, linea_producto_notify_error, f"Valor de semestre '{semestre_texto}' no reconocido")
+            raise HTTPException(status_code=400, detail=f"El semestre '{semestre_texto}' no es válido. Use: primer semestre, segundo semestre, etc.")
+
+        # --- PROCESAR PLAZO_VALOR_PAGAR, el dato entra en string y debe devolverse como un numero ---
+        plazo_texto = str(payload.get("plazo_valor_pagar")).strip().lower()
+        plazo_map = {
+            "a un mes": 1,
+            "a dos meses": 2,
+            "a tres meses": 3,
+            "a cuatro meses": 4,
+            "a cinco meses": 5,
+            "a seis meses": 6
+        }
+
+        if not plazo_texto:
+            await error_notify(method_name, linea_producto_notify_error, "Falta 'plazo_valor_pagar' en el payload")
+            raise HTTPException(status_code=400, detail="Debe incluir 'plazo_valor_pagar' en el payload")
+
+        plazo_valor = plazo_map.get(plazo_texto)
+        if plazo_valor is None:
+            await error_notify(method_name, linea_producto_notify_error, f"Valor de plazo '{plazo_texto}' no reconocido")
+            raise HTTPException(status_code=400, detail=f"El plazo '{plazo_texto}' no es válido. Use: a un mes, a dos meses, etc.")
+        
+        logger.info(f"plazo_valor procesado: {plazo_valor} \n")
+        logger.info (f"numero de semestre procesado: {numero_semestre} \n")
 
         # Limpieza y conversión del valor principal
         raw_principal = str(payload.get("principal", "0")).replace(",", "").strip()
@@ -521,8 +570,13 @@ async def calcular_financiamiento(payload: dict):
         porcentaje_cuota = float(porcentaje_str) / 100
 
         # Plazo y frecuencia
-        plazo_escogido = int(payload.get("plazo_escogido", 0))
+        #plazo_escogido = int(payload.get("plazo_escogido", 0))
+        #el plazo procesado de tipo string y transformado a numero es plazo_valor y se le asigna a plazo_escogido para los calculos
+        plazo_escogido = plazo_valor
         payment_frequency = int(payload.get("paymentFrequency", 30))
+        
+        #logger.info (f"plazo escogido para realizar los calculos: {plazo_escogido} \n")
+        
 
         # --- CÁLCULOS INICIALES ---
         valor_cuota_inicial = principal * porcentaje_cuota
@@ -575,6 +629,8 @@ async def calcular_financiamiento(payload: dict):
         valor_solicitar = valor_desembolsar / (1 - aval_porcentaje)
         deducciones_anticipadas = valor_solicitar * aval_porcentaje
 
+        logger.info (f"numero de semestre procesado: {numero_semestre} \n")
+        logger.info(f"plazo_valor_pagar procesado: {plazo_valor} meses \n")
         logger.info("Cálculo completado correctamente.")
 
         return {
@@ -585,7 +641,10 @@ async def calcular_financiamiento(payload: dict):
             "valor_solicitado": valor_solicitar,
             "aval_aplicado_porcentaje": aval_porcentaje,
             "plazo_dias": dias_totales,
-            "porcentaje_escogido": porcentaje_str
+            "porcentaje_escogido": porcentaje_str,
+            "numero_semestre": numero_semestre,
+            "plazo_valor_pagar_meses": plazo_valor,
+            "plazo_escogido_meses": plazo_escogido
         }
 
     except ValueError as e:
@@ -601,139 +660,6 @@ async def calcular_financiamiento(payload: dict):
         logger.error(f"Error interno inesperado: {e}")
         await error_notify(method_name, linea_producto_notify_error, f"Error interno: {e}")
         raise HTTPException(status_code=500, detail="Error interno en el cálculo de financiamiento")
-
-
-
-# # Endpoint para calcular financiamiento version 1
-# @app.post("/calcular_financiamiento")
-# async def calcular_financiamiento(payload: dict):
-#     """
-#     Calcula el financiamiento basado en:
-#     1. Valor de cuota = principal * porcentaje_cuota
-#     2. Días de plazo = plazo_escogido * paymentFrequency
-#     3. Ajusta las cuotas al plazo en meses
-#     """
-    
-#     method_name = "calcular_financiamiento"
-#     linea_producto_notify_error = f"linea_producto para la busqueda del la linea =  {payload.get('linea_producto')}"
-#     try:
-#         logger.info(f"Payload recibido para cálculo: {payload} \n") 
-#         # Procesar el valor principal con manejo de puntos y comas
-#         valor_principal = str(payload.get("principal"))
-#         # Manejar múltiples puntos, mantener solo el último como decimal
-#         partes = valor_principal.split(".")
-#         if len(partes) > 1:
-#             entero = "".join(partes[:-1]).replace(",", "").strip()
-#             decimal = partes[-1].replace(",", "").strip()
-#             valor_principal = f"{entero}.{decimal}"
-#         else:
-#             valor_principal = valor_principal.replace(",", "").strip()
-#         principal = float(valor_principal)
-        
-#         logger.info(f"Valor principal procesado: {principal} \n")
-#         # Extraer y procesar el resto de valores de forma simple
-#         porcentaje_str = str(payload.get("porcentaje_cuota", "0")).replace("%", "").strip()
-#         plazo_escogido = int(str(payload.get("plazo_escogido", "0")).strip())
-#         payment_frequency = int(str(payload.get("paymentFrequency", "30")).strip())
-        
-#         linea_producto = str(payload.get("linea_producto"))
-#         logger.info(f"linea_producto: {linea_producto} \n")
-        
-#         #porcentaje_cuota como decimal
-#         porcentaje_cuota = float(porcentaje_str) / 100
-#         logger.info(f"Porcentaje de cuota procesado: {porcentaje_cuota} \n")
-#         # valor cuota inicial
-#         valor_cuota_inicial = principal * porcentaje_cuota
-#         logger.info(f"Valor cuota inicial calculado: {valor_cuota_inicial} \n")
-#         # 2. Calcular días totales de plazo
-#         dias_totales = plazo_escogido * payment_frequency
-#         logger.info(f"Días totales de plazo calculados: {dias_totales} \n")
-        
-#         if not linea_producto:
-#             raise HTTPException(status_code=400, detail="Falta la propiedad 'linea_producto' en el payload")
-        
-#         async with httpx.AsyncClient() as client:
-#             # Extraer el token y crear nuevo payload
-#             token = await obtener_token(client)
-#             # Consultar API externa Kuenta
-#             KUENTA_URL = f"https://api.kuenta.co/v1/products/{linea_producto}"
-#             async with httpx.AsyncClient(timeout= 30.0) as client:
-#                 # Obtener token una sola vez
-#                 headers = {
-#                 "Config-Organization-ID": ORG_ID,
-#                 "Organization-ID": ORG_ID,
-#                 "Authorization": token
-#                 }
-                
-#                 response = await client.get(KUENTA_URL, headers=headers)
-#                 response.raise_for_status()
-#                 response = response.json()
-                
-#                 logger.info(f"Respuesta de la api Kuenta para línea de producto {linea_producto}: {response} \n")
-            
-#         # Validar el ID del producto
-#         product = response.get("data").get("product")
-#         logger.info(f"Producto obtenido de Kuenta: {product} \n")
-#         if product.get("ID") != linea_producto:
-#             raise HTTPException(status_code=404, detail="El ID de la línea de producto no coincide")
-        
-#         # Buscar el porcentaje de Aval
-#         aval_porcentaje = None
-#         for cost in product.get("costs", []):
-#             if cost.get("label") == "Aval":
-#                 aval_porcentaje = float(str(cost.get("percentage", "0")))
-#                 break
-            
-#         if aval_porcentaje is None:
-#             raise HTTPException(status_code=404, detail="No se encontró el porcentaje de Aval en la respuesta de Kuenta")
-        
-#         # --- 5. Aplicar fórmulas de la calculadora ---
-        
-#         # Valor a desembolsar = Valor del producto - Cuota inicial
-#         valor_desembolsar = principal - valor_cuota_inicial
-        
-#         # Valor a solicitar = Valor a desembolsar / (1 - porcentaje de deducciones)
-#         if (1 - aval_porcentaje) == 0:
-#             raise ValueError("El porcentaje de aval no puede ser 100%.")
-#         valor_solicitar = valor_desembolsar / (1 - aval_porcentaje)
-        
-#         # Deducciones anticipadas = Valor a solicitar * porcentaje de deducciones
-#         deducciones_anticipadas = valor_solicitar * aval_porcentaje
-        
-#         logger.info("------ CÁLCULO REALIZADO CON ÉXITO ------")
-#         logger.info(f"Valor del Producto: {valor_principal}")
-#         logger.info(f"Cuota Inicial: {valor_cuota_inicial}")
-#         logger.info(f"Valor a Desembolsar (Neto): {valor_desembolsar}")
-#         logger.info(f"Deducciones Anticipadas (Aval): {deducciones_anticipadas}")
-#         logger.info(f"Valor a Solicitar (Monto del crédito): {valor_solicitar}")
-        
-
-#         return {
-#             "valor_producto": principal,
-#             "cuota_inicial": valor_cuota_inicial,
-#             "valor_desembolsar": valor_desembolsar,
-#             "deducciones_anticipadas": deducciones_anticipadas,
-#             "valor_solicitado": valor_solicitar,
-#             "aval_aplicado_porcentaje": aval_porcentaje,
-#             "plazo_dias": dias_totales,
-#             "porcentaje_escogido": porcentaje_str
-#         }
-        
-
-#     except ValueError as e:
-#         logger.error(f"Error en la conversión de datos: {str(e)}")
-#         await error_notify(method_name, linea_producto_notify_error, f"Error en la respuesta de la API externa kuenta: {str(e)}")
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Error en los datos. Verifique que los valores numéricos sean válidos"
-#         )
-#     except Exception as e:
-#         logger.error(f"Error en el cálculo: {str(e)}")
-#         await error_notify(method_name, linea_producto_notify_error, f"Error en el cálculo: {str(e)}")
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Error en el cálculo: {str(e)}"
-#         )
 
 
 # Nuevo endpoint para consultar el estado de un pago usando creditid, installmentid y orderid
