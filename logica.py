@@ -404,9 +404,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
         async with httpx.AsyncClient() as client:
             
-            logger.info(f"+++++ Parámetros recibidos: client_id={client_id} ++++++++,\n")
+            logger.info(f"+++++ Parámetros recibidos: client_id= ++++++++, \n {client_id} \n")
             
-            logger.info(f"#####---Payload original ----#### \n {payload} \n")
+            logger.info(f"#####--- Payload entrante ----#### \n {payload} \n")
             
             principal = payload.principal
             initial_fee = payload.initialFee
@@ -423,7 +423,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "initialFee": initial_fee,
                 "paymentFrequency": payload.paymentFrequency
             }
-            logger.info(f"Payload para el post a kuenta: {new_payload} \n")
+            logger.info(f"Payload para saliente para el post a kuenta: \n {new_payload} \n")
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": client_id,
@@ -461,7 +461,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)  # espera exponencial
             # Si no se logró en los reintentos
-            await error_notify(method_name, client_id, f"Error de conexión tras: {max_retries} intentos o respuesta no válida ---- {str(e)}")
+            await error_notify(method_name, client_id, f"Error de conexión tras: {max_retries} intentos o respuesta no válida")
             raise HTTPException(status_code=502, detail=f"Error de conexión tras {max_retries} intentos o respuesta no válida")
         
     except ValueError as e:
@@ -500,10 +500,11 @@ async def calcular_financiamiento(payload: dict):
     linea_producto_notify_error = f"línea_producto={payload.get('linea_producto')}"
 
     try:
-        logger.info(f"Payload recibido: {payload} \n")
+        logger.info(f"###--- Payload recibido: ###---  \n {payload} \n")
 
         # --- VALIDACIONES DE ENTRADA ---
         linea_producto = payload.get("linea_producto")
+        logger.info(f"linea_producto recibido: {linea_producto} \n")
         if not linea_producto:
             await error_notify(method_name, linea_producto_notify_error, "Falta 'linea_producto' en el payload")
             raise HTTPException(status_code=400, detail="Debe incluir 'linea_producto' en el payload")
@@ -558,12 +559,15 @@ async def calcular_financiamiento(payload: dict):
         logger.info (f"numero de semestre procesado: {numero_semestre} \n")
 
         # Limpieza y conversión del valor principal
-        raw_principal = str(payload.get("principal", "0")).replace(",", "").strip()
-        if not raw_principal.isdigit():
+        raw_principal = str(payload.get("principal", "0")).strip()
+        # Eliminar todos los puntos y comas del número
+        cleaned_principal = raw_principal.replace(",", "").replace(".", "")
+        
+        if not cleaned_principal.isdigit():
             await error_notify(method_name, linea_producto_notify_error, f"El valor principal '{raw_principal}' no es numérico válido")
             raise ValueError(f"El valor principal '{raw_principal}' no es numérico válido")
 
-        principal = float(raw_principal)
+        principal = float(cleaned_principal)
 
         # Porcentaje de cuota (sin símbolo %)
         porcentaje_str = str(payload.get("porcentaje_cuota", "0")).replace("%", "").strip()
@@ -611,6 +615,8 @@ async def calcular_financiamiento(payload: dict):
         if product_data.get("ID") != linea_producto:
             await error_notify(method_name, linea_producto_notify_error, "El ID del producto no coincide")
             raise HTTPException(status_code=404, detail="El ID del producto no coincide")
+        
+        logger.info(f"ID  del producto obtenido: {product_data.get("ID")} \n")
 
         aval_porcentaje = next(
             (float(str(c.get("percentage", 0))) for c in product_data.get("costs", []) if c.get("label") == "Aval"),
@@ -619,7 +625,7 @@ async def calcular_financiamiento(payload: dict):
         if aval_porcentaje is None:
             await error_notify(method_name, linea_producto_notify_error, "No se encontró porcentaje de Aval en el producto")
             raise HTTPException(status_code=404, detail="No se encontró porcentaje de Aval en el producto")
-
+        logger.info(f"Porcentaje de Aval obtenido de la linea: {aval_porcentaje}% \n")
         # --- CÁLCULOS FINALES ---
         valor_desembolsar = principal - valor_cuota_inicial
         if (1 - aval_porcentaje) == 0:
@@ -628,11 +634,29 @@ async def calcular_financiamiento(payload: dict):
 
         valor_solicitar = valor_desembolsar / (1 - aval_porcentaje)
         deducciones_anticipadas = valor_solicitar * aval_porcentaje
-
-        logger.info (f"numero de semestre procesado: {numero_semestre} \n")
+        
+        # --- FORMATEO PARA DEMOSTRACIÓN ---
+        demostracion_valor_producto = f"${principal:,.0f}"
+        demostracion_cuota_inicial = f"${valor_cuota_inicial:,.0f}"
+        demostracion_valor_desembolsar = f"${valor_desembolsar:,.0f}"
+        demostracion_deducciones = f"${deducciones_anticipadas:,.0f}"
+        demostracion_valor_solicitar = f"${valor_solicitar:,.0f}"
+        
+        logger.info (f"numero de semestre procesado: {numero_semestre} semestre \n")
         logger.info(f"plazo_valor_pagar procesado: {plazo_valor} meses \n")
-        logger.info("Cálculo completado correctamente.")
-
+        
+        logger.info(f"----- Resumen de cálculos realizados ----- \n")
+        logger.info(f"Valor del producto (principal): {demostracion_valor_producto} \n")
+        logger.info(f"Cuota inicial (valor_cuota_inicial): {demostracion_cuota_inicial} \n")
+        logger.info(f"Valor a desembolsar (valor_desembolsar): {demostracion_valor_desembolsar} \n")
+        logger.info(f"Deducciones anticipadas (deducciones_anticipadas): {demostracion_deducciones} \n")
+        logger.info(f"Valor a solicitar (valor_solicitar): {demostracion_valor_solicitar} \n")
+        logger.info(f"Aval aplicado porcentaje (aval_porcentaje): {aval_porcentaje} \n")
+        logger.info(f"Plazo en días (plazo_dias): {dias_totales} \n")
+        logger.info(f"Porcentaje escogido (porcentaje_str): {porcentaje_str}% \n")
+        
+        logger.info("Cálculo completado correctamente. \n")
+        logger.info("-------------fin de la ejecución------------------ \n")
         return {
             "valor_producto": principal,
             "cuota_inicial": valor_cuota_inicial,
@@ -644,7 +668,14 @@ async def calcular_financiamiento(payload: dict):
             "porcentaje_escogido": porcentaje_str,
             "numero_semestre": numero_semestre,
             "plazo_valor_pagar_meses": plazo_valor,
-            "plazo_escogido_meses": plazo_escogido
+            "plazo_escogido_meses": plazo_escogido,
+            
+            # Agregar valores formateados para demostración
+            "valor_producto_demostracion": demostracion_valor_producto,
+            "cuota_inicial_demostracion": demostracion_cuota_inicial,
+            "valor_desembolsar_demostracion": demostracion_valor_desembolsar,
+            "deducciones_anticipadas_demostracion": demostracion_deducciones,
+            "valor_solicitado_demostracion": demostracion_valor_solicitar
         }
 
     except ValueError as e:
@@ -678,13 +709,17 @@ async def obtener_estado(debtor_id:str,request: Request):
         installmentid = body.get("installmentid")
         orderid = body.get("orderid")
         debtor_id_notify_error = f"debtor_id_cliente =  {debtor_id} y creditid = {creditid}"
+        logger.info(f"+++++ Parámetros recibidos en el body: creditid= ++++++++, \n {creditid} \n")
+        logger.info(f"+++++ Parámetros recibidos en el body: installmentid= ++++++++, \n {installmentid} \n")
+        logger.info(f"+++++ Parámetros recibidos en el body: orderid= ++++++++, \n {orderid} \n")
+        
 
         if not creditid or not installmentid or not orderid:
             raise HTTPException(status_code=400, detail="Faltan parámetros obligatorios: creditid, installmentid, orderid")
 
         url = f"https://api.kuenta.co/v1/payable/{creditid}/installment/0/order/list/{orderid}"
         intentos = 3
-        intervalo_segundos = 15
+        intervalo_segundos = 10
         intento = 0
 
         logger.info(f"Parámetros recibidos: creditid={creditid}, installmentid={installmentid}, orderid={orderid}")
@@ -715,8 +750,8 @@ async def obtener_estado(debtor_id:str,request: Request):
                     logger.info(f"Intento {intento}: status del pago = {status}")
                     
                     if status != "pending":
-                        logger.info(f"Estado final obtenido: {status} en el intento {intento}")
-                        logger.info(f"Respuesta completa: {data}")
+                        logger.info(f"Estado final obtenido: {status} en el intento {intento} \n")
+                        logger.info(f"Respuesta completa: {data} \n")
                         return data
                     
                 except Exception as e:
