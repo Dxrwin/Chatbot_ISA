@@ -35,6 +35,7 @@ AUTH_URL = os.getenv("AUTH_URL")
 API_URL = os.getenv("API_URL")
 ORG_ID = os.getenv("ORG_ID")
 PAYABLE_URL = os.getenv("PAYABLE_URL")
+GET_PAYABLE_URL = os.getenv("GET_PAYABLE_URL")
 
 #print("variables de entorno cargadas: \n AUTH_PAYLOAD: {AUTH_PAYLOAD} \n AUTH_URL: {AUTH_URL} \n API_URL: {API_URL} \n ORG_ID: {ORG_ID} \n PAYABLE_URL: {PAYABLE_URL} \n")
 
@@ -116,134 +117,6 @@ async def obtener_token(client: httpx.AsyncClient):
     print("Nuevo token obtenido exitosamente.")
     return TOKEN_DATA["access_token"]
 
-# Endpoint para obtener información del crédito y calcular días en mora
-@app.post("/info_credito_mora")
-async def obtener_info_credito(request: ClienteRequest = Body(...)):
-    """
-    Obtiene información del crédito y calcula días en mora por cuota.
-    """
-    
-    async with httpx.AsyncClient() as client:
-        id_credito = request.id_cliente
-        token = await obtener_token(client)
-        
-        url = f"https://api.kuenta.co/v1/receivable/{id_credito}"
-        
-        
-        headers = {
-            "Authorization": token,
-            "Config-Organization-ID": ORG_ID,
-            "Organization-ID": ORG_ID
-        }
-        
-        try:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            #logging.info(f"Respuesta de la API: {data.get("data").get("credit")} \n")
-        except Exception as e:
-            logger.error(f"Error al obtener crédito: {e}")
-            raise HTTPException(status_code=500, detail="Error al obtener información del crédito")
-    
-    principal = data.get("data").get("credit").get("principal")
-    logging.info(f"principal: {principal} \n")
-    
-    fecha_inicio_credito = data.get("data").get("credit").get("startedAt")
-    
-    reference = data.get("data").get("credit").get("reference")
-    logging.info(f"reference: {reference} \n")
-    
-    installments = data.get("data").get("credit").get("installments")
-    logging.info(f"installments: {installments} \n")
-    
-    summary = data.get("data").get("credit").get("summary")
-    logging.info(f"summary: {summary} \n")
-    
-    cuotas_str = ""
-    total_cuotas = 0
-    
-    cuotas_vencidas = []
-    
-    for cuota in installments:
-        status = cuota.get("status")
-        if status in [3]:  # 3 = pendiente, 4 = vencida
-            total_cuotas += 1
-            created_at_str = cuota.get("date")
-            
-            # Formatear fecha a dd/mm/yy
-            fecha_formateada = ""
-            if created_at_str:
-                fecha_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-                fecha_formateada = fecha_dt.strftime("%d/%m/%y")
-                
-            estado = "CUOTA VENCIDA" if status == 4 else "CUOTA PENDIENTE"
-            
-            # Formatear valores numéricos
-            payment = cuota.get("payment")
-            payment_str = f"{round(payment):,}".replace(",", ".") if payment is not None else "N/A"
-            
-            
-            cuotas_vencidas.append({
-            "id": cuota.get("id"),
-            "createdAt": fecha_formateada,
-            "estatus": estado,
-            "payment": payment_str,
-            "dias de intereses en mora":cuota.get("debtInterestDays")
-            })
-            cuotas_str += (
-                
-                f"   //== Cuota número: {total_cuotas}, Estado: {estado} , Valor a pagar: {payment_str}, Fecha de creación: {fecha_formateada} , Días de intereses en mora: {cuota.get('debtInterestDays')} "
-                " ==//---------------   "
-                "----------------------------------------------------------------------------------------------     "
-            )
-    if cuotas_vencidas:
-        cuotas_cache[id_credito] = {
-            "timestamp": datetime.now(timezone.utc),
-            "cuotas": cuotas_vencidas
-        }
-            
-    # Buscar la cuota más reciente por createdAt
-    cuota_reciente = None
-    if installments:
-        cuota_reciente = max(
-            installments,
-            key=lambda c: datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
-        )
-        
-    # Formatear datos de la cuota más reciente
-    cuota_reciente_id = cuota_reciente.get("id") if cuota_reciente else None
-    cuota_reciente_created = cuota_reciente.get("date") if cuota_reciente else None 
-    cuota_reciente_payment = cuota_reciente.get("payment") if cuota_reciente else None
-    cuota_reciente_payment_str = f"{round(cuota_reciente_payment):,}".replace(",", ".") if cuota_reciente_payment is not None else "N/A"
-    cuota_reciente_fecha = ""
-    if cuota_reciente_created:
-        fecha_dt = datetime.fromisoformat(cuota_reciente_created.replace("Z", "+00:00"))
-        cuota_reciente_fecha = fecha_dt.strftime("%d/%m/%y")
-
-    # Formatear valores principales
-    principal_str = f"{round(principal):,}".replace(",", ".") if principal is not None else "N/A"
-    valor_mora_str = f"{round(summary.get('debt')):,}".replace(",", ".") if summary.get("debt") is not None else "N/A"
-    valor_balance_str = f"{round(summary.get('balance')):,}".replace(",", ".") if summary.get("balance") is not None else "N/A"
-    valor_pagado_str = f"{round(summary.get('paid')):,}".replace(",", ".") if summary.get("paid") is not None else "N/A"
-    
-    
-    return {
-        "reference_credito": reference,
-        "fwcha_inicio_credito": fecha_inicio_credito,
-        "valor total del credito": principal_str,
-        "total_cuotas_vencidas_pendientes": total_cuotas,
-        "valor total de mora": valor_mora_str,
-        "dias en mora": summary.get("debtDays"),
-        "valor total por pagar": valor_balance_str,
-        "valor total pagado": valor_pagado_str,
-        "detalle_cuotas_vencidas": cuotas_str.strip(),
-        "cuotas_vencidas_pendientes": cuotas_vencidas,
-        "cuota_mas_reciente_por_pagar": {
-            "id": cuota_reciente_id,
-            "createdAt": cuota_reciente_fecha,
-            "payment": cuota_reciente_payment_str,
-        }
-    }
 
 
 # Endpoint para obtener detalles de una cuota específica desde la caché
@@ -387,6 +260,9 @@ async def webhook_product_lines(parent_id: str):
         await error_notify(method_name, parent_id_notify_error, f"Error general: {e}")
         raise HTTPException(status_code=500, detail=f"Error general: {e}")
 
+def format_currency(value: float) -> str:
+    """Formatea un número como moneda COP: sin decimales, con $ y separadores de miles."""
+    return f"${value:,.0f}"
 
 # Endpoint para crear un nuevo payable o credito despues de la simulacion
 @app.post("/payable/{client_id}")
@@ -412,11 +288,13 @@ async def create_payable(client_id: str, payload: PayableRequest):
             initial_fee = payload.initialFee
             
             token = await obtener_token(client)
+            #token = "v2.public.eyJjbGllbnQiOiIwNDY4Mzc1Yi0wYzAyLTQxNDMtYmY2NS03Njc0NDk3MTA0NmYiLCJjdHgiOiJ1c2VyIiwiZXhwIjoiMjAyNS0xMC0yOVQxNjo0MjowOS0wNTowMCIsImp0aSI6IjRhODExMmJlLWRmOWEtNDBmNC1iYTU1LTU1Y2ZiYzFmZGUzNyIsInNlc3Npb24iOiI3MDhjZGYzNi1kZmI5LTQ4M2MtODRiMy1iYTlhZTNiZGM2MDIiLCJ0eXBlIjoiYXV0aCIsInVzZXIiOiJlODI5YTY3NC04MDE3LTRhYWEtYTJlNy00MjI1YWEyOGFjZTMiLCJ2ZXJpZmllZCI6InRydWUifdxXSkJr8ChbO7Hoea_4eCj0OEuNMOvLj6Xqt2gfX92iqdwJsjhAK-cznEbl8i0jon-F1nLf8WNtGzBCQa6ucQQ.bnVsbA"
             
             logger.info(f"Token de autorización extraído: {token} \n")
             
             new_payload = {
                 "creditLineID": payload.creditLineID,
+                #"creditLineID": "97c6a459-a86c-4e01-bfa1-7b3e21acddf3",
                 "principal": principal,
                 "time": payload.time,
                 "disbursementMethod": payload.disbursementMethod,
@@ -427,6 +305,8 @@ async def create_payable(client_id: str, payload: PayableRequest):
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": client_id,
+                #"Config-Organization-ID":"c269cfcc-0c9c-43e3-bef0-9e95d42ca309",
+                #"Organization-ID":"c8c90e3e-f2a6-4caa-8254-a1403b4416d3",
                 "Authorization": token
             }
             logger.info(f"Iniciando petición POST a {PAYABLE_URL}")
@@ -434,21 +314,163 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
             max_retries = 3
             for attempt in range(max_retries):
+                
                 try:
                     response = await client.post(
                         PAYABLE_URL,
+                        #f"https://demo-api.kuenta.co/v1/payable",
                         json=new_payload,
                         headers=headers
                     )
                     status_code = response.status_code
                     logger.info(f"Intento {attempt+1}: status_code={status_code}")
                     if status_code == 201:
-                        logger.info("Petición completada exitosamente")
+                        #logger.info("Petición completada exitosamente")
                         # Si hay contenido, retorna el JSON, si no retorna vacío
-                        try:
-                            return response.json()
+                            logger.info("Procesando respuesta de Kuenta")
+                            response_data = response.json()
+                            credit = response_data.get("data", {}).get("credit", {})
+                            
+                            # ID credito
+                            response_credit_id = credit.get("ID")
+                            logger.info(f"ID del crédito creado: {response_credit_id} \n")
+                            #return response_data
                         
-                        except httpx.HTTPStatusError as e:
+                    try:
+                            # url en demo
+                            #url = GET_PAYABLE_URL + response_credit_id
+                            #print("url de la simulacion es: ", url)
+                            
+                            #url en produccion
+                            url_prod = f"https://api.kuenta.co/v1/payable/{response_credit_id}"
+                            # Realizar la consulta GET
+                            response_get_simulacion = await client.get(url_prod, headers=headers)
+                            status_code_simulacion = response_get_simulacion.status_code
+                            
+                            logger.info(f"Status code de la simulación: {status_code_simulacion}")
+                            
+                            
+                            if status_code_simulacion == 200 or status_code_simulacion == 201:
+                                simulacion_data = response_get_simulacion.json()
+                                installments = simulacion_data.get("data", {}).get("credit", {}).get("installments", [])
+                                cuota_inicial = simulacion_data.get("data", {}).get("credit", {}).get("initialFee")
+
+                                if installments:
+                                    # Tomar el primer installment
+                                    first_installment = installments[0]
+                
+                                    # Extraer y redondear valores
+                                    payment = round(float(first_installment.get("payment", 0)))
+                                    capital = round(float(first_installment.get("capital", 0)))
+                                    interest = round(float(first_installment.get("interest", 0)))
+                                    costs = round(float(first_installment.get("costs", 0)))
+                                    taxes = round(float(first_installment.get("taxes", 0)))
+                                    
+                                    # cuota inicial redondeada
+                                    cuota_inicial_rounded = round(float(cuota_inicial))
+
+                                    # Formatear valores para lectura humana
+                                    formatted_values = {
+                                        "payment_formatted": f"${payment:,}",
+                                        "capital_formatted": f"${capital:,}",
+                                        "interest_formatted": f"${interest:,}",
+                                        "costs_formatted": f"${costs:,}",
+                                        "taxes_formatted": f"${taxes:,}",
+                                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
+                                    }
+
+                                    # Agregar valores originales y formateados a la respuesta
+                                    response_data.update({
+                                        "ID del crédito creado": response_credit_id,
+                                        "valores_originales": {
+                                            "payment": payment,
+                                            "capital": capital,
+                                            "interest": interest,
+                                            "costs": costs,
+                                            "taxes": taxes
+                                        },
+                                        "valores_formateados": {
+                                            "payment_formatted": formatted_values["payment_formatted"],
+                                            "capital_formatted": formatted_values["capital_formatted"],
+                                            "interest_formatted": formatted_values["interest_formatted"],
+                                            "costs_formatted": formatted_values["costs_formatted"],
+                                            "taxes_formatted": formatted_values["taxes_formatted"],
+                                            "cuota_inicial_formatted": formatted_values["cuota_inicial_formatted"]
+                                        }
+                                    })
+
+                                    logger.info("Valores extraídos y formateados exitosamente")
+                                    logger.info(f"Valores formateados: {formatted_values}")
+                
+                                    return response_data
+                                else:
+                                    logger.error("No se encontraron installments en la respuesta")
+                                    raise HTTPException(status_code=404, detail="No se encontraron cuotas en la simulación")
+                
+                            else:
+                                logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
+                                raise HTTPException(status_code=status_code_simulacion, 
+                                                detail="Error al consultar la simulación")
+                            
+                            # credit = response_data.get("data", {}).get("credit", {})
+                            # logger.info(f"Credit data obtenido: {credit} \n")
+                            # # ID credito
+                            # response_credit_id = credit.get("ID", "N/A")
+                            # logger.info(f"ID del crédito creado: {response_credit_id} \n")
+                            # #debtor id
+                            # response_debtor_id = credit.get("debtorID", "N/A")
+                            # logger.info(f"ID del deudor asociado: {response_debtor_id} \n")
+                            # # creditLine id
+                            # response_creditline_id = credit.get("creditLine").get("ID", "N/A")
+                            # logger.info(f"ID de la línea de crédito asociada: {response_creditline_id} \n")
+                            # # cedula cliente
+                            # response_cedula = credit.get("debtorProfile").get("entity").get("idNumber")
+                            # logger.info(f"Cédula del cliente asociado: {response_cedula} \n")
+                            # # referencia 
+                            # response_referencia = credit.get("reference")
+                            # logger.info(f"Referencia del crédito creado: {response_referencia} \n")
+                            # # valor total del crédito
+                            # response_valor_total = float(credit.get("summary").get("capital"))
+                            # logger.info(f"Valor total del crédito creado: {response_valor_total} \n")
+                            # # cuota inicial
+                            # response_cuota_inicial = float(credit.get("initialFee"))
+                            # logger.info(f"Valor de la cuota inicial del crédito creado: {response_cuota_inicial} \n")
+                            
+
+                            # # --- EXTRAER EL PRIMER INSTALLMENT ---
+                            # installments = credit.get("installments")
+                            # logger.info(f"Installments obtenidas: {installments} \n")
+                            # if not installments:
+                            #     raise ValueError("No se encontraron cuotas (installments) en la respuesta de Kuenta")
+
+                            # first_installment = installments[0]
+
+                            # # --- EXTRAER Y FORMATEAR LOS 5 CAMPOS ---
+                            # payment_val = float(first_installment.get("payment", 0))
+                            # capital_val = float(first_installment.get("capital", 0))
+                            # interest_val = float(first_installment.get("interest", 0))
+                            # costs_val = float(first_installment.get("costs", 0))
+                            # taxes_val = float(first_installment.get("taxes", 0))
+                            
+                            # logger.info(f"Valores extraídos - payment: {payment_val}, capital: {capital_val}, interest: {interest_val}, costs: {costs_val}, taxes: {taxes_val} \n")
+
+                            # # --- CREAR OBJETO CON VALORES FORMATEADOS (FÁCIL DE MAPEAR) ---
+                            # formatted_values = {
+                            #     "payment_formateado": format_currency(payment_val),
+                            #     "capital_formateado": format_currency(capital_val),
+                            #     "interest_formateado": format_currency(interest_val),
+                            #     "costs_formateado": format_currency(costs_val),
+                            #     "taxes_formateado": format_currency(taxes_val),
+                            # }
+                            # logger.info(f"Valores formateados para respuesta: {formatted_values} \n")
+
+                            # # --- AGREGAR AL RESPONSE PARA QUE EL FLUJO LO PUEDA MAPEAR ---
+                            # # Opción 1: Agregar al nivel raíz (recomendado para mapeo simple)
+                            # response_data.update(formatted_values)
+
+                            #     # Opción 2 (alternativa): Agregar dentro de data.credit si prefieres
+                            #     # response_data["data"]["credit"].update(formatted_values) 
+                    except httpx.HTTPStatusError as e:
                             await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {str(e)}")
                             logger.error(f"Intento {attempt+1}: Error en la respuesta de la API externa kuenta: {e.response.status_code}")
                     else:
@@ -776,3 +798,199 @@ async def get_logs(limit: int = 20):
     """
     return {"count": len(get_cached_logs(limit)), "logs": get_cached_logs(limit)}
 
+
+# ### endpoints para flujo en cobranzas ###
+
+
+# # Endpoint para obtener información del crédito y calcular días en mora
+# @app.post("/info_credito_mora")
+# async def obtener_info_credito(request: ClienteRequest = Body(...)):
+#     """
+#     Obtiene información del crédito y calcula días en mora por cuota.
+#     """
+    
+#     async with httpx.AsyncClient() as client:
+#         id_credito = request.id_cliente
+#         token = await obtener_token(client)
+        
+#         url = f"https://api.kuenta.co/v1/receivable/{id_credito}"
+        
+        
+#         headers = {
+#             "Authorization": token,
+#             "Config-Organization-ID": ORG_ID,
+#             "Organization-ID": ORG_ID
+#         }
+        
+#         try:
+#             response = await client.get(url, headers=headers)
+#             response.raise_for_status()
+#             data = response.json()
+#             #logging.info(f"Respuesta de la API: {data.get("data").get("credit")} \n")
+#         except Exception as e:
+#             logger.error(f"Error al obtener crédito: {e}")
+#             raise HTTPException(status_code=500, detail="Error al obtener información del crédito")
+    
+#     principal = data.get("data").get("credit").get("principal")
+#     logging.info(f"principal: {principal} \n")
+    
+#     fecha_inicio_credito = data.get("data").get("credit").get("startedAt")
+    
+#     reference = data.get("data").get("credit").get("reference")
+#     logging.info(f"reference: {reference} \n")
+    
+#     installments = data.get("data").get("credit").get("installments")
+#     logging.info(f"installments: {installments} \n")
+    
+#     summary = data.get("data").get("credit").get("summary")
+#     logging.info(f"summary: {summary} \n")
+    
+#     cuotas_str = ""
+#     total_cuotas = 0
+    
+#     cuotas_vencidas = []
+    
+#     for cuota in installments:
+#         status = cuota.get("status")
+#         if status in [3]:  # 3 = pendiente, 4 = vencida
+#             total_cuotas += 1
+#             created_at_str = cuota.get("date")
+            
+#             # Formatear fecha a dd/mm/yy
+#             fecha_formateada = ""
+#             if created_at_str:
+#                 fecha_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+#                 fecha_formateada = fecha_dt.strftime("%d/%m/%y")
+                
+#             estado = "CUOTA VENCIDA" if status == 4 else "CUOTA PENDIENTE"
+            
+#             # Formatear valores numéricos
+#             payment = cuota.get("payment")
+#             payment_str = f"{round(payment):,}".replace(",", ".") if payment is not None else "N/A"
+            
+            
+#             cuotas_vencidas.append({
+#             "id": cuota.get("id"),
+#             "createdAt": fecha_formateada,
+#             "estatus": estado,
+#             "payment": payment_str,
+#             "dias de intereses en mora":cuota.get("debtInterestDays")
+#             })
+#             cuotas_str += (
+                
+#                 f"   //== Cuota número: {total_cuotas}, Estado: {estado} , Valor a pagar: {payment_str}, Fecha de creación: {fecha_formateada} , Días de intereses en mora: {cuota.get('debtInterestDays')} "
+#                 " ==//---------------   "
+#                 "----------------------------------------------------------------------------------------------     "
+#             )
+#     if cuotas_vencidas:
+#         cuotas_cache[id_credito] = {
+#             "timestamp": datetime.now(timezone.utc),
+#             "cuotas": cuotas_vencidas
+#         }
+            
+#     # Buscar la cuota más reciente por createdAt
+#     cuota_reciente = None
+#     if installments:
+#         cuota_reciente = max(
+#             installments,
+#             key=lambda c: datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
+#         )
+        
+#     # Formatear datos de la cuota más reciente
+#     cuota_reciente_id = cuota_reciente.get("id") if cuota_reciente else None
+#     cuota_reciente_created = cuota_reciente.get("date") if cuota_reciente else None 
+#     cuota_reciente_payment = cuota_reciente.get("payment") if cuota_reciente else None
+#     cuota_reciente_payment_str = f"{round(cuota_reciente_payment):,}".replace(",", ".") if cuota_reciente_payment is not None else "N/A"
+#     cuota_reciente_fecha = ""
+#     if cuota_reciente_created:
+#         fecha_dt = datetime.fromisoformat(cuota_reciente_created.replace("Z", "+00:00"))
+#         cuota_reciente_fecha = fecha_dt.strftime("%d/%m/%y")
+
+#     # Formatear valores principales
+#     principal_str = f"{round(principal):,}".replace(",", ".") if principal is not None else "N/A"
+#     valor_mora_str = f"{round(summary.get('debt')):,}".replace(",", ".") if summary.get("debt") is not None else "N/A"
+#     valor_balance_str = f"{round(summary.get('balance')):,}".replace(",", ".") if summary.get("balance") is not None else "N/A"
+#     valor_pagado_str = f"{round(summary.get('paid')):,}".replace(",", ".") if summary.get("paid") is not None else "N/A"
+    
+    
+#     return {
+#         "reference_credito": reference,
+#         "fwcha_inicio_credito": fecha_inicio_credito,
+#         "valor total del credito": principal_str,
+#         "total_cuotas_vencidas_pendientes": total_cuotas,
+#         "valor total de mora": valor_mora_str,
+#         "dias en mora": summary.get("debtDays"),
+#         "valor total por pagar": valor_balance_str,
+#         "valor total pagado": valor_pagado_str,
+#         "detalle_cuotas_vencidas": cuotas_str.strip(),
+#         "cuotas_vencidas_pendientes": cuotas_vencidas,
+#         "cuota_mas_reciente_por_pagar": {
+#             "id": cuota_reciente_id,
+#             "createdAt": cuota_reciente_fecha,
+#             "payment": cuota_reciente_payment_str,
+#         }
+#     }
+
+
+# @app.get("/creditos-en-mora")
+# async def creditos_en_mora(cedula: str):
+#     """
+#     Endpoint que recibe cédula, consulta créditos en mora (status=10),
+#     y retorna lista estructurada o error.
+#     """
+#     if not cedula or not cedula.isdigit():
+#         return JSONResponse(
+#             status_code=400,
+#             content={"error": True, "mensaje": "Cédula inválida", "codigo": "cedula_invalida"}
+#         )
+
+#     try:
+#         token = get_token()
+#         url = f"https://api.example.com/v1/receivables?offset=0&limit=3&status=10&q={cedula}"
+#         headers = {"Authorization": f"Bearer {token}"}
+        
+#         response = requests.get(url, headers=headers, timeout=15)
+        
+#         if response.status_code == 404:
+#             return JSONResponse(
+#                 status_code=200,
+#                 content={"error": False, "creditos_en_mora": [], "mensaje": "Sin créditos en mora"}
+#             )
+#         elif response.status_code != 200:
+#             logger.error(f"API externa falló: {response.status_code} - {response.text}")
+#             return JSONResponse(
+#                 status_code=200,
+#                 content={"error": True, "mensaje": "Error al consultar créditos", "codigo": "api_externa_fallo"}
+#             )
+
+#         data = response.json()
+#         creditos_mora = []
+
+#         for item in data.get("data", []):
+#             credit = item.get("credit", {})
+#             id_debtor = item.get("id_debtor")
+#             if not id_debtor:
+#                 continue  # Saltar si no tiene id_debtor
+
+#             creditos_mora.append({
+#                 "id_debtor": id_debtor,
+#                 "cedula": cedula,
+#                 "principal": credit.get("principal"),
+#                 "fecha_inicio_credito": credit.get("startedAt"),
+#                 "reference": credit.get("reference"),
+#                 "installments": credit.get("installments")
+#             })
+
+#         # Aquí iría la lógica de caché y base de datos (opcional para el flujo)
+
+#         return JSONResponse(
+#             status_code=200,
+#             content={"error": False, "creditos_en_mora": creditos_mora}
+#         )
+
+#     except Exception as e:
+#         logger.exception("Error inesperado en /creditos-en-mora")
+#         return JSONResponse(
+#             status_code=200,
+#             content={"error": True, "mensaje": "Error interno del sistema", "codigo": "error_interno"}
+#         )
