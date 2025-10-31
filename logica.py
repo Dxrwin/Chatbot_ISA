@@ -412,64 +412,6 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                 raise HTTPException(status_code=status_code_simulacion, 
                                                 detail="Error al consultar la simulación")
                             
-                            # credit = response_data.get("data", {}).get("credit", {})
-                            # logger.info(f"Credit data obtenido: {credit} \n")
-                            # # ID credito
-                            # response_credit_id = credit.get("ID", "N/A")
-                            # logger.info(f"ID del crédito creado: {response_credit_id} \n")
-                            # #debtor id
-                            # response_debtor_id = credit.get("debtorID", "N/A")
-                            # logger.info(f"ID del deudor asociado: {response_debtor_id} \n")
-                            # # creditLine id
-                            # response_creditline_id = credit.get("creditLine").get("ID", "N/A")
-                            # logger.info(f"ID de la línea de crédito asociada: {response_creditline_id} \n")
-                            # # cedula cliente
-                            # response_cedula = credit.get("debtorProfile").get("entity").get("idNumber")
-                            # logger.info(f"Cédula del cliente asociado: {response_cedula} \n")
-                            # # referencia 
-                            # response_referencia = credit.get("reference")
-                            # logger.info(f"Referencia del crédito creado: {response_referencia} \n")
-                            # # valor total del crédito
-                            # response_valor_total = float(credit.get("summary").get("capital"))
-                            # logger.info(f"Valor total del crédito creado: {response_valor_total} \n")
-                            # # cuota inicial
-                            # response_cuota_inicial = float(credit.get("initialFee"))
-                            # logger.info(f"Valor de la cuota inicial del crédito creado: {response_cuota_inicial} \n")
-                            
-
-                            # # --- EXTRAER EL PRIMER INSTALLMENT ---
-                            # installments = credit.get("installments")
-                            # logger.info(f"Installments obtenidas: {installments} \n")
-                            # if not installments:
-                            #     raise ValueError("No se encontraron cuotas (installments) en la respuesta de Kuenta")
-
-                            # first_installment = installments[0]
-
-                            # # --- EXTRAER Y FORMATEAR LOS 5 CAMPOS ---
-                            # payment_val = float(first_installment.get("payment", 0))
-                            # capital_val = float(first_installment.get("capital", 0))
-                            # interest_val = float(first_installment.get("interest", 0))
-                            # costs_val = float(first_installment.get("costs", 0))
-                            # taxes_val = float(first_installment.get("taxes", 0))
-                            
-                            # logger.info(f"Valores extraídos - payment: {payment_val}, capital: {capital_val}, interest: {interest_val}, costs: {costs_val}, taxes: {taxes_val} \n")
-
-                            # # --- CREAR OBJETO CON VALORES FORMATEADOS (FÁCIL DE MAPEAR) ---
-                            # formatted_values = {
-                            #     "payment_formateado": format_currency(payment_val),
-                            #     "capital_formateado": format_currency(capital_val),
-                            #     "interest_formateado": format_currency(interest_val),
-                            #     "costs_formateado": format_currency(costs_val),
-                            #     "taxes_formateado": format_currency(taxes_val),
-                            # }
-                            # logger.info(f"Valores formateados para respuesta: {formatted_values} \n")
-
-                            # # --- AGREGAR AL RESPONSE PARA QUE EL FLUJO LO PUEDA MAPEAR ---
-                            # # Opción 1: Agregar al nivel raíz (recomendado para mapeo simple)
-                            # response_data.update(formatted_values)
-
-                            #     # Opción 2 (alternativa): Agregar dentro de data.credit si prefieres
-                            #     # response_data["data"]["credit"].update(formatted_values) 
                     except httpx.HTTPStatusError as e:
                             await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {str(e)}")
                             logger.error(f"Intento {attempt+1}: Error en la respuesta de la API externa kuenta: {e.response.status_code}")
