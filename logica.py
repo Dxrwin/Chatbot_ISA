@@ -1,12 +1,12 @@
 from fastapi import FastAPI, HTTPException, Body,Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from utils.notify_error import error_notify, get_cached_logs
+from contextlib import asynccontextmanager
+from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
 import httpx
 import logging
 import asyncio
 from fastapi import Request
-#import redis.asyncio as redis
 import time
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -15,7 +15,76 @@ import os
 import json
 load_dotenv()
 
-app = FastAPI()
+#app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manejador de eventos del ciclo de vida del servidor usando el nuevo sistema Lifespan.
+    """
+    try:
+        # Código que se ejecuta al iniciar
+        message = (
+            "🟢 Servidor iniciado correctamente\n"
+            f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+            f"Ambiente: Producción\n"
+            "Estado: ONLINE"
+        )
+        await error_notify(
+            method_name="startup_server",
+            client_id="system",
+            error_message=message
+        )
+        logger.info("Servidor iniciado y notificaciones enviadas correctamente")
+        
+        yield  # El servidor está ejecutándose
+        
+        # Código que se ejecuta al apagar
+        message = (
+            "🔴 Servidor detenido\n"
+            f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+            f"Ambiente: Producción\n"
+            "Estado: OFFLINE"
+        )
+        await error_notify(
+            method_name="shutdown_server",
+            client_id="system",
+            error_message=message
+        )
+        logger.info("Servidor detenido y notificaciones enviadas correctamente")
+        
+    except Exception as e:
+        logger.error(f"Error en el ciclo de vida del servidor: {e}")
+
+# Crear la aplicación FastAPI con el nuevo manejador lifespan
+app = FastAPI(lifespan=lifespan)
+
+# El middleware para detectar reinicios
+@app.middleware("http")
+async def check_server_restart(request: Request, call_next):
+    """
+    Middleware que detecta reinicios del servidor por cambios en el código
+    """
+    try:
+        if not hasattr(app.state, "server_started"):
+            app.state.server_started = True
+            message = (
+                "🔄 Servidor actualizado y reiniciado\n"
+                f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"Ambiente: Producción\n"
+                "Estado: RELOADED"
+            )
+            await error_notify(
+                method_name="server_reload",
+                client_id="system",
+                error_message=message
+            )
+            logger.info("Servidor reiniciado y notificaciones enviadas")
+    except Exception as e:
+        logger.error(f"Error al enviar notificación de reinicio: {e}")
+    
+    return await call_next(request)
 
 # Configuración de logs
 logging.basicConfig(
@@ -68,6 +137,12 @@ class ClienteRequest(BaseModel):
 class DetalleCuotaRequest(BaseModel):
     id_cliente: str
     numero_cuota: int
+    
+# Modelo para probar notificaciones
+class TestNotifyRequest(BaseModel):
+    method_name: str = "test_method"
+    client_id: str = "test_client"
+    message: str = "Mensaje de prueba para notificación"
     
 
 #print("variables de entorno cargadas: \n AUTH_PAYLOAD: {AUTH_PAYLOAD} \n AUTH_URL: {AUTH_URL} \n API_URL: {API_URL} \n ORG_ID: {ORG_ID} \n PAYABLE_URL: {PAYABLE_URL} \n")
@@ -354,6 +429,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                 simulacion_data = response_get_simulacion.json()
                                 installments = simulacion_data.get("data", {}).get("credit", {}).get("installments", [])
                                 cuota_inicial = simulacion_data.get("data", {}).get("credit", {}).get("initialFee")
+                                ID_credito = simulacion_data.get("data", {}).get("credit", {}).get("ID")
+                                referencia_credito = simulacion_data.get("data").get("credit").get("reference")
+                                id_cliente = simulacion_data.get("data").get("credit").get("debtorID")
 
                                 if installments:
                                     # Tomar el primer installment
@@ -401,6 +479,12 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                                     logger.info("Valores extraídos y formateados exitosamente")
                                     logger.info(f"Valores formateados: {formatted_values}")
+                                    
+                                    #notificación informativa a telegram y email
+                                    info_message = f"Crédito creado y regsitrado en kuenta correctamente \n ID del crédito: {ID_credito} \n Referencia del credito :{referencia_credito}\n ID del cliente :{id_cliente} \n Valor total credito:{formatted_values['payment_formatted']}"
+                                    
+                                    # envia notificación informativa (email + telegram) con id para seguimiento
+                                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
                 
                                     return response_data
                                 else:
@@ -415,9 +499,8 @@ async def create_payable(client_id: str, payload: PayableRequest):
                     except httpx.HTTPStatusError as e:
                             await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {str(e)}")
                             logger.error(f"Intento {attempt+1}: Error en la respuesta de la API externa kuenta: {e.response.status_code}")
-                    else:
-                        logger.error(f"status error : {response.status_code}")
-                        await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {response.status_code}")
+                    except Exception as e:
+                        logger.warning(f"No se pudo enviar notificación informativa: {e}")
                         
                 except httpx.HTTPStatusError as e:
                         logger.error(f"Intento {attempt+1}: Error en API externa: {e.response.status_code}")
@@ -502,12 +585,12 @@ async def calcular_financiamiento(payload: dict):
         # --- PROCESAR PLAZO_VALOR_PAGAR, el dato entra en string y debe devolverse como un numero ---
         plazo_texto = str(payload.get("plazo_valor_pagar")).strip().lower()
         plazo_map = {
-            "a un mes": 1,
-            "a dos meses": 2,
-            "a tres meses": 3,
-            "a cuatro meses": 4,
-            "a cinco meses": 5,
-            "a seis meses": 6
+            "1 mes": 1,
+            "2 meses": 2,
+            "3 meses": 3,
+            "4 meses": 4,
+            "5 meses": 5,
+            "6 meses": 6
         }
 
         if not plazo_texto:
@@ -621,6 +704,10 @@ async def calcular_financiamiento(payload: dict):
         
         logger.info("Cálculo completado correctamente. \n")
         logger.info("-------------fin de la ejecución------------------ \n")
+        
+        #notificacion informativa
+        info_message = f"Cálculo de financiamiento realizado correctamente en etapa de simulacion \n ID linea de producto: {linea_producto}"
+        await info_notify(method_name, linea_producto_notify_error, info_message)
         return {
             "valor_producto": principal,
             "cuota_inicial": valor_cuota_inicial,
@@ -732,13 +819,60 @@ async def obtener_estado(debtor_id:str,request: Request):
         raise HTTPException(status_code=500, detail=f"Error en el proceso: {str(e)}")
     
 
+#### endpoints para pruebas de notificaciones ###
+
+# Endpoint que llama a error_notify (envía email + telegram)
+@app.post("/test-notify")
+async def test_notify(payload: TestNotifyRequest = Body(...)):
+    try:
+        result = await error_notify(payload.method_name, payload.client_id, payload.message)
+        return JSONResponse(status_code=200, content={"status": "ok", "result": result})
+    except Exception as e:
+        logger.exception("Error en /test-notify")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
+
+# Endpoint para probar solo envío por email
+@app.post("/test-email")
+async def test_email(payload: TestNotifyRequest = Body(...)):
+    try:
+        result = await send_log_email(payload.method_name, payload.client_id, payload.message)
+        return JSONResponse(status_code=200, content={"status": "ok", "result": result})
+    except Exception as e:
+        logger.exception("Error en /test-email")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
+
+# Endpoint para probar solo envío a Telegram
+@app.post("/test-telegram")
+async def test_telegram(payload: TestNotifyRequest = Body(...)):
+    try:
+        result = await send_log_telegram(payload.method_name, payload.client_id, payload.message)
+        return JSONResponse(status_code=200, content={"status": "ok", "result": result})
+    except Exception as e:
+        logger.exception("Error en /test-telegram")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
+    
+
 @app.get("/logs")
 async def get_logs(limit: int = 20):
     """
     Devuelve los últimos logs enviados (correo + Telegram).
     Se puede consultar por Postman o navegador.
+    Manejo seguro cuando la caché esté vacía o ocurra un error.
     """
-    return {"count": len(get_cached_logs(limit)), "logs": get_cached_logs(limit)}
+    try:
+        logs = await get_cached_logs(limit)
+        if not logs:
+            return {"count": 0, "logs": []}
+        return {"count": len(logs), "logs": logs}
+    except Exception as e:
+        logger.exception("Error al obtener logs desde la caché")
+        # No lanzar excepción para no interrumpir el servidor; devolver estructura vacía
+        return {"count": 0, "logs": []}
+
+
+
+
+
 
 
 # ### endpoints para flujo en cobranzas ###

@@ -1,7 +1,7 @@
 from datetime import datetime
 from fastapi import FastAPI
 import aiosmtplib
-import traceback
+import html
 import asyncio
 from email.mime.text import MIMEText
 import aiohttp
@@ -39,10 +39,8 @@ def get_formatted_datetime():
 
 
 # ENVÍO DE EMAIL
-
 async def send_log_email(method_name: str, client_id: str, error_message: str):
     """Envía el log por correo usando SMTP asincrónico"""
-    trace_id = generate_trace_id()
     date_time = get_formatted_datetime()
 
     message_body = (
@@ -53,7 +51,7 @@ async def send_log_email(method_name: str, client_id: str, error_message: str):
     )
 
     msg = MIMEText(message_body)
-    msg["Subject"] = f"[ERROR LOG] {method_name} - {trace_id}"
+    msg["Subject"] = f"[ERROR LOG] {method_name}"
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
@@ -66,45 +64,111 @@ async def send_log_email(method_name: str, client_id: str, error_message: str):
             username=EMAIL_FROM,
             password=EMAIL_PASSWORD,
         )
-        return {"status": "success", "trace_id": trace_id, "sent_to": EMAIL_TO}
+        return {"status": "success", "sent_to": EMAIL_TO}
     except Exception as e:
-        await error_notify(method_name, client_id, f"Fallo al enviar log por email: {str(e)}")
+        # No llamar a error_notify desde aquí (evita recursión)
         return {"status": "error", "error": str(e)}
 
 
-# ENVÍO A TELEGRAM
+async def send_info_email(method_name: str, client_id: str, info_message: str, entity_id: str = None):
+    """Envía una notificación informativa por correo (asincrónico)."""
+    date_time = get_formatted_datetime()
+    body_lines = [
+        f"--- {method_name} ---",
+        f"--- {date_time} ---",
+        f"--- {method_name} - {client_id} ---",
+        ""
+    ]
+    if entity_id:
+        body_lines.append(f"ID: {entity_id}")
+    body_lines.append(info_message)
+    message_body = "\n".join(body_lines)
+
+    msg = MIMEText(message_body)
+    msg["Subject"] = f"[INFO] {method_name}"
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname=SMTP_SERVER,
+            port=SMTP_PORT,
+            start_tls=True,
+            username=EMAIL_FROM,
+            password=EMAIL_PASSWORD,
+        )
+        return {"status": "success", "sent_to": EMAIL_TO}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    
+
 
 async def send_log_telegram(method_name: str, client_id: str, error_message: str):
-    """Envía un log de error al chat de Telegram"""
-    trace_id = generate_trace_id()
+    """Envía un log de error al chat de Telegram (texto seguro en HTML <pre>)"""
     date_time = get_formatted_datetime()
     message = (
-        f"🚨 *LOG DE ERROR*\n\n"
-        f"*Método:* {method_name}\n"
-        f"*Fecha:* {date_time}\n"
-        f"*Cliente:* {client_id}\n\n"
-        f"*Error:* {error_message}"
+        f"🚨 LOG DE ERROR\n\n"
+        f"Método: {method_name}\n"
+        f"Fecha: {date_time}\n"
+        f"Cliente: {client_id}\n\n"
+        f"Error:\n{error_message}"
     )
 
+    # Escapar HTML y enviar dentro de <pre> para evitar problemas de parseo
+    message_html = f"<pre>{html.escape(message)}</pre>"
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message_html, "parse_mode": "HTML"}
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    return {"status": "success", "trace_id": trace_id}
+                    return {"status": "success"}
                 else:
                     error_text = await response.text()
                     return {"status": "error", "error": error_text}
     except Exception as e:
-        await error_notify(method_name, client_id, f"Fallo al enviar log a Telegram: {str(e)}")
+        # No llamar a error_notify desde aquí (evita recursión)
         return {"status": "error", "error": str(e)}
 
 
+async def send_info_telegram(method_name: str, client_id: str, info_message: str, entity_id: str = None):
+    """Envía una notificación informativa a Telegram."""
+    date_time = get_formatted_datetime()
+    header = "✅ NOTIFICACIÓN INFORMATIVA"
+    message_lines = [
+        header,
+        f"Método: {method_name}",
+        f"Fecha: {date_time}",
+        f"Cliente: {client_id}",
+    ]
+    if entity_id:
+        message_lines.append(f"ID: {entity_id}")
+    message_lines.append("")
+    message_lines.append(info_message)
+
+    message = "\n".join(message_lines)
+    message_html = f"<pre>{html.escape(message)}</pre>"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message_html, "parse_mode": "HTML"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    return {"status": "success"}
+                else:
+                    error_text = await response.text()
+                    return {"status": "error", "error": error_text}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    
+
 
 # FUNCIÓN CENTRAL DE NOTIFICACIÓN DE ERRORES
-
 async def error_notify(method_name: str, client_id: str, error_message: str):
     """
     Función central que envía el log a correo y Telegram de forma asíncrona.
@@ -114,10 +178,10 @@ async def error_notify(method_name: str, client_id: str, error_message: str):
         #trace_id = f"TRACE-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
     # Añadimos traceback si se desea (opcional)
-    tb = traceback.format_exc()
-    if "NoneType: None" not in tb and tb.strip():
-        # si hay traceback que no sea vacío, lo agregamos
-        error_message = f"{error_message}\n\nTraceback:\n{tb}"
+    # tb = traceback.format_exc()
+    # if "NoneType: None" not in tb and tb.strip():
+    #     # si hay traceback que no sea vacío, lo agregamos
+    #     error_message = f"{error_message}\n\nTraceback:\n{tb}"
 
     # Ejecutar envíos en paralelo
     
@@ -146,16 +210,37 @@ async def error_notify(method_name: str, client_id: str, error_message: str):
 
     return {"results": normalized}
 
+async def info_notify(method_name: str, client_id: str, info_message: str, entity_id: str = None):
+    """
+    Envía notificación informativa por email y telegram en paralelo.
+    Guarda registro en cache con tipo "info".
+    """
+    results = await asyncio.gather(
+        send_info_email(method_name, client_id, info_message, entity_id),
+        send_info_telegram(method_name, client_id, info_message, entity_id),
+        return_exceptions=True
+    )
 
-# ENDPOINT DE TESTEO MANUAL
+    normalized = []
+    for r in results:
+        if isinstance(r, Exception):
+            normalized.append({"status": "error", "error": str(r)})
+        else:
+            normalized.append(r)
 
-@app.get("/test-notification")
-async def test_notification():
-    """Endpoint para probar manualmente el envío de logs"""
+    # Guardar en cache como informativo
+    _save_to_cache({
+        "timestamp": get_formatted_datetime(),
+        "type": "info",
+        "method": method_name,
+        "client_id": client_id,
+        "entity_id": entity_id,
+        "message": info_message[:250] + ("..." if len(info_message) > 250 else ""),
+        "results": normalized,
+    })
 
-    #retornar logs en cache
-    result = await get_cached_logs(10)
-    return {"message": "Test de notificación ejecutado", "result": result}
+    return {"results": normalized}
+
 
 
 # ======================================================
@@ -167,6 +252,7 @@ def _save_to_cache(log_entry: dict):
     if len(LOG_CACHE) > CACHE_LIMIT:
         LOG_CACHE.pop(0)
 
-def get_cached_logs(limit: int = 50):
-    """Devuelve los últimos logs almacenados."""
-    return LOG_CACHE[-limit:]
+async def get_cached_logs(limit: int = 50):
+    """Devuelve los últimos logs almacenados (async para poder usar await)."""
+    # devolver copia para evitar mutaciones externas
+    return LOG_CACHE[-limit:].copy()
