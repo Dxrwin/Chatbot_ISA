@@ -11,6 +11,7 @@ import time
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import re
 import os
 import json
 load_dotenv()
@@ -85,6 +86,16 @@ async def check_server_restart(request: Request, call_next):
         logger.error(f"Error al enviar notificación de reinicio: {e}")
     
     return await call_next(request)
+
+# Mensajes amigables para el cliente
+MENSAJES_CLIENTE = {
+    "error_conexion": "Lo sentimos, en este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
+    "error_datos": "Los valores ingresados no son válidos. Por favor verifica que el monto y la cuota inicial sean números válidos.",
+    "error_servicio": "En este momento nuestro servicio no está disponible. Por favor intenta más tarde.",
+    "error_simulacion": "No pudimos completar la simulación de tu crédito. Por favor verifica los datos e intenta nuevamente.",
+    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crédito. Por favor intenta nuevamente.",
+    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente más tarde."
+}
 
 # Configuración de logs
 logging.basicConfig(
@@ -269,12 +280,15 @@ async def webhook_product_lines(parent_id: str):
     parent_id_notify_error = f"parent_id para la busqueda del la linea={parent_id}"
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            #Obtener token (una sola vez)
             access_token = await obtener_token(client)
             if not access_token:
                 msg = "No se pudo obtener el token de acceso"
                 await error_notify(method_name, parent_id_notify_error, msg)
-                raise HTTPException(status_code=401, detail=msg)
+                return {
+                    "estado": "error",
+                    "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                    "detalles_usuario": "No se pudo obtener el token de acceso. Por favor intenta nuevamente más tarde."
+                }
 
             headers = {
                 "Config-Organization-ID": ORG_ID,
@@ -282,7 +296,6 @@ async def webhook_product_lines(parent_id: str):
                 "Authorization": f"{access_token}"
             }
 
-            #Intentar la consulta a la API externa con reintentos
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     response = await client.get(API_URL, headers=headers)
@@ -290,7 +303,6 @@ async def webhook_product_lines(parent_id: str):
                     data = response.json()
                     lines = data.get("data", {}).get("lines", [])
 
-                    # Buscar la línea
                     for line in lines:
                         if line.get("parentId") == parent_id:
                             logger.info(f"Línea encontrada: {line}")
@@ -304,36 +316,52 @@ async def webhook_product_lines(parent_id: str):
                                 "timeMax": line.get("timeMax"),
                             }
 
-                    # Si no hay coincidencia
                     msg = f"No se encontró la línea con parentId: {parent_id}"
                     await error_notify(method_name, parent_id_notify_error, msg)
-                    raise HTTPException(status_code=404, detail=msg)
+                    return {
+                        "estado": "error",
+                        "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                        "detalles_usuario": "No se encontró la línea de producto solicitada. Por favor verifica el código o intenta más tarde."
+                    }
 
                 except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
                     logger.warning(f"Intento {attempt}/{MAX_RETRIES} fallido por timeout o conexión: {e}")
                     if attempt == MAX_RETRIES:
-                        raise
-                    await asyncio.sleep(RETRY_DELAY * attempt)  # reintento exponencial
+                        return {
+                            "estado": "error",
+                            "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                            "detalles_usuario": "No se pudo conectar con el servicio externo. Por favor intenta nuevamente más tarde."
+                        }
+                    await asyncio.sleep(RETRY_DELAY * attempt)
 
                 except httpx.HTTPStatusError as e:
-                    # Si la API devuelve error, registrar y romper
                     logger.error(f"Error HTTP {e.response.status_code} en API externa: {e.response.text}")
                     await error_notify(method_name, parent_id_notify_error, f"Error en API externa: {e.response.text}")
                     if 500 <= e.response.status_code < 600 and attempt < MAX_RETRIES:
-                        # Reintentar en errores 5xx
                         await asyncio.sleep(RETRY_DELAY * attempt)
                         continue
-                    raise
+                    return {
+                        "estado": "error",
+                        "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                        "detalles_usuario": "El servicio externo no está disponible. Por favor intenta más tarde."
+                    }
 
-            # Si todos los intentos fallan
             msg = "Error persistente al consultar API externa"
             await error_notify(method_name, parent_id_notify_error, msg)
-            raise HTTPException(status_code=502, detail="Error persistente al consultar API externa")
+            return {
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                "detalles_usuario": "No se pudo obtener respuesta del servicio externo. Por favor intenta más tarde."
+            }
 
     except Exception as e:
         logger.error(f"Error general en webhook_product_lines: {e}")
         await error_notify(method_name, parent_id_notify_error, f"Error general: {e}")
-        raise HTTPException(status_code=500, detail=f"Error general: {e}")
+        return {
+            "estado": "error",
+            "mensaje": MENSAJES_CLIENTE["error_general"],
+            "detalles_usuario": "Ocurrió un error inesperado. Por favor intenta nuevamente más tarde."
+        }
 
 def format_currency(value: float) -> str:
     """Formatea un número como moneda COP: sin decimales, con $ y separadores de miles."""
@@ -514,24 +542,117 @@ async def create_payable(client_id: str, payload: PayableRequest):
     except ValueError as e:
         logger.error(f"Error de conversión de datos: {str(e)}")
         await error_notify(method_name, client_id, f"Error de conversión de datos: {str(e)}")
-        raise HTTPException(
+        return JSONResponse(
             status_code=400,
-            detail="Error en la conversión de datos. Asegúrate que principal y initialFee sean números válidos"
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_datos"],
+                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
+            }
         )
         
     except httpx.RequestError as e:
         logger.error(f"Error de conexión: {str(e)}")
         await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Error de conexión: {str(e)}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
+            }
+        )
     
     except httpx.HTTPStatusError as e:
         logger.error(f"Error en API externa: {e.response}")
         await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
-        raise HTTPException(status_code=e.response.status_code, detail=f"Error en API externa: {e.response.text}")
+        return JSONResponse(
+            status_code=e.response.status_code,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                "detalles_usuario": "Por favor intenta más tarde o contacta a nuestro servicio al cliente."
+            }
+        )
     except Exception as e:
         logger.error(f"Error interno: {str(e)}")
         await error_notify(method_name, client_id, f"Error interno: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_general"],
+                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
+            }
+        )
+
+
+#manejar diferentes casos de entrada para el valor "principal" y extraer solo los números
+def limpiar_valor_principal(raw_principal: str) -> float:
+    """
+    Limpia y extrae el valor numérico de una cadena que contiene un monto.
+    
+    Args:
+        raw_principal (str): Cadena con el valor principal en diferentes formatos
+        
+    Returns:
+        float: Valor numérico extraído
+        
+    Raises:
+        ValueError: Si no se puede extraer un valor numérico válido
+    """
+    if not raw_principal:
+        raise ValueError("El valor principal no puede estar vacío")
+
+    # Convertir a string y eliminar espacios
+    valor = str(raw_principal).strip().lower()
+
+    # Casos de entrada posibles:
+    # "$2500000"
+    # "$2.000.000"
+    # "quiero financiar 2500000"
+    # "el valor seria 2500000"
+    # "seria de 2.500.000"
+    # "necesito 2,500,000 pesos"
+    # "$ 2,500,000.00"
+    # "2500000 COP"
+    # "COP 2.500.000"
+    # "2'500.000"
+    # "2millones500mil"
+    # "dos millones quinientos mil"
+
+    # Eliminar caracteres especiales y texto común
+    palabras_a_eliminar = [
+        'cop', 'pesos', 'valor', 'seria', 'de', 'quiero', 
+        'financiar', 'necesito', 'el', 'aproximadamente',
+        'como', 'cerca', 'millones', 'mil'
+    ]
+    
+    for palabra in palabras_a_eliminar:
+        valor = valor.replace(palabra, '')
+
+    # Eliminar símbolos monetarios y caracteres especiales
+    valor = re.sub(r'[$ \'"]', '', valor)
+
+    # Convertir puntos y comas usados como separadores de miles
+    valor = valor.replace('.', '')
+    valor = valor.replace(',', '')
+
+    # Extraer solo dígitos
+    numeros = re.findall(r'\d+', valor)
+    
+    if not numeros:
+        raise ValueError(f"No se pudo extraer un valor numérico de: {raw_principal}")
+
+    # Unir todos los números encontrados
+    valor_limpio = ''.join(numeros)
+    
+    try:
+        return float(valor_limpio)
+    except ValueError as e:
+        raise ValueError(f"No se pudo convertir a número: {valor_limpio}") from e
+
+# Ejemplo de uso:
 
 #calcular financiamineto version 2
 @app.post("/calcular_financiamiento")
@@ -605,16 +726,12 @@ async def calcular_financiamiento(payload: dict):
         logger.info(f"plazo_valor procesado: {plazo_valor} \n")
         logger.info (f"numero de semestre procesado: {numero_semestre} \n")
 
-        # Limpieza y conversión del valor principal
-        raw_principal = str(payload.get("principal", "0")).strip()
-        # Eliminar todos los puntos y comas del número
-        cleaned_principal = raw_principal.replace(",", "").replace(".", "")
-        
-        if not cleaned_principal.isdigit():
-            await error_notify(method_name, linea_producto_notify_error, f"El valor principal '{raw_principal}' no es numérico válido")
-            raise ValueError(f"El valor principal '{raw_principal}' no es numérico válido")
-
-        principal = float(cleaned_principal)
+        try:
+            raw_principal = str(payload.get("principal", "0"))
+            principal = limpiar_valor_principal(raw_principal)
+        except ValueError as e:
+            await error_notify(method_name, linea_producto_notify_error, f"Error en el valor principal: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Error en el valor principal: {str(e)}")
 
         # Porcentaje de cuota (sin símbolo %)
         porcentaje_str = str(payload.get("porcentaje_cuota", "0")).replace("%", "").strip()
@@ -705,6 +822,17 @@ async def calcular_financiamiento(payload: dict):
         logger.info("Cálculo completado correctamente. \n")
         logger.info("-------------fin de la ejecución------------------ \n")
         
+        
+        MENSAJES_USUARIO = {
+            "valor_invalido": "El monto ingresado no es válido. Por favor ingresa un valor numérico, por ejemplo: 2500000 o $2.500.000",
+            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no está disponible en este momento. Por favor intenta nuevamente más tarde.",
+            "semestre_invalido": "El semestre ingresado no es válido. Por favor selecciona una opción entre 'primer semestre' y 'décimo semestre'.",
+            "plazo_invalido": "El plazo seleccionado no es válido. Por favor escoge entre 1 y 6 meses.",
+            "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
+            "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
+            "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
+        }
+        
         #notificacion informativa
         info_message = f"Cálculo de financiamiento realizado correctamente en etapa de simulacion \n ID linea de producto: {linea_producto}"
         await info_notify(method_name, linea_producto_notify_error, info_message)
@@ -732,16 +860,37 @@ async def calcular_financiamiento(payload: dict):
     except ValueError as e:
         logger.error(f"Error de datos: {e}")
         await error_notify(method_name, linea_producto_notify_error, f"Error de datos: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        #raise HTTPException(status_code=400, detail=str(e))
+        return {
+                "estado": "error",
+                "mensaje": MENSAJES_USUARIO["valor_invalido"],
+                "detalles_usuario": "Por favor verifica el valor del monto a financiar."
+            }
 
     except HTTPException as e:
+        mensaje_usuario = MENSAJES_USUARIO["datos_faltantes"]
+        if "semestre" in str(e.detail):
+            mensaje_usuario = MENSAJES_USUARIO["semestre_invalido"]
+        elif "plazo" in str(e.detail):
+            mensaje_usuario = MENSAJES_USUARIO["plazo_invalido"]
+        elif "línea_producto" in str(e.detail):
+            mensaje_usuario = MENSAJES_USUARIO["linea_no_existe"]
+            
         await error_notify(method_name, linea_producto_notify_error, e.detail)
-        raise
+        return {
+            "estado": "error",
+            "mensaje": mensaje_usuario,
+            "detalles_usuario": "Si el problema persiste, por favor comunícate con nuestro servicio al cliente."
+        }
 
     except Exception as e:
         logger.error(f"Error interno inesperado: {e}")
         await error_notify(method_name, linea_producto_notify_error, f"Error interno: {e}")
-        raise HTTPException(status_code=500, detail="Error interno en el cálculo de financiamiento")
+        return {
+            "estado": "error", 
+            "mensaje": MENSAJES_USUARIO["error_conexion"],
+            "detalles_usuario": "Nuestro equipo técnico ha sido notificado del inconveniente."
+        }
 
 
 # Nuevo endpoint para consultar el estado de un pago usando creditid, installmentid y orderid
