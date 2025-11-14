@@ -1,30 +1,56 @@
-import os
-import json
-from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Optional, Dict, Any
 
-load_dotenv()
+class Settings(BaseSettings):
+    """
+    Configuraciones de la aplicación, cargadas desde variables de entorno (.env)
+    Pydantic maneja automáticamente la carga de .env, la validación de tipos
+    e incluso el parseo de JSON strings a diccionarios.
+    """
+    
+    # --- Configuración de Correo (de mi versión anterior) ---
+    SMTP_SERVER: str = Field(..., env="SMTP_SERVER")
+    SMTP_PORT: int = Field(465, env="SMTP_PORT")
+    SMTP_USER: str = Field(..., env="SMTP_USER")
+    SMTP_PASS: str = Field(..., env="SMTP_PASS")
+    
+    # --- Configuración de Base de Datos (de mi versión anterior) ---
+    DB_HOST: str = Field("localhost", env="DB_HOST")
+    DB_USER: str = Field("root", env="DB_USER")
+    DB_PASS: str = Field(..., env="DB_PASS")
+    DB_NAME: str = Field(..., env="DB_NAME")
 
-# Cargar variables de entorno desde .env
-AUTH_PAYLOAD_PROD_STR = os.getenv("AUTH_PAYLOAD_PROD") or "{}"
-AUTH_PAYLOAD_DEMO_STR = os.getenv("AUTH_PAYLOAD_DEMO") or "{}"
+    # --- Nuevas variables de tu config.py (simples) ---
+    AUTH_URL: Optional[str] = Field(None, env="AUTH_URL")
+    API_URL: Optional[str] = Field(None, env="API_URL")
+    ORG_ID: Optional[str] = Field(None, env="ORG_ID")
+    PAYABLE_URL: Optional[str] = Field(None, env="PAYABLE_URL")
+    GET_PAYABLE_URL: Optional[str] = Field(None, env="GET_PAYABLE_URL")
 
-try:
-    AUTH_PAYLOAD_PROD = json.loads(AUTH_PAYLOAD_PROD_STR)
-except Exception:
-    AUTH_PAYLOAD_PROD = {}
+    # --- Nuevas variables de tu config.py (JSON parseadas) ---
+    AUTH_PAYLOAD_PROD: Dict[str, Any] = Field(default_factory=dict, env="AUTH_PAYLOAD_PROD")
+    AUTH_PAYLOAD_DEMO: Dict[str, Any] = Field(default_factory=dict, env="AUTH_PAYLOAD_DEMO")
 
-try:
-    AUTH_PAYLOAD_DEMO = json.loads(AUTH_PAYLOAD_DEMO_STR)
-except Exception:
-    AUTH_PAYLOAD_DEMO = {}
+    # --- CAMPOS QUE FALTABAN (LOS "EXTRA") ---
+    # Los agrego aquí para que Pydantic los reconozca.
+    # Asumo que son strings y obligatorios (usa Optional[str] = None si no lo son).
+    email_from: str = Field(..., env="email_from")
+    email_to: str = Field(..., env="email_to")
+    email_password: str = Field(..., env="email_password")
+    telegram_bot_token: str = Field(..., env="telegram_bot_token")
+    telegram_chat_id: str = Field(..., env="telegram_chat_id")
+    
 
-AUTH_URL = os.getenv("AUTH_URL")
-API_URL = os.getenv("API_URL")
-ORG_ID = os.getenv("ORG_ID")
-PAYABLE_URL = os.getenv("PAYABLE_URL")
-GET_PAYABLE_URL = os.getenv("GET_PAYABLE_URL")
+    class Config:
+        # Nombre del archivo del cual cargar las variables
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-# Variables globales para el token y su expiración (compartidas)
+# --- Instancia Única de Configuración ---
+settings = Settings()
+
+# --- Estado Global (separado de la configuración estática) ---
 TOKEN_DATA = {
     "access_token": None,
     "refresh_token": None,

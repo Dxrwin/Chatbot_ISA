@@ -3,20 +3,36 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
+from utils.enviar_correo_IA import procesar_webhook
+from models.models import WebhookPayload
 import httpx
 import logging
 import asyncio
 from fastapi import Request
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
+from utils.config import settings, TOKEN_DATA
 from dotenv import load_dotenv
 import re
-import os
-import json
-load_dotenv()
+#import os
+# import json
+# load_dotenv()
 
 #app = FastAPI()
+class ExtractedVariables(BaseModel):
+    estado: Optional[bool] = None
+    resumen: Optional[str] = None
+    mensaje: Optional[str] = None
+    interes_renovar: Optional[str] = None
+    comentario_libre: Optional[str] = None
+    link_enviado_sms: Optional[str] = None
+    contesto_llamada: Optional[bool] = None
+    correo_cliente: Optional[str] = None
+
+class SendEmailRequest(BaseModel):
+    extracted_variables: ExtractedVariables
+    destinatario: Optional[str] = None  # Email principal (opcional)
 
 
 @asynccontextmanager
@@ -105,17 +121,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Cargar variables de entorno desde .env
-AUTH_PAYLOAD_PROD_STR = os.getenv("AUTH_PAYLOAD_PROD")
-AUTH_PAYLOAD_DEMO_STR = os.getenv("AUTH_PAYLOAD_DEMO")
+# AUTH_PAYLOAD_PROD_STR = os.getenv("AUTH_PAYLOAD_PROD")
+# AUTH_PAYLOAD_DEMO_STR = os.getenv("AUTH_PAYLOAD_DEMO")
 
-AUTH_PAYLOAD_PROD = json.loads(AUTH_PAYLOAD_PROD_STR)
-AUTH_PAYLOAD_DEMO = json.loads(AUTH_PAYLOAD_DEMO_STR)
+# Pydantic ya los parseó como diccionarios
+AUTH_PAYLOAD_PROD = settings.AUTH_PAYLOAD_PROD 
+AUTH_PAYLOAD_DEMO = settings.AUTH_PAYLOAD_DEMO
 
-AUTH_URL = os.getenv("AUTH_URL")
-API_URL = os.getenv("API_URL")
-ORG_ID = os.getenv("ORG_ID")
-PAYABLE_URL = os.getenv("PAYABLE_URL")
-GET_PAYABLE_URL = os.getenv("GET_PAYABLE_URL")
+# Y las otras variables también
+AUTH_URL = settings.AUTH_URL
+API_URL = settings.API_URL
+ORG_ID = settings.ORG_ID
+PAYABLE_URL = settings.PAYABLE_URL
+GET_PAYABLE_URL = settings.GET_PAYABLE_URL
 
 #print("variables de entorno cargadas: \n AUTH_PAYLOAD: {AUTH_PAYLOAD} \n AUTH_URL: {AUTH_URL} \n API_URL: {API_URL} \n ORG_ID: {ORG_ID} \n PAYABLE_URL: {PAYABLE_URL} \n")
 
@@ -154,9 +172,7 @@ class TestNotifyRequest(BaseModel):
     method_name: str = "test_method"
     client_id: str = "test_client"
     message: str = "Mensaje de prueba para notificación"
-    
 
-#print("variables de entorno cargadas: \n AUTH_PAYLOAD: {AUTH_PAYLOAD} \n AUTH_URL: {AUTH_URL} \n API_URL: {API_URL} \n ORG_ID: {ORG_ID} \n PAYABLE_URL: {PAYABLE_URL} \n")
 
 # Función para obtener o refrescar el token
 async def obtener_token(client: httpx.AsyncClient):
@@ -999,7 +1015,38 @@ async def test_telegram(payload: TestNotifyRequest = Body(...)):
     except Exception as e:
         logger.exception("Error en /test-telegram")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
+
+
+# Endpoint para enviar correo de renovación de crédito con validaciones
+@app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraídas.",tags=["Correo_post_llamada"])
+async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
+    """
+    Endpoint principal que recibe el payload del webhook.
+
+    1.  Valida automáticamente el payload contra el modelo `WebhookPayload`.
+    2.  Llama al servicio `procesar_webhook` para manejar toda la lógica.
+    3.  Retorna una respuesta JSON.
+    """
+    try:
+        logging.info(f"Webhook recibido. Procesando para: {payload.input_variables.NOMBRE_TITULAR} \n")
+        
+        logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
+        # Delega toda la lógica al servicio
+        resultado = await procesar_webhook(payload)
+        
+        logging.info(f"Procesamiento completado para: {payload.input_variables.NOMBRE_TITULAR}")
+        return {"status": "success", "message": "Webhook procesado", "data": resultado}
+
+    except Exception as e:
+        logging.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
+        # Lanza una excepción HTTP que FastAPI convertirá en una respuesta de error
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error interno del servidor: {str(e)}"
+        )
+
     
+
 
 @app.get("/logs")
 async def get_logs(limit: int = 20):
