@@ -8,7 +8,11 @@ class InputVariables(BaseModel):
     Define la estructura y tipos de las variables de entrada.
     """
     NOMBRE_TITULAR: Optional[str] = None
+    Nombre: Optional[str] = None
     CORREO: Optional[str] = None
+    Contacto:Optional[str] = None
+    Universidad: Optional[str] = None
+    EMAIL: Optional[str] = None
     PHONE_NUMBER: Optional[str] = Field(None, alias="PHONE_NUMBER") # Mapea el alias
     SEMESTRE: Optional[int] = None
     LINEA_CREDITO: Optional[str] = None
@@ -29,9 +33,15 @@ class ExtractedVariables(BaseModel):
     mensaje: Optional[str] = None
     interes_renovar: Optional[str] = None
     comentario_libre: Optional[str] = None
-    link_enviado_sms: Optional[bool] = None
     contesto_llamada: Optional[bool] = None
+    calidad_llamada: Optional[str] = None
+    mensaje: Optional[str] = None
     correo_cliente: Optional[str] = None
+    primer_name: Optional[str] = None
+    desicion_correo: Optional[bool] = None
+    ambiguedad:Optional[bool] = None
+    objetivo: Optional[str] = None
+    interessolicitud: Optional[str] = None
     
     # Permite campos adicionales
     class Config:

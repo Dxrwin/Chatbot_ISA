@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
-from utils.enviar_correo_IA import procesar_webhook
+from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar
 from models.models import WebhookPayload
 import httpx
 import logging
@@ -15,6 +15,13 @@ from datetime import datetime, timezone, timedelta
 from utils.config import settings, TOKEN_DATA
 from dotenv import load_dotenv
 import re
+import aiomysql
+        
+# Obtener parámetros de configuración DE LA BASE DE DATOS
+db_host = settings.DB_HOST
+db_user = settings.DB_USER
+db_pass = settings.DB_PASSWORD_RENOVACION
+db_name = settings.DB_NAME_RENOVACION
 #import os
 # import json
 # load_dotenv()
@@ -33,6 +40,12 @@ class ExtractedVariables(BaseModel):
 class SendEmailRequest(BaseModel):
     extracted_variables: ExtractedVariables
     destinatario: Optional[str] = None  # Email principal (opcional)
+
+
+class RenovacionPayload(BaseModel):
+    estado_final_renovacion: str
+    estado_pago_payvalida: str
+    nombre_cliente: str
 
 
 @asynccontextmanager
@@ -120,9 +133,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cargar variables de entorno desde .env
-# AUTH_PAYLOAD_PROD_STR = os.getenv("AUTH_PAYLOAD_PROD")
-# AUTH_PAYLOAD_DEMO_STR = os.getenv("AUTH_PAYLOAD_DEMO")
 
 # Pydantic ya los parseó como diccionarios
 AUTH_PAYLOAD_PROD = settings.AUTH_PAYLOAD_PROD 
@@ -1031,8 +1041,18 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         logging.info(f"Webhook recibido. Procesando para: {payload.input_variables.NOMBRE_TITULAR} \n")
         
         logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
-        # Delega toda la lógica al servicio
-        resultado = await procesar_webhook(payload)
+        
+        # Lógica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
+        if payload.extracted_variables.objetivo == "webinar":
+            logging.info("El objetivo es 'webinar'. Llamando a procesar_webhook_webinar.")
+            resultado = await procesar_webhook_webinar(payload)
+            logging.info(f"Procesamiento completado para webinar: {payload.input_variables.NOMBRE_TITULAR}")
+            return {"status": "success", "message": "Webhook de webinar procesado", "data": resultado}
+        
+        elif payload.extracted_variables.objetivo == "renovacion":
+            logging.info("El objetivo es 'renovacion'. Llamando a procesar_webhook_renovacion.")
+            # Delega toda la lógica al servicio
+            resultado = await procesar_webhook_renovacion(payload)
         
         logging.info(f"Procesamiento completado para: {payload.input_variables.NOMBRE_TITULAR}")
         return {"status": "success", "message": "Webhook procesado", "data": resultado}
@@ -1045,7 +1065,125 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
             detail=f"Error interno del servidor: {str(e)}"
         )
 
+
+# Endpoint para registrar renovaciones en la base de datos
+@app.post("/renovaciones", tags=["Renovaciones"], summary="Registrar renovación de cliente")
+async def registrar_renovacion(payload: RenovacionPayload):
+    """
+    Endpoint para registrar una renovación de crédito en la base de datos.
     
+    Recibe:
+    - estado_final_renovacion: Estado final de la renovación
+    - estado_pago_payvalida: Estado del pago en PayValida
+    - nombre_cliente: Nombre del cliente
+    
+    Retorna:
+    - Confirmación de inserción y mensaje de éxito
+    """
+    method_name = "registrar_renovacion"
+    
+    try:
+        
+        logger.info(f"Intentando registrar renovación para: {payload.nombre_cliente}")
+        
+        # Crear conexión asincrónica a la base de datos
+        connection = await aiomysql.connect(
+            host=db_host,
+            user=db_user,
+            password=db_pass,
+            db=db_name
+        )
+        
+        try:
+            async with connection.cursor() as cursor:
+                # Preparar la consulta INSERT
+                query = """
+                    INSERT INTO renovaciones_clientes 
+                    (estado_final_renovacion, estado_pago_payvalida, nombre_cliente) 
+                    VALUES (%s, %s, %s)
+                """
+                
+                # Ejecutar la inserción
+                await cursor.execute(
+                    query,
+                    (
+                        payload.estado_final_renovacion,
+                        payload.estado_pago_payvalida,
+                        payload.nombre_cliente
+                    )
+                )
+                
+                # Confirmar la transacción
+                await connection.commit()
+                
+                # Obtener el ID de la renovación insertada
+                insertado_id = cursor.lastrowid
+                
+                logger.info(f"Renovación registrada exitosamente con ID: {insertado_id}")
+                
+                # Enviar notificación informativa
+                info_message = (
+                    f"Renovación registrada exitosamente en la base de datos\n"
+                    f"Cliente: {payload.nombre_cliente}\n"
+                    f"Estado Final: {payload.estado_final_renovacion}\n"
+                    f"Estado Pago: {payload.estado_pago_payvalida}\n"
+                    f"ID Registro: {insertado_id}"
+                )
+                
+                await info_notify(
+                    method_name=method_name,
+                    client_id=payload.nombre_cliente,
+                    info_message=info_message,
+                    entity_id=str(insertado_id)
+                )
+                
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "status": "success",
+                        "message": "Renovación registrada exitosamente",
+                        "id_registro": insertado_id,
+                        "cliente": payload.nombre_cliente,
+                        "estado_final_renovacion": payload.estado_final_renovacion,
+                        "estado_pago_payvalida": payload.estado_pago_payvalida,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                )
+                
+        finally:
+            connection.close()
+    
+    except aiomysql.Error as db_error:
+        logger.error(f"Error de base de datos: {str(db_error)}")
+        await error_notify(
+            method_name=method_name,
+            client_id=payload.nombre_cliente,
+            error_message=f"Error al insertar en BD: {str(db_error)}"
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error al conectar con la base de datos",
+                "detail": "No se pudo registrar la renovación"
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"Error en registrar_renovacion: {str(e)}")
+        await error_notify(
+            method_name=method_name,
+            client_id=payload.nombre_cliente,
+            error_message=f"Error en registrar_renovacion: {str(e)}"
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno del servidor",
+                "detail": str(e)
+            }
+        )
 
 
 @app.get("/logs")

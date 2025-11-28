@@ -15,31 +15,34 @@ class Settings(BaseSettings):
     SMTP_USER: str = Field(..., env="SMTP_USER")
     SMTP_PASS: str = Field(..., env="SMTP_PASS")
     
-    # --- Configuración de Base de Datos (de mi versión anterior) ---
+    # --- Configuración de Base de Datos para renovaciones---
     DB_HOST: str = Field("localhost", env="DB_HOST")
     DB_USER: str = Field("root", env="DB_USER")
-    DB_PASS: str = Field(..., env="DB_PASS")
-    DB_NAME: str = Field(..., env="DB_NAME")
+    DB_PASSWORD_RENOVACION: str = Field(..., env="DB_PASSWORD_RENOVACION")
+    DB_NAME_RENOVACION: str = Field(..., env="DB_NAME_RENOVACION")
+        
 
-    # --- Nuevas variables de tu config.py (simples) ---
+    # --- Variables de Autenticación y API ---
     AUTH_URL: Optional[str] = Field(None, env="AUTH_URL")
     API_URL: Optional[str] = Field(None, env="API_URL")
     ORG_ID: Optional[str] = Field(None, env="ORG_ID")
     PAYABLE_URL: Optional[str] = Field(None, env="PAYABLE_URL")
     GET_PAYABLE_URL: Optional[str] = Field(None, env="GET_PAYABLE_URL")
 
-    # --- Nuevas variables de tu config.py (JSON parseadas) ---
+    # --- Payloads de Autenticación (JSON parseadas) ---
     AUTH_PAYLOAD_PROD: Dict[str, Any] = Field(default_factory=dict, env="AUTH_PAYLOAD_PROD")
     AUTH_PAYLOAD_DEMO: Dict[str, Any] = Field(default_factory=dict, env="AUTH_PAYLOAD_DEMO")
 
-    # --- CAMPOS QUE FALTABAN (LOS "EXTRA") ---
-    # Los agrego aquí para que Pydantic los reconozca.
-    # Asumo que son strings y obligatorios (usa Optional[str] = None si no lo son).
-    email_from: str = Field(..., env="email_from")
-    email_to: str = Field(..., env="email_to")
-    email_password: str = Field(..., env="email_password")
-    telegram_bot_token: str = Field(..., env="telegram_bot_token")
-    telegram_chat_id: str = Field(..., env="telegram_chat_id")
+    # --- Configuración de Correo (alineado con .env) ---
+    EMAIL_FROM: Optional[str] = Field(None, env="EMAIL_FROM")
+    EMAIL_TO: Optional[str] = Field(None, env="EMAIL_TO")
+    EMAIL_PASSWORD: Optional[str] = Field(None, env="EMAIL_PASSWORD")
+
+
+
+    # --- Configuración Telegram ---
+    TELEGRAM_BOT_TOKEN: Optional[str] = Field(None, env="TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID: Optional[str] = Field(None, env="TELEGRAM_CHAT_ID")
     
 
     class Config:

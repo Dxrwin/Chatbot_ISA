@@ -1,60 +1,84 @@
-import mysql.connector
+import aiomysql
 import logging
-from datetime import datetime
-
-# Importa el modelo de Pydantic
-from models.models import InputVariables
-
-# Importa la configuración
 from utils.config import settings
 
-# Configuración de la BD desde el objeto de settings
 db_config = {
     "host": settings.DB_HOST,
     "user": settings.DB_USER,
-    "password": settings.DB_PASS,
-    "database": settings.DB_NAME
+    "password": settings.DB_PASSWORD_RENOVACION,
+    "database": settings.DB_NAME_RENOVACION
 }
 
-def guardar_en_bd(input_variables: InputVariables):
+
+logger = logging.getLogger(__name__)
+
+
+
+async def insertar_flujo_correo_post_agente(
+    nombre_cliente: str,
+    correo_enviado: str,
+    numero_telefono: str,
+    linea_universitaria: str,
+) -> int:
     """
-    Guarda las variables de entrada en la base de datos.
-    Ahora usa el modelo pydantic para más seguridad.
+    Inserta (o actualiza) un registro en flujo_correo_post_agente.
+
+    - numero_telefono es único, si ya existe se actualiza el registro
+    y se refresca fecha_envio.
     """
+    method_name = "insertar_flujo_correo_post_agente"
+
     try:
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor()
-
-        query = (
-            "INSERT INTO Clientes "
-            "(NOMBRE, CORREO, NUMERO, SEMESTRE, LINEA_CREDITO, ESTADO_CREDITO, LINK, CUOTAS_PENDIENTES, FECHA_INSERCION) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-        )
-        
-        # Extrae valores del modelo Pydantic
-        valores = (
-            input_variables.NOMBRE_TITULAR,
-            input_variables.CORREO,
-            input_variables.PHONE_NUMBER,
-            input_variables.SEMESTRE,
-            input_variables.LINEA_CREDITO,
-            input_variables.ESTADO_CREDITO,
-            input_variables.LINK,
-            input_variables.CUOTAS_PENDIENTES,
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        connection = await aiomysql.connect(
+            host= db_config["host"],
+            user= db_config["user"],
+            password= db_config["password"],
+            db= db_config["database"]
         )
 
-        cursor.execute(query, valores)
-        conn.commit()
-        
-        logging.info("Datos insertados en la base de datos correctamente")
+        try:
+            async with connection.cursor() as cursor:
+                query = """
+                    INSERT INTO flujo_correo_post_agente (
+                        nombre_cliente,
+                        correo_enviado,
+                        numero_telefono,
+                        linea_universitaria
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        nombre_cliente = VALUES(nombre_cliente),
+                        correo_enviado = VALUES(correo_enviado),
+                        linea_universitaria = VALUES(linea_universitaria),
+                        fecha_envio = CURRENT_TIMESTAMP;
+                """
 
-    except Exception as e:
-        logging.error(f"Error al guardar en BD: {e}", exc_info=True)
-        # Relanza la excepción para que el servicio superior la maneje
+                await cursor.execute(
+                    query,
+                    (
+                        nombre_cliente,
+                        correo_enviado,
+                        numero_telefono,
+                        linea_universitaria,
+                    ),
+                )
+
+                await connection.commit()
+
+                insert_id = cursor.lastrowid
+                logger.info(
+                    f"[{method_name}] Registro insertado/actualizado. ID: {insert_id} | Teléfono: {numero_telefono}"
+                )
+
+                # Si fue UPDATE, lastrowid puede venir 0; a nivel de negocio
+                # igual ya quedó registrado.
+                return insert_id or 0
+
+        finally:
+            connection.close()
+
+    except aiomysql.Error as db_error:
+        logger.error(f"[{method_name}] Error de base de datos: {str(db_error)}", exc_info=True)
+        # Aquí puedes llamar a error_notify si quieres
+        # await error_notify(...)
         raise
-    finally:
-        if 'cursor' in locals() and cursor:
-            cursor.close()
-        if 'conn' in locals() and conn:
-            conn.close()

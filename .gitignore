@@ -1,10 +1,7 @@
 .env
 __pycache__/
 logica.cpython-313.pyct
-test_endpoint.py
 notify_error.cpython-313.pyc
-ejemplos_payloads
-ejemplos_payloads.json
 *.pyc
 venv/
 .venv
