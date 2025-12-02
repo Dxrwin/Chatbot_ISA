@@ -1,6 +1,17 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from typing import Optional, Dict, Any
+import os
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
+# Buscar y cargar el archivo .env
+env_file = find_dotenv()
+if env_file:
+    load_dotenv(env_file, override=True)
+else:
+    # Si no encuentra .env con find_dotenv, intenta con la ruta relativa
+    load_dotenv('.env', override=True)
 
 class Settings(BaseSettings):
     """
@@ -38,8 +49,6 @@ class Settings(BaseSettings):
     EMAIL_TO: Optional[str] = Field(None, env="EMAIL_TO")
     EMAIL_PASSWORD: Optional[str] = Field(None, env="EMAIL_PASSWORD")
 
-
-
     # --- Configuración Telegram ---
     TELEGRAM_BOT_TOKEN: Optional[str] = Field(None, env="TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID: Optional[str] = Field(None, env="TELEGRAM_CHAT_ID")
@@ -49,6 +58,8 @@ class Settings(BaseSettings):
         # Nombre del archivo del cual cargar las variables
         env_file = ".env"
         env_file_encoding = "utf-8"
+        # Permite lectura de variables del ambiente del sistema operativo
+        case_sensitive = False
 
 # --- Instancia Única de Configuración ---
 settings = Settings()

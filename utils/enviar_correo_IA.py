@@ -191,7 +191,7 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
                 f"El cliente {variables_entrada.Nombre} con correo {variables_entrada.EMAIL} "
                 "no esta interesado en el webinar."
             )
-            error_notify(
+            await error_notify(
                 method_name="procesar_webhook_webinar",
                 client_id=variables_entrada.Nombre,
                 error_message=msg,
@@ -199,7 +199,7 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
     
     if variables_extraidas.contesto_llamada is False and variables_extraidas.estado is False:
         enviar_correo = False
-        error_notify(
+        await error_notify(
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
             error_message=(
@@ -215,10 +215,10 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
             f"El cliente {variables_entrada.Nombre} con correo {variables_entrada.EMAIL} "
             "no cumple condiciones para envio de correo."
         )
-        error_notify(
+        await error_notify(
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
-            info_message=msg,
+            error_message=msg,
         )
         return {
             "status": "success",
@@ -230,10 +230,10 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
     
     
     # --- Validación de decisión de correo ---
-    # Si desicion_correo es True, usar CORREO de input_vars
-    # Si desicion_correo es False, usar correo_cliente de extracted_vars
+    # Si desicion_correo es True, usar EMAIL de variables_entrada
+    # Si desicion_correo es False, usar correo_cliente de variables_extraidas
     if variables_extraidas.desicion_correo is True:
-        destinatario = variables_entrada.CORREO
+        destinatario = variables_entrada.EMAIL
         logging.info(f"Usando correo guardado (desicion_correo=True): {destinatario}")
     elif variables_extraidas.desicion_correo is False:
         destinatario = variables_extraidas.correo_cliente
@@ -245,8 +245,8 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
         
     if not destinatario:
         logging.warning("No se puede enviar correo, no hay destinatario (ni CORREO ni correo_cliente).")
-        error_notify(
-            method_name="procesar_webhook_renovacion",
+        await error_notify(
+            method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
             error_message=(
                 f"No se pudo enviar correo por falta de destinatario. "
@@ -259,12 +259,12 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
         }
         
     
-    numero_telefono_input = getattr(variables_entrada.Contacto)
+    numero_telefono_input = getattr(variables_entrada, "Contacto", None)
     if not numero_telefono_input:
         logging.warning("No se recibio numero_telefono en el payload. No se registrara flujo en BD.")
         
     logging.info(f"Validacion superada. Intentando enviar correo a: {variables_entrada.Nombre} con correo : {variables_entrada.EMAIL}")
-    info_notify(
+    await info_notify(
         method_name="procesar_webhook_webinar",
         client_id=variables_entrada.Nombre,
         info_message=(
@@ -280,12 +280,12 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
             nombre=primer_name or "Cliente Onetwocredit",
         )
         logging.info(confirmacion_response)
-        info_notify(
+        await info_notify(
             method_name="procesar_webhook_webinar",
-            client_id=variables_entrada.NOMBRE_TITULAR,
+            client_id=variables_entrada.Nombre,
             info_message=(
                 f"{confirmacion_response} hacia {destinatario} "
-                f"para el cliente {variables_entrada.NOMBRE_TITULAR}."
+                f"para el cliente {variables_entrada.Nombre}."
                 f"con correo {destinatario}"
             ),
         )
@@ -293,8 +293,8 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
         
         flujo_id = None
 
-        # 4. Solo intentamos guardar en BD si tenemos telefono y linea
-        if numero_telefono_input and variables_extraidas.interessolicitud == "si":
+        # 4. Solo intentamos guardar en BD si tenemos telefono
+        if variables_entrada.Contacto:
             try:
                 flujo_id = await insertar_flujo_correo_post_agente(
                     nombre_cliente=variables_entrada.Nombre,
@@ -307,7 +307,7 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
                 logging.error(f"Error al registrar flujo en BD: {e}", exc_info=True)
                 # El correo ya fue enviado; no lanzamos error para no romper el webhook.
         else:
-            logging.warning("No se registrara en BD por faltar numero_telefono o linea_universitaria.")
+            logging.warning("No se registrara en BD por faltar numero_telefono.")
         
         payload_respuesta = {
             "status": "success",

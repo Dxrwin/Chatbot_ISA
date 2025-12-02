@@ -1,4 +1,4 @@
-from utils.config import AUTH_PAYLOAD_PROD, AUTH_URL, TOKEN_DATA
+from utils.config import settings, TOKEN_DATA
 import time
 import httpx
 import logging
@@ -13,9 +13,9 @@ async def obtener_token(client: httpx.AsyncClient):
     if TOKEN_DATA.get("access_token") and TOKEN_DATA.get("expires_at", 0) > int(time.time()) + 30:
         return TOKEN_DATA["access_token"]
 
-    payload = AUTH_PAYLOAD_PROD or {}
+    payload = settings.AUTH_PAYLOAD_PROD or {}
     try:
-        resp = await client.post(AUTH_URL, json=payload, timeout=10.0)
+        resp = await client.post(settings.AUTH_URL, json=payload, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
         access = data.get("access_token") or data.get("accessToken") or data.get("token")

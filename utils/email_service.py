@@ -67,7 +67,7 @@ async def enviar_correo_webinar(destinatario: str, nombre: str):
     html_template = get_html_template_webinar()
     
     # 2. Reemplazar los placeholders
-    cuerpo_html = html_template.replace("{{contact.FIRSTNAME}}", nombre)
+    cuerpo_html = html_template.replace("{{ contact.FIRSTNAME }}", nombre)
     
 
     # 3. Configurar el mensaje

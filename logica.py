@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Body,Query
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -13,7 +13,7 @@ import time
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from utils.config import settings, TOKEN_DATA
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 import re
 import aiomysql
         
@@ -61,10 +61,10 @@ async def lifespan(app: FastAPI):
             f"Ambiente: Producción\n"
             "Estado: ONLINE"
         )
-        await error_notify(
+        await info_notify(
             method_name="startup_server",
             client_id="system",
-            error_message=message
+            info_message=message
         )
         logger.info("Servidor iniciado y notificaciones enviadas correctamente")
         
@@ -105,10 +105,10 @@ async def check_server_restart(request: Request, call_next):
                 f"Ambiente: Producción\n"
                 "Estado: RELOADED"
             )
-            await error_notify(
+            await info_notify(
                 method_name="server_reload",
                 client_id="system",
-                error_message=message
+                info_message=message
             )
             logger.info("Servidor reiniciado y notificaciones enviadas")
     except Exception as e:
@@ -1041,6 +1041,8 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         logging.info(f"Webhook recibido. Procesando para: {payload.input_variables.NOMBRE_TITULAR} \n")
         
         logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
+        
+        logging.info(f"Objetivo extraído: {payload.extracted_variables.objetivo} \n")
         
         # Lógica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
         if payload.extracted_variables.objetivo == "webinar":
