@@ -28,7 +28,8 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
                 f"El cliente {input_vars.NOMBRE_TITULAR} con correo {input_vars.CORREO} "
                 "no esta interesado en renovar."
             )
-            error_notify(
+            # Notificamos que el cliente no quiere renovar para auditar la decisión
+            await error_notify(
                 method_name="procesar_webhook_renovacion",
                 client_id=input_vars.NOMBRE_TITULAR,
                 error_message=msg,
@@ -36,7 +37,8 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
 
     if extracted_vars.contesto_llamada is False and extracted_vars.estado is False:
         enviar_correo = False
-        error_notify(
+        # Registramos que no atendió la llamada para no disparar correos
+        await error_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
             error_message=(
@@ -52,7 +54,8 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             f"El cliente {input_vars.NOMBRE_TITULAR} con correo {input_vars.CORREO} "
             "no cumple condiciones para envio de correo."
         )
-        info_notify(
+        # Confirmamos por correo/telegram que el flujo no envió email
+        await info_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
             info_message=msg,
@@ -82,7 +85,8 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
 
     if not destinatario:
         logging.warning("No se puede enviar correo, no hay destinatario (ni CORREO ni correo_cliente).")
-        error_notify(
+        # Persistimos la falta de destinatario para rastreo sin romper el flujo
+        await error_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
             error_message=(
@@ -124,7 +128,8 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             link_asesor=link_whatsapp_asesor,
         )
         logging.info(confirmacion_response)
-        info_notify(
+        # Guardamos evidencia del correo enviado (email + telegram)
+        await info_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
             info_message=(

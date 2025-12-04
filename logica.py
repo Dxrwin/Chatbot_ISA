@@ -4,29 +4,25 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
 from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar
+from utils.auth import obtener_token
 from models.models import WebhookPayload
 import httpx
 import logging
 import asyncio
 from fastapi import Request
-import time
 from typing import Optional, Dict, Any
-from datetime import datetime, timezone, timedelta
-from utils.config import settings, TOKEN_DATA
-#from dotenv import load_dotenv
+from datetime import datetime, timezone
+from utils.config import settings
 import re
+import unicodedata
 import aiomysql
         
-# Obtener parámetros de configuración DE LA BASE DE DATOS
+# Obtener parametros de configuración DE LA BASE DE DATOS
 db_host = settings.DB_HOST
 db_user = settings.DB_USER
 db_pass = settings.DB_PASSWORD_RENOVACION
 db_name = settings.DB_NAME_RENOVACION
-#import os
-# import json
-# load_dotenv()
 
-#app = FastAPI()
 class ExtractedVariables(BaseModel):
     estado: Optional[bool] = None
     resumen: Optional[str] = None
@@ -54,9 +50,9 @@ async def lifespan(app: FastAPI):
     Manejador de eventos del ciclo de vida del servidor usando el nuevo sistema Lifespan.
     """
     try:
-        # Código que se ejecuta al iniciar
+        
         message = (
-            "🟢 Servidor iniciado correctamente\n"
+            "Servidor iniciado correctamente\n"
             f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
             f"Ambiente: Producción\n"
             "Estado: ONLINE"
@@ -68,11 +64,11 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Servidor iniciado y notificaciones enviadas correctamente")
         
-        yield  # El servidor está ejecutándose
+        yield  
         
-        # Código que se ejecuta al apagar
+        
         message = (
-            "🔴 Servidor detenido\n"
+            "Servidor detenido\n"
             f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
             f"Ambiente: Producción\n"
             "Estado: OFFLINE"
@@ -87,20 +83,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error en el ciclo de vida del servidor: {e}")
 
-# Crear la aplicación FastAPI con el nuevo manejador lifespan
+
 app = FastAPI(lifespan=lifespan)
 
 # El middleware para detectar reinicios
 @app.middleware("http")
 async def check_server_restart(request: Request, call_next):
     """
-    Middleware que detecta reinicios del servidor por cambios en el código
+    Middleware que detecta reinicios del servidor por cambios en el cÃƒÂ³digo
     """
     try:
         if not hasattr(app.state, "server_started"):
             app.state.server_started = True
             message = (
-                "🔄 Servidor actualizado y reiniciado\n"
+                "Servidor actualizado y reiniciado\n"
                 f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
                 f"Ambiente: Producción\n"
                 "Estado: RELOADED"
@@ -112,18 +108,28 @@ async def check_server_restart(request: Request, call_next):
             )
             logger.info("Servidor reiniciado y notificaciones enviadas")
     except Exception as e:
-        logger.error(f"Error al enviar notificación de reinicio: {e}")
+        logger.error(f"Error al enviar notificaciÃƒÂ³n de reinicio: {e}")
     
     return await call_next(request)
 
 # Mensajes amigables para el cliente
 MENSAJES_CLIENTE = {
     "error_conexion": "Lo sentimos, en este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
-    "error_datos": "Los valores ingresados no son válidos. Por favor verifica que el monto y la cuota inicial sean números válidos.",
-    "error_servicio": "En este momento nuestro servicio no está disponible. Por favor intenta más tarde.",
-    "error_simulacion": "No pudimos completar la simulación de tu crédito. Por favor verifica los datos e intenta nuevamente.",
-    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crédito. Por favor intenta nuevamente.",
-    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente más tarde."
+    "error_datos": "Los valores ingresados no son vÃƒÂ¡lidos. Por favor verifica que el monto y la cuota inicial sean nÃƒÂºmeros vÃƒÂ¡lidos.",
+    "error_servicio": "En este momento nuestro servicio no estÃƒÂ¡ disponible. Por favor intenta mÃƒÂ¡s tarde.",
+    "error_simulacion": "No pudimos completar la simulaciÃƒÂ³n de tu crÃƒÂ©dito. Por favor verifica los datos e intenta nuevamente.",
+    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crÃƒÂ©dito. Por favor intenta nuevamente.",
+    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente mÃƒÂ¡s tarde."
+}
+
+MENSAJES_USUARIO = {
+    "valor_invalido": "El monto ingresado no es válido. Por favor ingresa un valor numérico, por ejemplo: 2500000 o $2.500.000",
+    "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no está disponible en este momento. Por favor intenta nuevamente más tarde.",
+    "semestre_invalido": "El semestre ingresado no es válido. Por favor selecciona una opción entre 'primer semestre' y 'décimo semestre'.",
+    "plazo_invalido": "El plazo seleccionado no es válido. Por favor escoge entre 1 y 6 meses.",
+    "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
+    "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
+    "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
 }
 
 # Configuración de logs
@@ -134,30 +140,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Pydantic ya los parseó como diccionarios
-AUTH_PAYLOAD_PROD = settings.AUTH_PAYLOAD_PROD 
-AUTH_PAYLOAD_DEMO = settings.AUTH_PAYLOAD_DEMO
-
-# Y las otras variables también
-AUTH_URL = settings.AUTH_URL
+# Variables de configuración usadas en los endpoints principales
 API_URL = settings.API_URL
 ORG_ID = settings.ORG_ID
 PAYABLE_URL = settings.PAYABLE_URL
 GET_PAYABLE_URL = settings.GET_PAYABLE_URL
 
-#print("variables de entorno cargadas: \n AUTH_PAYLOAD: {AUTH_PAYLOAD} \n AUTH_URL: {AUTH_URL} \n API_URL: {API_URL} \n ORG_ID: {ORG_ID} \n PAYABLE_URL: {PAYABLE_URL} \n")
-
-
-# Variables globales para el token y su expiración
-TOKEN_DATA = {
-    "access_token": None,
-    "refresh_token": None,
-    "expires_at": 0
-}
-
-# --- Sistema de Caché en Memoria ---
+# --- Sistema de Cache en Memoria ---
 cuotas_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_MINUTES = 5
+
+# Normaliza nombres/titulos a un slug estable (sin tildes, minusculas y sin simbolos)
+def slugify_nombre(value: str) -> str:
+    if not value:
+        return ""
+    normalized = unicodedata.normalize("NFD", value)
+    ascii_str = ''.join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    ascii_str = re.sub(r"[^a-zA-Z0-9\s-]", "", ascii_str)
+    ascii_str = re.sub(r"\s+", " ", ascii_str).strip().lower()
+    return ascii_str.replace(" ", "-")
 
 #pydantc es un validador de datos de entrada y salida
 # Modelo Pydantic para el payload sin validaciones estrictas
@@ -181,129 +182,31 @@ class DetalleCuotaRequest(BaseModel):
 class TestNotifyRequest(BaseModel):
     method_name: str = "test_method"
     client_id: str = "test_client"
-    message: str = "Mensaje de prueba para notificación"
-
-
-# Función para obtener o refrescar el token
-async def obtener_token(client: httpx.AsyncClient):
-    """
-    Obtiene el token de acceso, refresca si está expirado.
-    """
-    ahora = int(time.time())
-    # Si el token existe y no ha expirado, lo retorna
-    if TOKEN_DATA["access_token"] and TOKEN_DATA["expires_at"] > ahora:
-        print("Token válido, no es necesario refrescar.")
-        return TOKEN_DATA["access_token"]
-    # Si hay refresh_token, intenta refrescar
-    if TOKEN_DATA["refresh_token"]:
-        refresh_payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": TOKEN_DATA["refresh_token"],
-            "client_id": AUTH_PAYLOAD_PROD["client_id"],
-            "client_secret": AUTH_PAYLOAD_PROD["client_secret"]
-        }
-        response = await client.post(AUTH_URL, json=refresh_payload)
-        response.raise_for_status()
-        auth_data = response.json()
-        TOKEN_DATA["access_token"] = auth_data.get("access_token")
-        TOKEN_DATA["refresh_token"] = auth_data.get("refresh_token")
-        
-        print("Token refrescado exitosamente.")
-        
-        expires_in = auth_data.get("expires_in", 3600)
-        TOKEN_DATA["expires_at"] = ahora + expires_in - 60  # margen de 1 min
-        return TOKEN_DATA["access_token"]
-    # Si no hay token, solicita uno nuevo
-    print("Solicitando nuevo token de acceso.")
-    print(f"Payload de autenticación: {AUTH_PAYLOAD_PROD}")
-    
-    response = await client.post(AUTH_URL, json=AUTH_PAYLOAD_PROD)
-    response.raise_for_status()
-    auth_data = response.json()
-    
-    TOKEN_DATA["access_token"] = auth_data.get("access_token")
-    TOKEN_DATA["refresh_token"] = auth_data.get("refresh_token")
-    
-    expires_in = auth_data.get("expires_in", 3600)
-    TOKEN_DATA["expires_at"] = ahora + expires_in - 60  # margen de 1 min
-    print("Nuevo token obtenido exitosamente.")
-    return TOKEN_DATA["access_token"]
+    message: str = "Mensaje de prueba para notificaciÃƒÂ³n"
 
 
 
-# Endpoint para obtener detalles de una cuota específica desde la caché
-@app.post("/detalle_cuota_vencida", response_class=JSONResponse)
-async def obtener_detalle_cuota(request: DetalleCuotaRequest = Body(...)):
-    """
-    PASO 2: Consulta la caché para obtener los detalles de UNA SOLA cuota.
-    Devuelve una respuesta estructurada que el bot puede interpretar.
-    """
-    id_credito = request.id_cliente
-    numero_cuota = request.numero_cuota
-
-    cache_entry = cuotas_cache.get(id_credito)
-    
-    if not cache_entry:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "error",
-                "clave_error": "SESION_NO_ENCONTRADA",
-                "mensaje": "No se encontraron cuotas para este cliente. El bot debería volver a ejecutar la consulta inicial."
-            }
-        )
-
-    cache_time = cache_entry["timestamp"]
-    if datetime.now(timezone.utc) - cache_time > timedelta(minutes=CACHE_TTL_MINUTES):
-        del cuotas_cache[id_credito]
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "error",
-                "clave_error": "SESION_EXPIRADA",
-                "mensaje": "La información ha expirado. El bot debe notificar al usuario y volver a consultar."
-            }
-        )
-
-    lista_cuotas = cache_entry["cuotas"]
-
-    if not (1 <= numero_cuota <= len(lista_cuotas)):
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "error",
-                "clave_error": "INDICE_INVALIDO",
-                "mensaje": f"Número de cuota inválido. Por favor, elija un número entre 1 y {len(lista_cuotas)}."
-            }
-        )
-    
-    cuota_solicitada = lista_cuotas[numero_cuota - 1]
-    
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "exito",
-            "cuota": cuota_solicitada
-        }
-    )
-
-
-# Endpoint para obtener líneas de producto basado en parentId
 @app.get("/product-lines/{parent_id}")
-async def webhook_product_lines(parent_id: str):
+async def webhook_product_lines(
+    parent_id: str,
+    name: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    product_type: Optional[int] = None,
+    tipo: Optional[int] = None,
+):
     """
-    Webhook asíncrono:
-    1. Solicita token de autorización al AUTH_URL
-    2. Usa el token para consultar API_URL
-    3. Retorna solo id, parentId y name
+    Webhook asincrono para recuperar una linea de producto.
+    Busca por parentId y tambien por un slug derivado de name/title para soportar cambios de version.
+    Filtros opcionales: entity_id, product_type, tipo y archived=false por defecto.
     """
-    
-    MAX_RETRIES = 3  # número máximo de intentos
+    MAX_RETRIES = 3  # numero maximo de intentos
     RETRY_DELAY = 5  # segundos entre intentos (base)
     TIMEOUT = 15     # timeout en segundos por solicitud
-    
+
     method_name = "product-lines"
     parent_id_notify_error = f"parent_id para la busqueda del la linea={parent_id}"
+    target_slug = slugify_nombre(name) if name else ""
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             access_token = await obtener_token(client)
@@ -313,7 +216,7 @@ async def webhook_product_lines(parent_id: str):
                 return {
                     "estado": "error",
                     "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                    "detalles_usuario": "No se pudo obtener el token de acceso. Por favor intenta nuevamente más tarde."
+                    "detalles_usuario": "No se pudo obtener el token de acceso. Por favor intenta nuevamente mas tarde."
                 }
 
             headers = {
@@ -329,34 +232,93 @@ async def webhook_product_lines(parent_id: str):
                     data = response.json()
                     lines = data.get("data", {}).get("lines", [])
 
+                    candidates = []
                     for line in lines:
-                        if line.get("parentId") == parent_id:
-                            logger.info(f"Línea encontrada: {line}")
-                            return {
-                                "id": line.get("id"),
-                                "name": line.get("name"),
-                                "parentId": line.get("parentId"),
-                                "principalMin": line.get("principalMin"),
-                                "principalMax": line.get("principalMax"),
-                                "timeMin": line.get("timeMin"),
-                                "timeMax": line.get("timeMax"),
-                            }
+                        if line.get("archived"):
+                            continue
+                        if entity_id and line.get("entityID") != entity_id:
+                            continue
+                        if product_type is not None and line.get("productType") != product_type:
+                            continue
+                        if tipo is not None and line.get("type") != tipo:
+                            continue
 
-                    msg = f"No se encontró la línea con parentId: {parent_id}"
-                    await error_notify(method_name, parent_id_notify_error, msg)
+                        parent_match = line.get("parentId") == parent_id
+                        slug_name = slugify_nombre(line.get("name", ""))
+                        slug_title = slugify_nombre(line.get("title", ""))
+                        slug_match = bool(target_slug) and (slug_name == target_slug or slug_title == target_slug)
+
+                        if not (parent_match or slug_match):
+                            continue
+
+                        candidates.append({
+                            "line": line,
+                            "matched_by": "parentId" if parent_match else "slug"
+                        })
+
+                    # Coincidencias parciales para rescate (si nada exacto)
+                    if not candidates and target_slug:
+                        for line in lines:
+                            if line.get("archived"):
+                                continue
+                            if entity_id and line.get("entityID") != entity_id:
+                                continue
+                            slug_name = slugify_nombre(line.get("name", ""))
+                            slug_title = slugify_nombre(line.get("title", ""))
+                            if target_slug in slug_name or target_slug in slug_title:
+                                candidates.append({"line": line, "matched_by": "partial-slug"})
+
+                    if not candidates:
+                        msg = f"No se encontro la linea con parentId {parent_id} ni slug {target_slug}"
+                        await error_notify(method_name, parent_id_notify_error, msg)
+                        sugerencias = [slugify_nombre(l.get("name", "")) for l in lines][:10]
+                        return {
+                            "estado": "error",
+                            "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                            "detalles_usuario": "No se encontro la linea de producto solicitada. Verifica el nombre o intenta mas tarde.",
+                            "sugerencias": sugerencias
+                        }
+
+                    def parse_updated(val: str):
+                        try:
+                            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+                        except Exception:
+                            return datetime.min
+
+                    candidates.sort(
+                        key=lambda item: (
+                            parse_updated(item["line"].get("updatedAt")),
+                            item["line"].get("version", 0)
+                        ),
+                        reverse=True
+                    )
+
+                    selected = candidates[0]
+                    line = selected["line"]
+
+                    logger.info(f"Linea encontrada via {selected['matched_by']}: {line}")
                     return {
-                        "estado": "error",
-                        "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                        "detalles_usuario": "No se encontró la línea de producto solicitada. Por favor verifica el código o intenta más tarde."
+                        "id": line.get("id"),
+                        "name": line.get("name"),
+                        "title": line.get("title"),
+                        "parentId": line.get("parentId"),
+                        "version": line.get("version"),
+                        "matched_by": selected["matched_by"],
+                        "principalMin": line.get("principalMin"),
+                        "principalMax": line.get("principalMax"),
+                        "timeMin": line.get("timeMin"),
+                        "timeMax": line.get("timeMax"),
+                        "timeDefault": line.get("timeDefault"),
+                        "paymentFrequency": line.get("paymentFrequency"),
                     }
 
                 except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
-                    logger.warning(f"Intento {attempt}/{MAX_RETRIES} fallido por timeout o conexión: {e}")
+                    logger.warning(f"Intento {attempt}/{MAX_RETRIES} fallido por timeout o conexion: {e}")
                     if attempt == MAX_RETRIES:
                         return {
                             "estado": "error",
                             "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                            "detalles_usuario": "No se pudo conectar con el servicio externo. Por favor intenta nuevamente más tarde."
+                            "detalles_usuario": "No se pudo conectar con el servicio externo. Por favor intenta nuevamente mas tarde."
                         }
                     await asyncio.sleep(RETRY_DELAY * attempt)
 
@@ -369,7 +331,7 @@ async def webhook_product_lines(parent_id: str):
                     return {
                         "estado": "error",
                         "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                        "detalles_usuario": "El servicio externo no está disponible. Por favor intenta más tarde."
+                        "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
                     }
 
             msg = "Error persistente al consultar API externa"
@@ -377,7 +339,7 @@ async def webhook_product_lines(parent_id: str):
             return {
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "No se pudo obtener respuesta del servicio externo. Por favor intenta más tarde."
+                "detalles_usuario": "No se pudo obtener respuesta del servicio externo. Por favor intenta mas tarde."
             }
 
     except Exception as e:
@@ -386,11 +348,12 @@ async def webhook_product_lines(parent_id: str):
         return {
             "estado": "error",
             "mensaje": MENSAJES_CLIENTE["error_general"],
-            "detalles_usuario": "Ocurrió un error inesperado. Por favor intenta nuevamente más tarde."
+            "detalles_usuario": "Ocurrio un error inesperado. Por favor intenta nuevamente mas tarde."
         }
 
+
 def format_currency(value: float) -> str:
-    """Formatea un número como moneda COP: sin decimales, con $ y separadores de miles."""
+    """Formatea un nÃƒÂºmero como moneda COP: sin decimales, con $ y separadores de miles."""
     return f"${value:,.0f}"
 
 # Endpoint para crear un nuevo payable o credito despues de la simulacion
@@ -398,10 +361,10 @@ def format_currency(value: float) -> str:
 async def create_payable(client_id: str, payload: PayableRequest):
     """
     Endpoint para crear un nuevo payable:
-    1. Recibe el ID del cliente como parámetro
+    1. Recibe el ID del cliente como parÃƒÂ¡metro
     2. Transforma los campos principal y initialFee de str a int
-    3. Extrae el token de autorización del payload
-    4. Realiza la petición POST al endpoint de payable
+    3. Extrae el token de autorizacion del payload
+    4. Realiza la peticiÃƒÂ³n POST al endpoint de payable
     
     """
     method_name = "create_payable"
@@ -409,7 +372,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
         async with httpx.AsyncClient() as client:
             
-            logger.info(f"+++++ Parámetros recibidos: client_id= ++++++++, \n {client_id} \n")
+            logger.info(f"+++++ Parametros recibidos: client_id= ++++++++, \n {client_id} \n")
             
             logger.info(f"#####--- Payload entrante ----#### \n {payload} \n")
             
@@ -417,13 +380,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
             initial_fee = payload.initialFee
             
             token = await obtener_token(client)
-            #token = "v2.public.eyJjbGllbnQiOiIwNDY4Mzc1Yi0wYzAyLTQxNDMtYmY2NS03Njc0NDk3MTA0NmYiLCJjdHgiOiJ1c2VyIiwiZXhwIjoiMjAyNS0xMC0yOVQxNjo0MjowOS0wNTowMCIsImp0aSI6IjRhODExMmJlLWRmOWEtNDBmNC1iYTU1LTU1Y2ZiYzFmZGUzNyIsInNlc3Npb24iOiI3MDhjZGYzNi1kZmI5LTQ4M2MtODRiMy1iYTlhZTNiZGM2MDIiLCJ0eXBlIjoiYXV0aCIsInVzZXIiOiJlODI5YTY3NC04MDE3LTRhYWEtYTJlNy00MjI1YWEyOGFjZTMiLCJ2ZXJpZmllZCI6InRydWUifdxXSkJr8ChbO7Hoea_4eCj0OEuNMOvLj6Xqt2gfX92iqdwJsjhAK-cznEbl8i0jon-F1nLf8WNtGzBCQa6ucQQ.bnVsbA"
-            
-            logger.info(f"Token de autorización extraído: {token} \n")
             
             new_payload = {
                 "creditLineID": payload.creditLineID,
-                #"creditLineID": "97c6a459-a86c-4e01-bfa1-7b3e21acddf3",
                 "principal": principal,
                 "time": payload.time,
                 "disbursementMethod": payload.disbursementMethod,
@@ -438,7 +397,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 #"Organization-ID":"c8c90e3e-f2a6-4caa-8254-a1403b4416d3",
                 "Authorization": token
             }
-            logger.info(f"Iniciando petición POST a {PAYABLE_URL}")
+            logger.info(f"Iniciando peticion POST a {PAYABLE_URL}")
             logger.info(f"Payload transformado para enviar a kuenta: {new_payload}")
 
             max_retries = 3
@@ -447,36 +406,27 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 try:
                     response = await client.post(
                         PAYABLE_URL,
-                        #f"https://demo-api.kuenta.co/v1/payable",
                         json=new_payload,
                         headers=headers
                     )
                     status_code = response.status_code
                     logger.info(f"Intento {attempt+1}: status_code={status_code}")
                     if status_code == 201:
-                        #logger.info("Petición completada exitosamente")
-                        # Si hay contenido, retorna el JSON, si no retorna vacío
                             logger.info("Procesando respuesta de Kuenta")
                             response_data = response.json()
                             credit = response_data.get("data", {}).get("credit", {})
                             
                             # ID credito
                             response_credit_id = credit.get("ID")
-                            logger.info(f"ID del crédito creado: {response_credit_id} \n")
-                            #return response_data
-                        
+                            logger.info(f"ID del crÃƒÂ©dito creado: {response_credit_id} \n")
+
                     try:
-                            # url en demo
-                            #url = GET_PAYABLE_URL + response_credit_id
-                            #print("url de la simulacion es: ", url)
-                            
-                            #url en produccion
+
                             url_prod = f"https://api.kuenta.co/v1/payable/{response_credit_id}"
-                            # Realizar la consulta GET
                             response_get_simulacion = await client.get(url_prod, headers=headers)
                             status_code_simulacion = response_get_simulacion.status_code
                             
-                            logger.info(f"Status code de la simulación: {status_code_simulacion}")
+                            logger.info(f"Status code de la simulacion: {status_code_simulacion}")
                             
                             
                             if status_code_simulacion == 200 or status_code_simulacion == 201:
@@ -513,7 +463,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                                     # Agregar valores originales y formateados a la respuesta
                                     response_data.update({
-                                        "ID del crédito creado": response_credit_id,
+                                        "ID del credito creado": response_credit_id,
                                         "valores_originales": {
                                             "payment": payment,
                                             "capital": capital,
@@ -531,61 +481,69 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                         }
                                     })
 
-                                    logger.info("Valores extraídos y formateados exitosamente")
+                                    logger.info("Valores extraidos y formateados exitosamente")
                                     logger.info(f"Valores formateados: {formatted_values}")
+                                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
+                                    if id_cliente and installments:
+                                        cuotas_cache[id_cliente] = {
+                                            "cuotas": installments,
+                                            "timestamp": datetime.now(timezone.utc)
+                                        }
                                     
-                                    #notificación informativa a telegram y email
-                                    info_message = f"Crédito creado y regsitrado en kuenta correctamente \n ID del crédito: {ID_credito} \n Referencia del credito :{referencia_credito}\n ID del cliente :{id_cliente} \n Valor total credito:{formatted_values['payment_formatted']}"
+                                    #notificacion informativa a telegram y email
+                                    info_message = f"Credito creado y regsitrado en kuenta correctamente \n ID del crÃƒÂ©dito: {ID_credito} \n Referencia del credito :{referencia_credito}\n ID del cliente :{id_cliente} \n Valor total credito:{formatted_values['payment_formatted']}"
                                     
-                                    # envia notificación informativa (email + telegram) con id para seguimiento
+                                    # envia notificacion informativa (email + telegram) con id para seguimiento
                                     await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
                 
                                     return response_data
                                 else:
                                     logger.error("No se encontraron installments en la respuesta")
-                                    raise HTTPException(status_code=404, detail="No se encontraron cuotas en la simulación")
+                                    await error_notify(method_name, client_id, "No se encontraron cuotas en la simulacion")
+                                    raise HTTPException(status_code=404, detail="No se encontraron cuotas en la simulacion")
                 
                             else:
-                                logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
+                                logger.error(f"Error en la consulta de simulaciÃƒÂ³n: {status_code_simulacion}")
+                                await error_notify(method_name, client_id, f"Error al consultar la simulacion: {status_code_simulacion}")
                                 raise HTTPException(status_code=status_code_simulacion, 
-                                                detail="Error al consultar la simulación")
+                                                detail="Error al consultar la simulacion")
                             
                     except httpx.HTTPStatusError as e:
                             await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {str(e)}")
                             logger.error(f"Intento {attempt+1}: Error en la respuesta de la API externa kuenta: {e.response.status_code}")
                     except Exception as e:
-                        logger.warning(f"No se pudo enviar notificación informativa: {e}")
+                        logger.warning(f"No se pudo enviar notificacion informativa: {e}")
                         
                 except httpx.HTTPStatusError as e:
                         logger.error(f"Intento {attempt+1}: Error en API externa: {e.response.status_code}")
                         await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)  # espera exponencial
-            # Si no se logró en los reintentos
-            await error_notify(method_name, client_id, f"Error de conexión tras: {max_retries} intentos o respuesta no válida")
-            raise HTTPException(status_code=502, detail=f"Error de conexión tras {max_retries} intentos o respuesta no válida")
+            # Si no se logrÃƒÂ³ en los reintentos
+            await error_notify(method_name, client_id, f"Error de conexion tras: {max_retries} intentos o respuesta no vÃƒÂ¡lida")
+            raise HTTPException(status_code=502, detail=f"Error de conexion tras {max_retries} intentos o respuesta no vÃƒÂ¡lida")
         
     except ValueError as e:
-        logger.error(f"Error de conversión de datos: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conversión de datos: {str(e)}")
+        logger.error(f"Error de conversion de datos: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conversion de datos: {str(e)}")
         return JSONResponse(
             status_code=400,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_datos"],
-                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
+                "detalles_usuario": "Recuerda ingresar solo numeros en los campos de monto y cuota inicial."
             }
         )
         
     except httpx.RequestError as e:
-        logger.error(f"Error de conexión: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
+        logger.error(f"Error de conexiÃƒÂ³n: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conexion: {str(e)}")
         return JSONResponse(
             status_code=502,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
+                "detalles_usuario": "Nuestro servicio estÃƒÂ¡ experimentando problemas de conexion temporales."
             }
         )
     
@@ -597,7 +555,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                "detalles_usuario": "Por favor intenta más tarde o contacta a nuestro servicio al cliente."
+                "detalles_usuario": "Por favor intenta mas tarde o contacta a nuestro servicio al cliente."
             }
         )
     except Exception as e:
@@ -608,27 +566,27 @@ async def create_payable(client_id: str, payload: PayableRequest):
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_general"],
-                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
+                "detalles_usuario": "Nuestro equipo tecnico ha sido notificado y esta trabajando en solucionarlo."
             }
         )
 
 
-#manejar diferentes casos de entrada para el valor "principal" y extraer solo los números
-def limpiar_valor_principal(raw_principal: str) -> float:
+#manejar diferentes casos de entrada para el valor "principal" y extraer solo los nÃƒÂºmeros
+async def limpiar_valor_principal(raw_principal: str) -> float:
     """
-    Limpia y extrae el valor numérico de una cadena que contiene un monto.
+    Limpia y extrae el valor numÃƒÂ©rico de una cadena que contiene un monto.
     
     Args:
         raw_principal (str): Cadena con el valor principal en diferentes formatos
         
     Returns:
-        float: Valor numérico extraído
+        float: Valor numÃƒÂ©rico extraÃƒÂ­do
         
     Raises:
-        ValueError: Si no se puede extraer un valor numérico válido
+        ValueError: Si no se puede extraer un valor numÃƒÂ©rico vÃƒÂ¡lido
     """
     if not raw_principal:
-        raise ValueError("El valor principal no puede estar vacío")
+        raise ValueError("El valor principal no puede estar vacÃƒÂ­o")
 
     # Convertir a string y eliminar espacios
     valor = str(raw_principal).strip().lower()
@@ -647,7 +605,7 @@ def limpiar_valor_principal(raw_principal: str) -> float:
     # "2millones500mil"
     # "dos millones quinientos mil"
 
-    # Eliminar caracteres especiales y texto común
+    # Eliminar caracteres especiales y texto comÃƒÂºn
     palabras_a_eliminar = [
         'cop', 'pesos', 'valor', 'seria', 'de', 'quiero', 
         'financiar', 'necesito', 'el', 'aproximadamente',
@@ -657,26 +615,27 @@ def limpiar_valor_principal(raw_principal: str) -> float:
     for palabra in palabras_a_eliminar:
         valor = valor.replace(palabra, '')
 
-    # Eliminar símbolos monetarios y caracteres especiales
+    # Eliminar sÃƒÂ­mbolos monetarios y caracteres especiales
     valor = re.sub(r'[$ \'"]', '', valor)
 
     # Convertir puntos y comas usados como separadores de miles
     valor = valor.replace('.', '')
     valor = valor.replace(',', '')
 
-    # Extraer solo dígitos
+    # Extraer solo dÃƒÂ­gitos
     numeros = re.findall(r'\d+', valor)
     
     if not numeros:
-        raise ValueError(f"No se pudo extraer un valor numérico de: {raw_principal}")
+        raise ValueError(f"No se pudo extraer un valor numÃƒÂ©rico de: {raw_principal}")
 
-    # Unir todos los números encontrados
+    # Unir todos los nÃƒÂºmeros encontrados
     valor_limpio = ''.join(numeros)
     
     try:
         return float(valor_limpio)
     except ValueError as e:
-        raise ValueError(f"No se pudo convertir a número: {valor_limpio}") from e
+        await error_notify("limpiar_valor_principal", "N/A", f"Error al convertir a numero: {valor_limpio}")
+        raise ValueError(f"No se pudo convertir a numero: {valor_limpio}") from e
 
 # Ejemplo de uso:
 
@@ -686,12 +645,12 @@ async def calcular_financiamiento(payload: dict):
     """
     Calcula el financiamiento basado en:
     1. Cuota inicial = principal * porcentaje_cuota
-    2. Plazo en días = plazo_escogido * paymentFrequency
+    2. Plazo en dÃƒÂ­as = plazo_escogido * paymentFrequency
     3. Consulta a la API Kuenta para obtener el porcentaje de Aval
     4. Calcula desembolso, deducciones y valor a solicitar
     """
     method_name = "calcular_financiamiento"
-    linea_producto_notify_error = f"línea_producto={payload.get('linea_producto')}"
+    linea_producto_notify_error = f"linea_producto={payload.get('linea_producto')}"
 
     try:
         logger.info(f"###--- Payload recibido: ###---  \n {payload} \n")
@@ -704,7 +663,13 @@ async def calcular_financiamiento(payload: dict):
             raise HTTPException(status_code=400, detail="Debe incluir 'linea_producto' en el payload")
         
         # --- PROCESAR SEMESTRE, el dato entra como una palabra ejemplo "segundo semestre" y debe devolver el numero del semestre ---
-        semestre_texto = str(payload.get("semestre_renovación_menu", "")).strip().lower()
+        semestre_keys = [
+            "semestre_renovacion_menu",
+            "semestre_renovación_menu",
+            "semestre",
+        ]
+        semestre_texto_raw = next((payload.get(k) for k in semestre_keys if payload.get(k) is not None), "")
+        semestre_texto = unicodedata.normalize("NFKD", str(semestre_texto_raw)).encode("ascii", "ignore").decode("ascii").strip().lower()
         semestres_map = {
             "primer semestre": 1,
             "segundo semestre": 2,
@@ -712,12 +677,10 @@ async def calcular_financiamiento(payload: dict):
             "cuarto semestre": 4,
             "quinto semestre": 5,
             "sexto semestre": 6,
-            "séptimo semestre": 7,
-            #"septimo semestre": 7,   # variante sin tilde
+            "septimo semestre": 7,
             "octavo semestre": 8,
             "noveno semestre": 9,
-            "décimo semestre": 10
-            #"decimo semestre": 10    # variante sin tilde
+            "decimo semestre": 10
         }
         
         if not semestre_texto:
@@ -730,7 +693,8 @@ async def calcular_financiamiento(payload: dict):
             raise HTTPException(status_code=400, detail=f"El semestre '{semestre_texto}' no es válido. Use: primer semestre, segundo semestre, etc.")
 
         # --- PROCESAR PLAZO_VALOR_PAGAR, el dato entra en string y debe devolverse como un numero ---
-        plazo_texto = str(payload.get("plazo_valor_pagar")).strip().lower()
+        plazo_texto_raw = payload.get("plazo_valor_pagar", "")
+        plazo_texto = unicodedata.normalize("NFKD", str(plazo_texto_raw)).encode("ascii", "ignore").decode("ascii").strip().lower()
         plazo_map = {
             "1 mes": 1,
             "2 meses": 2,
@@ -747,7 +711,7 @@ async def calcular_financiamiento(payload: dict):
         plazo_valor = plazo_map.get(plazo_texto)
         if plazo_valor is None:
             await error_notify(method_name, linea_producto_notify_error, f"Valor de plazo '{plazo_texto}' no reconocido")
-            raise HTTPException(status_code=400, detail=f"El plazo '{plazo_texto}' no es válido. Use: a un mes, a dos meses, etc.")
+            raise HTTPException(status_code=400, detail=f"El plazo '{plazo_texto}' no es valido. Use: a un mes, a dos meses, etc.")
         
         logger.info(f"plazo_valor procesado: {plazo_valor} \n")
         logger.info (f"numero de semestre procesado: {numero_semestre} \n")
@@ -759,7 +723,7 @@ async def calcular_financiamiento(payload: dict):
             await error_notify(method_name, linea_producto_notify_error, f"Error en el valor principal: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Error en el valor principal: {str(e)}")
 
-        # Porcentaje de cuota (sin símbolo %)
+        # Porcentaje de cuota (sin sÃƒÂ­mbolo %)
         porcentaje_str = str(payload.get("porcentaje_cuota", "0")).replace("%", "").strip()
         porcentaje_cuota = float(porcentaje_str) / 100
 
@@ -772,7 +736,7 @@ async def calcular_financiamiento(payload: dict):
         #logger.info (f"plazo escogido para realizar los calculos: {plazo_escogido} \n")
         
 
-        # --- CÁLCULOS INICIALES ---
+        # --- CÃƒLCULOS INICIALES ---
         valor_cuota_inicial = principal * porcentaje_cuota
         dias_totales = plazo_escogido * payment_frequency
 
@@ -780,8 +744,8 @@ async def calcular_financiamiento(payload: dict):
         async with httpx.AsyncClient(timeout=15.0) as client:
             token = await obtener_token(client)
             if not token:
-                await error_notify(method_name, linea_producto_notify_error, "No se pudo obtener token de autenticación")
-                raise HTTPException(status_code=401, detail="No se pudo obtener token de autenticación")
+                await error_notify(method_name, linea_producto_notify_error, "No se pudo obtener token de autenticacion")
+                raise HTTPException(status_code=401, detail="No se pudo obtener token de autenticacion")
 
             KUENTA_URL = f"https://api.kuenta.co/v1/products/{linea_producto}"
             headers = {
@@ -795,8 +759,8 @@ async def calcular_financiamiento(payload: dict):
                 resp.raise_for_status()
                 product_data = resp.json().get("data", {}).get("product", {})
             except httpx.RequestError as e:
-                await error_notify(method_name, linea_producto_notify_error, f"Error de conexión con la API de Kuenta: {e}")
-                raise HTTPException(status_code=502, detail=f"Error de conexión con la API de Kuenta: {e}")
+                await error_notify(method_name, linea_producto_notify_error, f"Error de conexion con la API de Kuenta: {e}")
+                raise HTTPException(status_code=502, detail=f"Error de conexion con la API de Kuenta: {e}")
             except httpx.HTTPStatusError as e:
                 await error_notify(method_name, linea_producto_notify_error, f"Error de respuesta de Kuenta: {e.response.text}")
                 raise HTTPException(status_code=e.response.status_code, detail=f"Error de respuesta de Kuenta: {e.response.text}")
@@ -813,10 +777,10 @@ async def calcular_financiamiento(payload: dict):
             None
         )
         if aval_porcentaje is None:
-            await error_notify(method_name, linea_producto_notify_error, "No se encontró porcentaje de Aval en el producto")
-            raise HTTPException(status_code=404, detail="No se encontró porcentaje de Aval en el producto")
+            await error_notify(method_name, linea_producto_notify_error, "No se encontro porcentaje de Aval en el producto")
+            raise HTTPException(status_code=404, detail="No se encontro porcentaje de Aval en el producto")
         logger.info(f"Porcentaje de Aval obtenido de la linea: {aval_porcentaje}% \n")
-        # --- CÁLCULOS FINALES ---
+        # --- CALCULOS FINALES ---
         valor_desembolsar = principal - valor_cuota_inicial
         if (1 - aval_porcentaje) == 0:
             await error_notify(method_name, linea_producto_notify_error, "El porcentaje de aval no puede ser 100%")
@@ -825,7 +789,7 @@ async def calcular_financiamiento(payload: dict):
         valor_solicitar = valor_desembolsar / (1 - aval_porcentaje)
         deducciones_anticipadas = valor_solicitar * aval_porcentaje
         
-        # --- FORMATEO PARA DEMOSTRACIÓN ---
+        # --- FORMATEO PARA DEMOSTRACION ---
         demostracion_valor_producto = f"${principal:,.0f}"
         demostracion_cuota_inicial = f"${valor_cuota_inicial:,.0f}"
         demostracion_valor_desembolsar = f"${valor_desembolsar:,.0f}"
@@ -835,32 +799,32 @@ async def calcular_financiamiento(payload: dict):
         logger.info (f"numero de semestre procesado: {numero_semestre} semestre \n")
         logger.info(f"plazo_valor_pagar procesado: {plazo_valor} meses \n")
         
-        logger.info(f"----- Resumen de cálculos realizados ----- \n")
+        logger.info(f"----- Resumen de calculos realizados ----- \n")
         logger.info(f"Valor del producto (principal): {demostracion_valor_producto} \n")
         logger.info(f"Cuota inicial (valor_cuota_inicial): {demostracion_cuota_inicial} \n")
         logger.info(f"Valor a desembolsar (valor_desembolsar): {demostracion_valor_desembolsar} \n")
         logger.info(f"Deducciones anticipadas (deducciones_anticipadas): {demostracion_deducciones} \n")
         logger.info(f"Valor a solicitar (valor_solicitar): {demostracion_valor_solicitar} \n")
         logger.info(f"Aval aplicado porcentaje (aval_porcentaje): {aval_porcentaje} \n")
-        logger.info(f"Plazo en días (plazo_dias): {dias_totales} \n")
+        logger.info(f"Plazo en dias (plazo_dias): {dias_totales} \n")
         logger.info(f"Porcentaje escogido (porcentaje_str): {porcentaje_str}% \n")
         
-        logger.info("Cálculo completado correctamente. \n")
-        logger.info("-------------fin de la ejecución------------------ \n")
+        logger.info("CAlculo completado correctamente. \n")
+        logger.info("-------------fin de la ejecucion------------------ \n")
         
         
         MENSAJES_USUARIO = {
-            "valor_invalido": "El monto ingresado no es válido. Por favor ingresa un valor numérico, por ejemplo: 2500000 o $2.500.000",
-            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no está disponible en este momento. Por favor intenta nuevamente más tarde.",
-            "semestre_invalido": "El semestre ingresado no es válido. Por favor selecciona una opción entre 'primer semestre' y 'décimo semestre'.",
-            "plazo_invalido": "El plazo seleccionado no es válido. Por favor escoge entre 1 y 6 meses.",
+            "valor_invalido": "El monto ingresado no es vÃƒÂ¡lido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
+            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no estÃƒÂ¡ disponible en este momento. Por favor intenta nuevamente mÃƒÂ¡s tarde.",
+            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'dÃƒÂ©cimo semestre'.",
+            "plazo_invalido": "El plazo seleccionado no es valido. Por favor escoge entre 1 y 6 meses.",
             "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
             "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
             "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
         }
         
         #notificacion informativa
-        info_message = f"Cálculo de financiamiento realizado correctamente en etapa de simulacion \n ID linea de producto: {linea_producto}"
+        info_message = f"Calculo de financiamiento realizado correctamente en etapa de simulacion \n ID linea de producto: {linea_producto}"
         await info_notify(method_name, linea_producto_notify_error, info_message)
         return {
             "valor_producto": principal,
@@ -875,7 +839,7 @@ async def calcular_financiamiento(payload: dict):
             "plazo_valor_pagar_meses": plazo_valor,
             "plazo_escogido_meses": plazo_escogido,
             
-            # Agregar valores formateados para demostración
+            # Agregar valores formateados para demostracion
             "valor_producto_demostracion": demostracion_valor_producto,
             "cuota_inicial_demostracion": demostracion_cuota_inicial,
             "valor_desembolsar_demostracion": demostracion_valor_desembolsar,
@@ -899,14 +863,14 @@ async def calcular_financiamiento(payload: dict):
             mensaje_usuario = MENSAJES_USUARIO["semestre_invalido"]
         elif "plazo" in str(e.detail):
             mensaje_usuario = MENSAJES_USUARIO["plazo_invalido"]
-        elif "línea_producto" in str(e.detail):
+        elif "lÃƒÂ­nea_producto" in str(e.detail):
             mensaje_usuario = MENSAJES_USUARIO["linea_no_existe"]
             
         await error_notify(method_name, linea_producto_notify_error, e.detail)
         return {
             "estado": "error",
             "mensaje": mensaje_usuario,
-            "detalles_usuario": "Si el problema persiste, por favor comunícate con nuestro servicio al cliente."
+            "detalles_usuario": "Si el problema persiste, por favor comuni­cate con nuestro servicio al cliente."
         }
 
     except Exception as e:
@@ -915,7 +879,7 @@ async def calcular_financiamiento(payload: dict):
         return {
             "estado": "error", 
             "mensaje": MENSAJES_USUARIO["error_conexion"],
-            "detalles_usuario": "Nuestro equipo técnico ha sido notificado del inconveniente."
+            "detalles_usuario": "Nuestro equipo tÃƒÂ©cnico ha sido notificado del inconveniente."
         }
 
 
@@ -935,20 +899,20 @@ async def obtener_estado(debtor_id:str,request: Request):
         installmentid = body.get("installmentid")
         orderid = body.get("orderid")
         debtor_id_notify_error = f"debtor_id_cliente =  {debtor_id} y creditid = {creditid}"
-        logger.info(f"+++++ Parámetros recibidos en el body: creditid= ++++++++, \n {creditid} \n")
-        logger.info(f"+++++ Parámetros recibidos en el body: installmentid= ++++++++, \n {installmentid} \n")
-        logger.info(f"+++++ Parámetros recibidos en el body: orderid= ++++++++, \n {orderid} \n")
+        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: creditid= ++++++++, \n {creditid} \n")
+        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: installmentid= ++++++++, \n {installmentid} \n")
+        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: orderid= ++++++++, \n {orderid} \n")
         
 
         if not creditid or not installmentid or not orderid:
-            raise HTTPException(status_code=400, detail="Faltan parámetros obligatorios: creditid, installmentid, orderid")
+            raise HTTPException(status_code=400, detail="Faltan parÃƒÂ¡metros obligatorios: creditid, installmentid, orderid")
 
         url = f"https://api.kuenta.co/v1/payable/{creditid}/installment/0/order/list/{orderid}"
         intentos = 3
         intervalo_segundos = 10
         intento = 0
 
-        logger.info(f"Parámetros recibidos: creditid={creditid}, installmentid={installmentid}, orderid={orderid}")
+        logger.info(f"ParÃƒÂ¡metros recibidos: creditid={creditid}, installmentid={installmentid}, orderid={orderid}")
 
         async with httpx.AsyncClient() as client:
             # Obtener token una sola vez
@@ -996,7 +960,7 @@ async def obtener_estado(debtor_id:str,request: Request):
 
 #### endpoints para pruebas de notificaciones ###
 
-# Endpoint que llama a error_notify (envía email + telegram)
+# Endpoint que llama a error_notify (envÃƒÂ­a email + telegram)
 @app.post("/test-notify")
 async def test_notify(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1006,7 +970,7 @@ async def test_notify(payload: TestNotifyRequest = Body(...)):
         logger.exception("Error en /test-notify")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# Endpoint para probar solo envío por email
+# Endpoint para probar solo envÃƒÂ­o por email
 @app.post("/test-email")
 async def test_email(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1016,7 +980,7 @@ async def test_email(payload: TestNotifyRequest = Body(...)):
         logger.exception("Error en /test-email")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# Endpoint para probar solo envío a Telegram
+# Endpoint para probar solo envÃƒÂ­o a Telegram
 @app.post("/test-telegram")
 async def test_telegram(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1027,14 +991,14 @@ async def test_telegram(payload: TestNotifyRequest = Body(...)):
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
 
-# Endpoint para enviar correo de renovación de crédito con validaciones
-@app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraídas.",tags=["Correo_post_llamada"])
+# Endpoint para enviar correo de renovaciÃƒÂ³n de crÃƒÂ©dito con validaciones
+@app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraÃƒÂ­das.",tags=["Correo_post_llamada"])
 async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     """
     Endpoint principal que recibe el payload del webhook.
 
-    1.  Valida automáticamente el payload contra el modelo `WebhookPayload`.
-    2.  Llama al servicio `procesar_webhook` para manejar toda la lógica.
+    1.  Valida automaticamente el payload contra el modelo `WebhookPayload`.
+    2.  Llama al servicio `procesar_webhook` para manejar toda la logica.
     3.  Retorna una respuesta JSON.
     """
     try:
@@ -1042,26 +1006,37 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         
         logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
         
-        logging.info(f"Objetivo extraído: {payload.extracted_variables.objetivo} \n")
+        logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
         
-        # Lógica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
+        # Logica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
         if payload.extracted_variables.objetivo == "webinar":
             logging.info("El objetivo es 'webinar'. Llamando a procesar_webhook_webinar.")
             resultado = await procesar_webhook_webinar(payload)
             logging.info(f"Procesamiento completado para webinar: {payload.input_variables.NOMBRE_TITULAR}")
+            await info_notify(
+                method_name="handle_webhook_webinar",
+                client_id=payload.extracted_variables.objetivo,
+                info_message=f"Webhook de webinar procesado exitosamente para {payload.input_variables.NOMBRE_TITULAR} \n resultado : {resultado} "
+            )
             return {"status": "success", "message": "Webhook de webinar procesado", "data": resultado}
+        
         
         elif payload.extracted_variables.objetivo == "renovacion":
             logging.info("El objetivo es 'renovacion'. Llamando a procesar_webhook_renovacion.")
-            # Delega toda la lógica al servicio
+            
             resultado = await procesar_webhook_renovacion(payload)
+            
         
         logging.info(f"Procesamiento completado para: {payload.input_variables.NOMBRE_TITULAR}")
+        await info_notify(
+            method_name="handle_webhook_renovacion",
+            client_id=payload.extracted_variables.objetivo,
+            info_message=f"Webhook de renovacion procesado exitosamente para {payload.input_variables.NOMBRE_TITULAR} \n resultado : {resultado} "
+        )
         return {"status": "success", "message": "Webhook procesado", "data": resultado}
 
     except Exception as e:
         logging.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
-        # Lanza una excepción HTTP que FastAPI convertirá en una respuesta de error
         raise HTTPException(
             status_code=500, 
             detail=f"Error interno del servidor: {str(e)}"
@@ -1069,26 +1044,26 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
 
 
 # Endpoint para registrar renovaciones en la base de datos
-@app.post("/renovaciones", tags=["Renovaciones"], summary="Registrar renovación de cliente")
+@app.post("/renovaciones", tags=["Renovaciones"], summary="Registrar renovaciÃƒÂ³n de cliente")
 async def registrar_renovacion(payload: RenovacionPayload):
     """
-    Endpoint para registrar una renovación de crédito en la base de datos.
+    Endpoint para registrar una renovacion de credito en la base de datos.
     
     Recibe:
-    - estado_final_renovacion: Estado final de la renovación
+    - estado_final_renovacion: Estado final de la renovacion
     - estado_pago_payvalida: Estado del pago en PayValida
     - nombre_cliente: Nombre del cliente
     
     Retorna:
-    - Confirmación de inserción y mensaje de éxito
+    - Confirmacion de insercion y mensaje de exito
     """
     method_name = "registrar_renovacion"
     
     try:
         
-        logger.info(f"Intentando registrar renovación para: {payload.nombre_cliente}")
+        logger.info(f"Intentando registrar renovaciÃƒÂ³n para: {payload.nombre_cliente}")
         
-        # Crear conexión asincrónica a la base de datos
+        # Crear conexiÃƒÂ³n asincrÃƒÂ³nica a la base de datos
         connection = await aiomysql.connect(
             host=db_host,
             user=db_user,
@@ -1105,7 +1080,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     VALUES (%s, %s, %s)
                 """
                 
-                # Ejecutar la inserción
+                # Ejecutar la inserciÃƒÂ³n
                 await cursor.execute(
                     query,
                     (
@@ -1115,17 +1090,17 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     )
                 )
                 
-                # Confirmar la transacción
+                # Confirmar la transacciÃƒÂ³n
                 await connection.commit()
                 
-                # Obtener el ID de la renovación insertada
+                # Obtener el ID de la renovaciÃƒÂ³n insertada
                 insertado_id = cursor.lastrowid
                 
-                logger.info(f"Renovación registrada exitosamente con ID: {insertado_id}")
+                logger.info(f"RenovaciÃƒÂ³n registrada exitosamente con ID: {insertado_id}")
                 
-                # Enviar notificación informativa
+                # Enviar notificaciÃƒÂ³n informativa
                 info_message = (
-                    f"Renovación registrada exitosamente en la base de datos\n"
+                    f"RenovaciÃƒÂ³n registrada exitosamente en la base de datos\n"
                     f"Cliente: {payload.nombre_cliente}\n"
                     f"Estado Final: {payload.estado_final_renovacion}\n"
                     f"Estado Pago: {payload.estado_pago_payvalida}\n"
@@ -1143,15 +1118,14 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     status_code=201,
                     content={
                         "status": "success",
-                        "message": "Renovación registrada exitosamente",
+                        "message": "RenovaciÃƒÂ³n registrada exitosamente",
                         "id_registro": insertado_id,
                         "cliente": payload.nombre_cliente,
                         "estado_final_renovacion": payload.estado_final_renovacion,
                         "estado_pago_payvalida": payload.estado_pago_payvalida,
                         "timestamp": datetime.now(timezone.utc).isoformat()
                     }
-                )
-                
+                )      
         finally:
             connection.close()
     
@@ -1167,7 +1141,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
             content={
                 "status": "error",
                 "message": "Error al conectar con la base de datos",
-                "detail": "No se pudo registrar la renovación"
+                "detail": "No se pudo registrar la renovaciÃƒÂ³n"
             }
         )
     
@@ -1191,9 +1165,9 @@ async def registrar_renovacion(payload: RenovacionPayload):
 @app.get("/logs")
 async def get_logs(limit: int = 20):
     """
-    Devuelve los últimos logs enviados (correo + Telegram).
+    Devuelve los ÃƒÂºltimos logs enviados (correo + Telegram).
     Se puede consultar por Postman o navegador.
-    Manejo seguro cuando la caché esté vacía o ocurra un error.
+    Manejo seguro cuando la cachÃƒÂ© estÃƒÂ© vacÃƒÂ­a o ocurra un error.
     """
     try:
         logs = await get_cached_logs(limit)
@@ -1201,6 +1175,6 @@ async def get_logs(limit: int = 20):
             return {"count": 0, "logs": []}
         return {"count": len(logs), "logs": logs}
     except Exception as e:
-        logger.exception("Error al obtener logs desde la caché")
-        # No lanzar excepción para no interrumpir el servidor; devolver estructura vacía
+        logger.exception("Error al obtener logs desde la cachÃƒÂ©")
+        # No lanzar excepciÃƒÂ³n para no interrumpir el servidor; devolver estructura vacÃƒÂ­a
         return {"count": 0, "logs": []}
