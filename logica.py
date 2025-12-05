@@ -1036,10 +1036,25 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         return {"status": "success", "message": "Webhook procesado", "data": resultado}
 
     except Exception as e:
+        # No devolver 500 para evitar que el proveedor del webhook reintente
+        # y provoque envíos duplicados. Registramos y notificamos, y
+        # respondemos 200 con detalle del error interno.
         logging.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error interno del servidor: {str(e)}"
+        try:
+            await error_notify(
+                method_name="handle_webhook",
+                client_id=(payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"),
+                error_message=f"Error en el endpoint /webhook: {str(e)}",
+            )
+        except Exception:
+            logging.exception("Fallo al enviar notificacion de error")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "message": "Error interno (registrado). No se reintentará desde el servidor.",
+                "detail": str(e),
+            },
         )
 
 

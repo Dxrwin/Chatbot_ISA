@@ -1,6 +1,6 @@
 from typing import Optional, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class InputVariables(BaseModel):
@@ -25,6 +25,19 @@ class InputVariables(BaseModel):
     # Permite campos adicionales y acepta alias/camelCase
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
+    @field_validator("Contacto", "Celular", "PHONE_NUMBER", mode="before")
+    @classmethod
+    def _cast_phone_like_to_str(cls, v: Any) -> Optional[str]:
+        """
+        Convierte enteros u otros tipos sencillos a str para evitar 422 cuando llegan numeros.
+        """
+        if v is None:
+            return None
+        try:
+            return str(v)
+        except Exception:
+            return v
+
 
 class ExtractedVariables(BaseModel):
     """
@@ -41,7 +54,7 @@ class ExtractedVariables(BaseModel):
     correo_cliente: Optional[str] = Field(None, alias="correoCliente")
     primer_name: Optional[str] = Field(None, alias="primerName")
     desicion_correo: Optional[bool] = Field(None, alias="desicionCorreo")
-    ambiguedad: Optional[bool] = Field(None, alias="ambiguedad")
+    ambiguedad: Optional[bool] = Field(None, alias="ambig\u00fcedad")
     objetivo: Optional[str] = None
     interessolicitud: Optional[str] = Field(None, alias="interesSolicitud")
 
