@@ -186,7 +186,7 @@ async def error_notify(method_name: str, client_id: str, error_message: str):
     # Ejecutar envíos en paralelo
     
     results = await asyncio.gather(
-        send_log_email(method_name, client_id, error_message),
+        # send_log_email(method_name, client_id, error_message),
         send_log_telegram(method_name, client_id, error_message),
         return_exceptions=True
     )
@@ -216,7 +216,7 @@ async def info_notify(method_name: str, client_id: str, info_message: str, entit
     Guarda registro en cache con tipo "info".
     """
     results = await asyncio.gather(
-        send_info_email(method_name, client_id, info_message, entity_id),
+        # send_info_email(method_name, client_id, info_message, entity_id),
         send_info_telegram(method_name, client_id, info_message, entity_id),
         return_exceptions=True
     )

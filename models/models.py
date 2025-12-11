@@ -19,7 +19,6 @@ class InputVariables(BaseModel):
     SEMESTRE: Optional[int] = None
     LINEA_CREDITO: Optional[str] = None
     ESTADO_CREDITO: Optional[str] = None
-    LINK: Optional[str] = None
     CUOTAS_PENDIENTES: Optional[int] = None
 
     # Permite campos adicionales y acepta alias/camelCase

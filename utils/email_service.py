@@ -128,15 +128,15 @@ async def _send_async_email(message: MIMEMultipart, destinatario: str | None = N
     except Exception as exc:
         logging.error("Error al encolar notificacion de fallo SMTP: %s", exc)
 
-    return {
-        "status": "error",
-        "message": f"No se pudo enviar correo. Error: {error_type}",
-        "destinatario": destinatario_real,
-        "intentos": 1,
-    }
+    # return {
+    #     "status": "error",
+    #     "message": f"No se pudo enviar correo. Error: {error_type}",
+    #     "destinatario": destinatario_real,
+    #     "intentos": 1,
+    # }
 
 
-async def enviar_correo_renovacion(destinatario: str, nombre: str, link_renovacion: str, semestre: str, link_asesor: str) -> dict:
+async def enviar_correo_renovacion(destinatario: str, nombre: str, semestre: str, link_asesor: str) -> dict:
     """
     Construye y envia el correo HTML de renovacion.
     Retorna dict con status success/error.
@@ -148,7 +148,7 @@ async def enviar_correo_renovacion(destinatario: str, nombre: str, link_renovaci
         semestre_texto = f"para el semestre {semestre}" if semestre else "para el próximo semestre"
         cuerpo_html = html_template.replace("{{NOMBRE}}", nombre)
         cuerpo_html = cuerpo_html.replace("{{SEMESTRE_INFO}}", semestre_texto)
-        cuerpo_html = cuerpo_html.replace("{{LINK_RENOVACION}}", link_renovacion or link_asesor)
+        cuerpo_html = cuerpo_html.replace("{{LINK_RENOVACION}}", link_asesor)
         cuerpo_html = cuerpo_html.replace("{{LINK_ASESOR}}", link_asesor)
 
         msg = MIMEMultipart("alternative")

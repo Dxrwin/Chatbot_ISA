@@ -113,8 +113,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
 
         confirmacion_response = await enviar_correo_renovacion(
             destinatario=destinatario,
-            nombre=primer_name or "Cliente Onetwocredit",
-            link_renovacion=input_vars.LINK,
+            nombre=primer_name or "Cliente One2credit",
             semestre=str(input_vars.SEMESTRE),
             link_asesor=link_whatsapp_asesor,
         )
@@ -124,6 +123,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
         
         # Si el correo NO se envió exitosamente
         if confirmacion_response.get("status") != "success":
+            logging.error(f"❌ Error en envio de correo de renovacion a {destinatario}: {confirmacion_response.get('message')}")
             logging.warning(f"El correo no fue enviado: {confirmacion_response.get('message')}")
             logging.warning(f"Detalles: {confirmacion_response}")
             
@@ -188,7 +188,6 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             "enviado_a": input_vars.NOMBRE_TITULAR,
             "correo_destinatario": destinatario,
             "intentos_correo": confirmacion_response.get("intentos"),
-            "link_renovacion": input_vars.LINK,
             "numero_telefono": numero_telefono_input,
             "linea_universitaria": linea_universitaria,
             "id_flujo_bd": flujo_id,
@@ -310,6 +309,7 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
     
     
     try:
+        #luego de las validaciones envia el correo
         confirmacion_response = await enviar_correo_webinar(
             destinatario=destinatario,
             nombre=primer_name or "Cliente Onetwocredit",

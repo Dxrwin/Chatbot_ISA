@@ -90,7 +90,7 @@ app = FastAPI(lifespan=lifespan)
 @app.middleware("http")
 async def check_server_restart(request: Request, call_next):
     """
-    Middleware que detecta reinicios del servidor por cambios en el cÃƒÂ³digo
+    Middleware que detecta reinicios del servidor por cambios en el codigo
     """
     try:
         if not hasattr(app.state, "server_started"):
@@ -108,7 +108,7 @@ async def check_server_restart(request: Request, call_next):
             )
             logger.info("Servidor reiniciado y notificaciones enviadas")
     except Exception as e:
-        logger.error(f"Error al enviar notificaciÃƒÂ³n de reinicio: {e}")
+        logger.error(f"Error al enviar notificación de reinicio: {e}")
     
     return await call_next(request)
 
@@ -990,7 +990,7 @@ async def test_telegram(payload: TestNotifyRequest = Body(...)):
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
 
-# Endpoint para enviar correo de renovaciÃƒÂ³n de crÃƒÂ©dito con validaciones
+# Endpoint para enviar correo de renovacion de credito con validaciones
 @app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraÃƒÂ­das.",tags=["Correo_post_llamada"])
 async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     """
@@ -1001,11 +1001,11 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     3.  Retorna una respuesta JSON.
     """
     try:
-        logging.info(f"Webhook recibido. Procesando para: {payload.input_variables.NOMBRE_TITULAR} \n")
+        
         
         logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
         
-        logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
+        # logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
         
         # Logica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
         objetivo = payload.extracted_variables.objetivo
@@ -1013,7 +1013,10 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         
         if objetivo == "webinar":
             logging.info("El objetivo es 'webinar'. Llamando a procesar_webhook_webinar.")
+            
+            #empieza aqui
             resultado = await procesar_webhook_webinar(payload)
+            
             logging.info(f"Procesamiento completado para webinar: {payload.input_variables.NOMBRE_TITULAR}")
             
             #Validar explicitamente el resultado
@@ -1050,7 +1053,11 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         
         elif objetivo == "renovacion":
             logging.info("El objetivo es 'renovacion'. Llamando a procesar_webhook_renovacion.")
+            
+            
             resultado = await procesar_webhook_renovacion(payload)
+            
+            
             logging.info(f"Procesamiento completado para renovacion: {payload.input_variables.NOMBRE_TITULAR}")
             
             #Validar explicitamente el resultado
