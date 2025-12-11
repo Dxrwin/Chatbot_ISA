@@ -1,144 +1,119 @@
-import logging
 import asyncio
+import logging
+import smtplib
+import ssl
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-import aiosmtplib
+from functools import partial
 
 from utils.config import settings
 from utils.email_template import get_html_template, get_html_template_webinar
 from utils.notify_error import error_notify
 
+# Pool de hilos para ejecutar las operaciones SMTP sin bloquear el event loop
+SMTP_THREAD_POOL = ThreadPoolExecutor(max_workers=5)
 
-async def _send_async_email(message: MIMEMultipart, destinatario: str = None) -> dict:
+
+def _send_email_sync(message: MIMEMultipart, destinatario_real: str, timeout_seconds: int) -> dict:
     """
-    Envía correo SMTP con 2 intentos y backoff.
-    
-    Retorna dict:
-    {
-        "status": "success" | "error",
-        "message": "descripción",
-        "destinatario": "email",
-        "intentos": número
+    Envia el correo de manera sincrona usando smtplib.
+    Esta funcion se corre dentro de un thread del pool configurado arriba.
+    """
+    use_tls = settings.SMTP_PORT == 465
+    context = ssl.create_default_context()
+
+    logging.info("Conectando a servidor SMTP %s:%s", settings.SMTP_SERVER, settings.SMTP_PORT)
+    if use_tls:
+        smtp_client = smtplib.SMTP_SSL(
+            host=settings.SMTP_SERVER,
+            port=settings.SMTP_PORT,
+            timeout=timeout_seconds,
+            context=context,
+        )
+    else:
+        smtp_client = smtplib.SMTP(
+            host=settings.SMTP_SERVER,
+            port=settings.SMTP_PORT,
+            timeout=timeout_seconds,
+        )
+
+    with smtp_client as smtp:
+        smtp.ehlo()
+        if not use_tls:
+            logging.info("Ejecutando STARTTLS para la conexion SMTP")
+            smtp.starttls(context=context)
+            smtp.ehlo()
+
+        logging.info("Autenticando contra SMTP como %s", settings.SMTP_USER)
+        smtp.login(settings.SMTP_USER, settings.SMTP_PASS)
+
+        logging.info("Enviando mensaje SMTP a %s", destinatario_real)
+        smtp.send_message(message)
+
+    logging.info("Envio SMTP completado para %s", destinatario_real)
+    return {
+        "status": "success",
+        "message": "Correo enviado exitosamente",
+        "destinatario": destinatario_real,
+        "intentos": 1,
     }
-    
-    NUNCA lanza excepción. Notifica error y detiene tras 2 intentos fallidos.
+
+
+async def _send_async_email(message: MIMEMultipart, destinatario: str | None = None) -> dict:
     """
-    destinatario_real = destinatario or message.get('To', 'desconocido')
-    
-    if not destinatario_real or '@' not in destinatario_real:
-        logging.error(f"Correo destino invalido. Formato: {destinatario_real}")
+    Wrapper asincrono que valida el destinatario y delega el envio SMTP
+    a un hilo del pool para evitar bloquear el event loop.
+    """
+    destinatario_real = destinatario or message.get("To", "desconocido")
+    if not destinatario_real or "@" not in destinatario_real:
+        logging.error("Correo destino invalido. Formato recibido: %s", destinatario_real)
         return {
             "status": "error",
             "message": f"Correo invalido: {destinatario_real}",
             "destinatario": destinatario_real,
-            "intentos": 0
+            "intentos": 0,
         }
-    
-    use_tls = settings.SMTP_PORT == 465
-    timeout_seconds = 20
-    max_intentos = 2
-    backoff_seconds = 3
-    last_error = None
-    
-    logging.info(f"Iniciando envio de correo a: {destinatario_real}")
-    logging.info(f"Servidor SMTP: {settings.SMTP_SERVER}:{settings.SMTP_PORT}")
-    logging.info(f"Modo conexion: SSL (465)" if use_tls else "STARTTLS (587)")
-    logging.info(f"Timeout: {timeout_seconds}s. Reintentos: {max_intentos}")
 
-    for intento in range(1, max_intentos + 1):
-        try:
-            logging.info(f"Intento {intento}/{max_intentos}: Conectando a servidor SMTP...")
-            
-            async with aiosmtplib.SMTP(
-                hostname=settings.SMTP_SERVER,
-                port=settings.SMTP_PORT,
-                timeout=timeout_seconds,
-                use_tls=use_tls,
-            ) as smtp:
-                logging.info(f"Intento {intento}/{max_intentos}: Conectado exitosamente")
-                
-                if settings.SMTP_PORT == 587:
-                    logging.info(f"Intento {intento}/{max_intentos}: Ejecutando STARTTLS...")
-                    await smtp.starttls()
-                    logging.info(f"Intento {intento}/{max_intentos}: STARTTLS completado")
-                
-                logging.info(f"Intento {intento}/{max_intentos}: Autenticando con usuario: {settings.SMTP_USER}")
-                await smtp.login(settings.SMTP_USER, settings.SMTP_PASS)
-                logging.info(f"Intento {intento}/{max_intentos}: Autenticacion exitosa")
-                
-                logging.info(f"Intento {intento}/{max_intentos}: Enviando mensaje...")
-                await smtp.send_message(message)
-                logging.info(f"Intento {intento}/{max_intentos}: Mensaje enviado")
+    timeout_seconds = 15
+    loop = asyncio.get_running_loop()
 
-            logging.info(f"EXITO: Correo enviado a {destinatario_real} en intento {intento}")
-            return {
-                "status": "success",
-                "message": "Correo enviado exitosamente",
-                "destinatario": destinatario_real,
-                "intentos": intento
-            }
+    error_type = "UnknownError"
+    error_msg = "Error desconocido"
 
-        except asyncio.TimeoutError as e:
-            last_error = e
-            logging.warning(f"Intento {intento}/{max_intentos}: TIMEOUT - Conexion agotada. {str(e)[:80]}")
-            if intento < max_intentos:
-                logging.info(f"Esperando {backoff_seconds}s antes del siguiente intento...")
-                await asyncio.sleep(backoff_seconds)
-
-        except aiosmtplib.SMTPConnectTimeoutError as e:
-            last_error = e
-            logging.warning(f"Intento {intento}/{max_intentos}: CONNECT TIMEOUT - Servidor no responde en {timeout_seconds}s")
-            logging.warning(f"Servidor: {settings.SMTP_SERVER}:{settings.SMTP_PORT}")
-            if intento < max_intentos:
-                logging.info(f"Esperando {backoff_seconds}s antes del siguiente intento...")
-                await asyncio.sleep(backoff_seconds)
-
-        except aiosmtplib.SMTPReadTimeoutError as e:
-            last_error = e
-            logging.warning(f"Intento {intento}/{max_intentos}: READ TIMEOUT - Servidor tardo en responder")
-            if intento < max_intentos:
-                logging.info(f"Esperando {backoff_seconds}s antes del siguiente intento...")
-                await asyncio.sleep(backoff_seconds)
-
-        except aiosmtplib.SMTPAuthenticationError as e:
-            last_error = e
-            logging.error(f"Intento {intento}/{max_intentos}: ERROR DE AUTENTICACION")
-            logging.error(f"Usuario: {settings.SMTP_USER}")
-            logging.error(f"Servidor: {settings.SMTP_SERVER}:{settings.SMTP_PORT}")
-            logging.error(f"Detalle: {str(e)[:100]}")
-            break
-
-        except aiosmtplib.SMTPRecipientsRefused as e:
-            last_error = e
-            logging.error(f"Intento {intento}/{max_intentos}: DESTINATARIO RECHAZADO - {destinatario_real}")
-            logging.error(f"Detalle: {str(e)[:100]}")
-            break
-
-        except Exception as e:
-            last_error = e
-            logging.error(f"Intento {intento}/{max_intentos}: ERROR INESPERADO - {type(e).__name__}: {str(e)[:100]}")
-            if intento < max_intentos:
-                logging.info(f"Esperando {backoff_seconds}s antes del siguiente intento...")
-                await asyncio.sleep(backoff_seconds)
-
-    # TRAS AGOTAR REINTENTOS - DETENER Y NOTIFICAR
-    error_type = type(last_error).__name__ if last_error else "UnknownError"
-    error_msg = str(last_error)[:200] if last_error else "Error desconocido"
-    
-    logging.error(f"FALLO DEFINITIVO: No se pudo enviar correo a {destinatario_real} tras {max_intentos} intentos")
-    logging.error(f"Tipo de error: {error_type}")
-    logging.error(f"Mensaje de error: {error_msg}")
-    logging.error(f"Accion requerida: Revisar configuracion SMTP o contactar al proveedor del servidor de correo")
+    try:
+        send_callable = partial(_send_email_sync, message, destinatario_real, timeout_seconds)
+        return await loop.run_in_executor(SMTP_THREAD_POOL, send_callable)
+    except smtplib.SMTPAuthenticationError as exc:
+        logging.error("Error de autenticacion SMTP para %s: %s", destinatario_real, exc)
+        error_type = type(exc).__name__
+        error_msg = str(exc)[:200]
+    except smtplib.SMTPRecipientsRefused as exc:
+        logging.error("Destinatario rechazado (%s): %s", destinatario_real, exc)
+        error_type = type(exc).__name__
+        error_msg = str(exc)[:200]
+    except (
+        smtplib.SMTPConnectError,
+        smtplib.SMTPDataError,
+        smtplib.SMTPServerDisconnected,
+        smtplib.SMTPException,
+    ) as exc:
+        logging.error("Error SMTP para %s: %s", destinatario_real, exc)
+        error_type = type(exc).__name__
+        error_msg = str(exc)[:200]
+    except Exception as exc:
+        logging.error("Error inesperado enviando correo a %s: %s", destinatario_real, exc)
+        error_type = type(exc).__name__
+        error_msg = str(exc)[:200]
 
     mensaje_error = (
-        f"Fallo en envio de correo tras {max_intentos} intentos agotados.\n"
+        "Envio SMTP fallido.\n"
         f"Destinatario: {destinatario_real}\n"
         f"Servidor: {settings.SMTP_SERVER}:{settings.SMTP_PORT}\n"
         f"Usuario: {settings.SMTP_USER}\n"
         f"Tipo de error: {error_type}\n"
         f"Detalle: {error_msg}\n"
-        f"Accion: Revisar configuracion SMTP, verificar credenciales y conectividad del servidor."
+        "Accion: Revisar configuracion SMTP, verificar credenciales y conectividad del servidor."
     )
 
     try:
@@ -146,24 +121,24 @@ async def _send_async_email(message: MIMEMultipart, destinatario: str = None) ->
             error_notify(
                 method_name="enviar_correo",
                 client_id=destinatario_real,
-                error_message=mensaje_error
+                error_message=mensaje_error,
             )
         )
-        logging.info(f"Notificacion de error encolada para {destinatario_real}")
-    except Exception as e:
-        logging.error(f"Error al encolar notificacion: {e}")
+        logging.info("Notificacion de error encolada para %s", destinatario_real)
+    except Exception as exc:
+        logging.error("Error al encolar notificacion de fallo SMTP: %s", exc)
 
     return {
         "status": "error",
-        "message": f"No se pudo enviar correo tras {max_intentos} intentos. Error: {error_type}",
+        "message": f"No se pudo enviar correo. Error: {error_type}",
         "destinatario": destinatario_real,
-        "intentos": max_intentos
+        "intentos": 1,
     }
 
 
 async def enviar_correo_renovacion(destinatario: str, nombre: str, link_renovacion: str, semestre: str, link_asesor: str) -> dict:
     """
-    Construye y envía el correo HTML de renovación.
+    Construye y envia el correo HTML de renovacion.
     Retorna dict con status success/error.
     """
     try:
@@ -183,20 +158,20 @@ async def enviar_correo_renovacion(destinatario: str, nombre: str, link_renovaci
         msg.attach(MIMEText(cuerpo_html, "html"))
 
         return await _send_async_email(msg, destinatario)
-    
-    except Exception as e:
-        logging.error(f"Error construyendo correo de renovacion: {e}")
+
+    except Exception as exc:
+        logging.error("Error construyendo correo de renovacion: %s", exc)
         return {
             "status": "error",
-            "message": f"Error al construir correo: {str(e)}",
+            "message": f"Error al construir correo: {exc}",
             "destinatario": destinatario,
-            "intentos": 0
+            "intentos": 0,
         }
 
 
 async def enviar_correo_webinar(destinatario: str, nombre: str) -> dict:
     """
-    Construye y envía el correo HTML para invitación a webinar.
+    Construye y envia el correo HTML para invitacion a webinar.
     Retorna dict con status success/error.
     """
     try:
@@ -212,12 +187,12 @@ async def enviar_correo_webinar(destinatario: str, nombre: str) -> dict:
         msg.attach(MIMEText(cuerpo_html, "html"))
 
         return await _send_async_email(msg, destinatario)
-    
-    except Exception as e:
-        logging.error(f"Error construyendo correo de webinar: {e}")
+
+    except Exception as exc:
+        logging.error("Error construyendo correo de webinar: %s", exc)
         return {
             "status": "error",
-            "message": f"Error al construir correo: {str(e)}",
+            "message": f"Error al construir correo: {exc}",
             "destinatario": destinatario,
-            "intentos": 0
+            "intentos": 0,
         }

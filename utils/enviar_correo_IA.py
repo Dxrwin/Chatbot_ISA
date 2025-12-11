@@ -118,16 +118,41 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             semestre=str(input_vars.SEMESTRE),
             link_asesor=link_whatsapp_asesor,
         )
-        logging.info(confirmacion_response)
+        
+        #Validar explícitamente la respuesta del envío de correo
+        logging.info(f"Respuesta del envío de correo: {confirmacion_response}")
+        
+        # Si el correo NO se envió exitosamente
+        if confirmacion_response.get("status") != "success":
+            logging.warning(f"El correo no fue enviado: {confirmacion_response.get('message')}")
+            logging.warning(f"Detalles: {confirmacion_response}")
+            
+            # Notificar el error pero no reintentemos
+            await error_notify(
+                method_name="procesar_webhook_renovacion",
+                client_id=input_vars.NOMBRE_TITULAR,
+                error_message=f"Correo no enviado para renovación. Destinatario: {destinatario}. Error: {confirmacion_response.get('message')}. Detalles: {confirmacion_response}",
+            )
+            
+            return {
+                "status": "error",
+                "message": confirmacion_response.get("message", "Error desconocido al enviar correo"),
+                "correo_enviado": False,
+                "destinatario": destinatario,
+                "intentos_correo": confirmacion_response.get("intentos", 0),
+            }
+        
+        #Si el correo se envió exitosamente, proceder con BD
+        logging.info(f"✅ Correo enviado exitosamente a: {destinatario} en intento {confirmacion_response.get('intentos')}")
         
         await info_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
-            info_message=f"{confirmacion_response} hacia {destinatario} para {input_vars.NOMBRE_TITULAR}",
+            info_message=f"Correo de renovación enviado exitosamente a {destinatario} en intento {confirmacion_response.get('intentos')} para {input_vars.NOMBRE_TITULAR}",
         )
 
         flujo_id = None
-
+        #Mejorado manejo de registro en BD
         if numero_telefono_input and linea_universitaria:
             try:
                 flujo_id = await insertar_flujo_correo_post_agente(
@@ -137,32 +162,51 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
                     linea_universitaria=linea_universitaria,
                 )
                 logging.info(f"Flujo registrado en BD con ID: {flujo_id}")
+                
+                await info_notify(
+                    method_name="procesar_webhook_renovacion",
+                    client_id=input_vars.NOMBRE_TITULAR,
+                    info_message=f"Flujo de renovación registrado en BD. ID: {flujo_id}",
+                )
             except Exception as e:
                 logging.error(f"Error al registrar flujo en BD: {e}", exc_info=True)
+                await error_notify(
+                    method_name="procesar_webhook_renovacion",
+                    client_id=input_vars.NOMBRE_TITULAR,
+                    error_message=f"Correo enviado pero error al registrar flujo en BD: {e}",
+                )
+        else:
+            if not numero_telefono_input:
+                logging.warning(f"No se registró flujo: número telefónico faltante para {input_vars.NOMBRE_TITULAR}")
+            if not linea_universitaria:
+                logging.warning(f"No se registró flujo: línea universitaria faltante para {input_vars.NOMBRE_TITULAR}")
 
+        #Respuesta mejorada con flags explícitos
         return {
             "status": "success",
+            "correo_enviado": True,
             "enviado_a": input_vars.NOMBRE_TITULAR,
             "correo_destinatario": destinatario,
+            "intentos_correo": confirmacion_response.get("intentos"),
             "link_renovacion": input_vars.LINK,
-            "status_correo": "Enviado",
             "numero_telefono": numero_telefono_input,
             "linea_universitaria": linea_universitaria,
             "id_flujo_bd": flujo_id,
         }
 
     except Exception as e:
-        logging.error(f"Error al enviar correo: {e}", exc_info=True)
+        logging.error(f"Excepción en procesar_webhook_renovacion: {e}", exc_info=True)
         # Notificar el error pero no lanzar excepción para evitar que el caller
         # (webhook sender) reintente la petición y provoque envíos duplicados.
         await error_notify(
             method_name="procesar_webhook_renovacion",
             client_id=input_vars.NOMBRE_TITULAR,
-            error_message=f"Error en el servicio de envio de correo: {e}",
+            error_message=f"Excepción en servicio de correo de renovación: {e}",
         )
         return {
             "status": "error",
             "message": f"Error en el servicio de envio de correo: {e}",
+            "correo_enviado": False,
         }
 
 #validaciones par
@@ -270,15 +314,41 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
             destinatario=destinatario,
             nombre=primer_name or "Cliente Onetwocredit",
         )
-        logging.info(confirmacion_response)
+        
+        #Validar explícitamente la respuesta del envío de correo
+        logging.info(f"Respuesta del envío de correo (webinar): {confirmacion_response}")
+        
+        # Si el correo NO se envió exitosamente
+        if confirmacion_response.get("status") != "success":
+            logging.warning(f"El correo webinar no fue enviado: {confirmacion_response.get('message')}")
+            logging.warning(f"Detalles: {confirmacion_response}")
+            
+            # Notificar el error
+            await error_notify(
+                method_name="procesar_webhook_webinar",
+                client_id=variables_entrada.Nombre,
+                error_message=f"Correo webinar no enviado. Destinatario: {destinatario}. Error: {confirmacion_response.get('message')}. Detalles: {confirmacion_response}",
+            )
+            
+            return {
+                "status": "error",
+                "message": confirmacion_response.get("message", "Error desconocido al enviar correo"),
+                "correo_enviado": False,
+                "destinatario": destinatario,
+                "intentos_correo": confirmacion_response.get("intentos", 0),
+            }
+        
+        #Si el correo se envió exitosamente, proceder con BD
+        logging.info(f"Correo webinar enviado exitosamente a: {destinatario} en intento {confirmacion_response.get('intentos')}")
+        
         await info_notify(
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
-            info_message=f"{confirmacion_response} hacia {destinatario} para {variables_entrada.Nombre}",
+            info_message=f"Correo de invitación a webinar enviado exitosamente a {destinatario} en intento {confirmacion_response.get('intentos')} para {variables_entrada.Nombre}",
         )
         
         flujo_id = None
-
+        #Mejorado manejo de registro en BD
         if numero_telefono_input:
             try:
                 flujo_id = await insertar_flujo_correo_post_agente(
@@ -287,33 +357,43 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
                     numero_telefono=numero_telefono_input,
                     linea_universitaria=variables_extraidas.objetivo,
                 )
-                logging.info(f"Flujo registrado en BD con ID: {flujo_id}")
+                logging.info(f"Flujo de webinar registrado en BD con ID: {flujo_id}")
+                
+                await info_notify(
+                    method_name="procesar_webhook_webinar",
+                    client_id=variables_entrada.Nombre,
+                    info_message=f"Flujo de webinar registrado en BD. ID: {flujo_id}",
+                )
             except Exception as e:
-                logging.error(f"Error al registrar flujo en BD: {e}", exc_info=True)
+                logging.error(f"Error al registrar flujo de webinar en BD: {e}", exc_info=True)
+                await error_notify(
+                    method_name="procesar_webhook_webinar",
+                    client_id=variables_entrada.Nombre,
+                    error_message=f"Correo webinar enviado pero error al registrar flujo en BD: {e}",
+                )
+        else:
+            logging.warning(f"No se registró flujo de webinar: número telefónico faltante para {variables_entrada.Nombre}")
+        
         
         return {
             "status": "success",
             "enviado_a": variables_entrada.Nombre,
             "correo_destinatario": destinatario,
-            "status_correo": "Enviado",
-            "numero_telefono": numero_telefono_input,
+            "numero_telefono": numero_telefono_input
         }
     
     except Exception as e:
-        logging.error(f"Error al enviar correo: {e}", exc_info=True)
+        logging.error(f"Excepción en procesar_webhook_webinar: {e}", exc_info=True)
         # Notificar el error y devolver un resultado de error en lugar de lanzar.
         await error_notify(
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
-            error_message=(
-                "problemas con el servidor de envio de correos "
-                "(reintentos agotados, requiere reintento manual)"
-            ),
+            error_message=f"Excepción en servicio de correo de webinar: {e}",
         )
-        mensaje_error = "problemas con el servidor de envio de correos"
         return {
             "status": "error",
-            "message": mensaje_error,
+            "message": f"Error en el servicio de envio de correo: {e}",
+            "correo_enviado": False,
         }
         
     

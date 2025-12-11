@@ -580,7 +580,7 @@ async def limpiar_valor_principal(raw_principal: str) -> float:
         raw_principal (str): Cadena con el valor principal en diferentes formatos
         
     Returns:
-        float: Valor numÃƒÂ©rico extraÃƒÂ­do
+        float: Valor numerico extraido
         
     Raises:
         ValueError: Si no se puede extraer un valor numÃƒÂ©rico vÃƒÂ¡lido
@@ -716,9 +716,20 @@ async def calcular_financiamiento(payload: dict):
         logger.info(f"plazo_valor procesado: {plazo_valor} \n")
         logger.info (f"numero de semestre procesado: {numero_semestre} \n")
 
+        # Definir MENSAJES_USUARIO antes del try para que sea accesible en los bloques except
+        MENSAJES_USUARIO = {
+            "valor_invalido": "El monto ingresado no es vÃƒÂ¡lido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
+            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no estÃƒÂ¡ disponible en este momento. Por favor intenta nuevamente mÃƒÂ¡s tarde.",
+            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'dÃƒÂ©cimo semestre'.",
+            "plazo_invalido": "El plazo seleccionado no es valido. Por favor escoge entre 1 y 6 meses.",
+            "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
+            "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
+            "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
+        }
+
         try:
             raw_principal = str(payload.get("principal", "0"))
-            principal = limpiar_valor_principal(raw_principal)
+            principal = await limpiar_valor_principal(raw_principal)
         except ValueError as e:
             await error_notify(method_name, linea_producto_notify_error, f"Error en el valor principal: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Error en el valor principal: {str(e)}")
@@ -812,17 +823,6 @@ async def calcular_financiamiento(payload: dict):
         logger.info("CAlculo completado correctamente. \n")
         logger.info("-------------fin de la ejecucion------------------ \n")
         
-        
-        MENSAJES_USUARIO = {
-            "valor_invalido": "El monto ingresado no es vÃƒÂ¡lido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
-            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no estÃƒÂ¡ disponible en este momento. Por favor intenta nuevamente mÃƒÂ¡s tarde.",
-            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'dÃƒÂ©cimo semestre'.",
-            "plazo_invalido": "El plazo seleccionado no es valido. Por favor escoge entre 1 y 6 meses.",
-            "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
-            "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
-            "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
-        }
-        
         #notificacion informativa
         info_message = f"Calculo de financiamiento realizado correctamente en etapa de simulacion \n ID linea de producto: {linea_producto}"
         await info_notify(method_name, linea_producto_notify_error, info_message)
@@ -850,7 +850,6 @@ async def calcular_financiamiento(payload: dict):
     except ValueError as e:
         logger.error(f"Error de datos: {e}")
         await error_notify(method_name, linea_producto_notify_error, f"Error de datos: {e}")
-        #raise HTTPException(status_code=400, detail=str(e))
         return {
                 "estado": "error",
                 "mensaje": MENSAJES_USUARIO["valor_invalido"],
@@ -1009,31 +1008,97 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
         logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
         
         # Logica de enrutamiento de el envio de los correos basada en el objetivo de la llamada de cada agente IA
-        if payload.extracted_variables.objetivo == "webinar":
+        objetivo = payload.extracted_variables.objetivo
+        logging.info(f"Objetivo a procesar: {objetivo}")
+        
+        if objetivo == "webinar":
             logging.info("El objetivo es 'webinar'. Llamando a procesar_webhook_webinar.")
             resultado = await procesar_webhook_webinar(payload)
             logging.info(f"Procesamiento completado para webinar: {payload.input_variables.NOMBRE_TITULAR}")
-            await info_notify(
-                method_name="handle_webhook_webinar",
-                client_id=payload.extracted_variables.objetivo,
-                info_message=f"Webhook de webinar procesado exitosamente para {payload.input_variables.NOMBRE_TITULAR} \n resultado : {resultado} "
-            )
-            return {"status": "success", "message": "Webhook de webinar procesado", "data": resultado}
-        
-        
-        elif payload.extracted_variables.objetivo == "renovacion":
-            logging.info("El objetivo es 'renovacion'. Llamando a procesar_webhook_renovacion.")
             
-            resultado = await procesar_webhook_renovacion(payload)
-            
-        
-        logging.info(f"Procesamiento completado para: {payload.input_variables.NOMBRE_TITULAR}")
-        await info_notify(
-            method_name="handle_webhook_renovacion",
-            client_id=payload.extracted_variables.objetivo,
-            info_message=f"Webhook de renovacion procesado exitosamente para {payload.input_variables.NOMBRE_TITULAR} \n resultado : {resultado} "
+            #Validar explicitamente el resultado
+            if resultado.get("status") == "success" and resultado.get("correo_enviado"):
+                logging.info(f"Webhook webinar EXITOSO: Correo enviado en {resultado.get('intentos_correo')} intento(s)")
+                await info_notify(
+                    method_name="webhook_webinar",
+                    client_id=objetivo,
+                    info_message=f"Webhook de webinar completado exitosamente. Correo enviado en {resultado.get('intentos_correo')} intento(s) para {payload.input_variables.NOMBRE_TITULAR}"
+                )
+                return JSONResponse(status_code=200,
+                                    content={
+                                        "status": "success",
+                                        "message": "Webhook de renovacion procesado",
+                                        "correo_enviado": True,
+                                        "intentos": resultado.get("intentos_correo"),
+                                        "data": resultado,
+                                    },
         )
-        return {"status": "success", "message": "Webhook procesado", "data": resultado}
+            else:
+                logging.warning(f"Webhook webinar con problemas: {resultado}")
+                await error_notify(
+                    method_name="handle_webhook_webinar",
+                    client_id=objetivo,
+                    error_message=f"Webhook webinar con problemas: {resultado.get('message')}"
+                )
+                return {
+                    "status": "error" if resultado.get("status") == "error" else "partial",
+                    "message": resultado.get("message", "Error desconocido"),
+                    "correo_enviado": resultado.get("correo_enviado", False),
+                    "intentos": resultado.get("intentos_correo", 0),
+                    "data": resultado
+                }
+        
+        elif objetivo == "renovacion":
+            logging.info("El objetivo es 'renovacion'. Llamando a procesar_webhook_renovacion.")
+            resultado = await procesar_webhook_renovacion(payload)
+            logging.info(f"Procesamiento completado para renovacion: {payload.input_variables.NOMBRE_TITULAR}")
+            
+            #Validar explicitamente el resultado
+            if resultado.get("status") == "success" and resultado.get("correo_enviado"):
+                logging.info(f"Webhook renovacion EXITOSO: Correo enviado en {resultado.get('intentos_correo')} intento(s)")
+                await info_notify(
+                    method_name="handle_webhook_renovacion",
+                    client_id=objetivo,
+                    info_message=f"Webhook de renovacion completado exitosamente. Correo enviado en {resultado.get('intentos_correo')} intento(s) para {payload.input_variables.NOMBRE_TITULAR}"
+                )
+                return  JSONResponse( status_code=200,
+                content={
+                    "status": "success",
+                    "message": "Webhook de renovacion procesado exitosamente",
+                    "correo_enviado": True,
+                    "intentos": resultado.get("intentos_correo"),
+                    "data": resultado
+                })
+            else:
+                logging.warning(f"⚠️ Webhook renovacion con problemas: {resultado}")
+                await error_notify(
+                    method_name="handle_webhook_renovacion",
+                    client_id=objetivo,
+                    error_message=f"Webhook renovacion con problemas: {resultado.get('message')}"
+                )
+                return {
+                    "status": "error" if resultado.get("status") == "error" else "partial",
+                    "message": resultado.get("message", "Error desconocido"),
+                    "correo_enviado": resultado.get("correo_enviado", False),
+                    "intentos": resultado.get("intentos_correo", 0),
+                    "data": resultado
+                }
+        
+        else:
+            logging.error(f"❌ Objetivo desconocido: {objetivo}")
+            await error_notify(
+                method_name="handle_webhook",
+                client_id="unknown",
+                error_message=f"Objetivo desconocido en webhook: {objetivo}"
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "error",
+                    "message": f"Objetivo '{objetivo}' no reconocido. Valores validos: 'webinar', 'renovacion'",
+                    "correo_enviado": False,
+                }
+            )
 
     except Exception as e:
         # No devolver 500 para evitar que el proveedor del webhook reintente
