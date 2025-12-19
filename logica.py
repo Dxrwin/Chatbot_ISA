@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
-from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar
+from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar, procesar_llamada_renovacion_Y_refinanciamiento
 from utils.auth import obtener_token
 from models.models import WebhookPayload
 import httpx
@@ -162,13 +162,64 @@ def slugify_nombre(value: str) -> str:
 
 #pydantc es un validador de datos de entrada y salida
 # Modelo Pydantic para el payload sin validaciones estrictas
+from pydantic import BaseModel, field_validator
+from typing import Optional, Dict, Any
+
 class PayableRequest(BaseModel):
-    creditLineID: str 
+    creditLineId: str 
     principal: float 
     time: int 
-    disbursementMethod: str 
+    paymentFrequency: int
     initialFee: float 
-    paymentFrequency: int 
+    disbursementMethod: Optional[str] = None 
+    source: Optional[str] = None             
+    redirectUrl: Optional[str] = None         
+    callbackUrl: Optional[str] = None        
+    meta: Optional[Dict[str, Any]] = None     
+
+    @field_validator('principal', 'initialFee', mode='before')
+    @classmethod
+    def validate_floats(cls, v):
+        """Convierte strings a float si es necesario"""
+        if isinstance(v, str):
+            if v.strip() == "":
+                raise ValueError("El campo no puede estar vacío")
+            try:
+                return float(v.replace(',', '.').strip())
+            except ValueError:
+                raise ValueError(f"No se puede convertir '{v}' a número decimal")
+        return v
+
+    @field_validator('time', 'paymentFrequency', mode='before')
+    @classmethod
+    def validate_ints(cls, v):
+        """Convierte strings a int si es necesario"""
+        if isinstance(v, str):
+            if v.strip() == "":
+                raise ValueError("El campo no puede estar vacío")
+            try:
+                return int(v.strip())
+            except ValueError:
+                raise ValueError(f"No se puede convertir '{v}' a número entero")
+        return v
+
+    @field_validator('disbursementMethod', mode='before')
+    @classmethod
+    def validate_disbursement(cls, v):
+        """Valida disbursementMethod, rechaza strings vacíos"""
+        if v == "" or v is None:
+            return None
+        if isinstance(v, str):
+            return v.strip() if v.strip() else None
+        return v
+
+    @field_validator('creditLineId', mode='before')
+    @classmethod
+    def validate_creditlineId(cls, v):
+        """Valida creditLineId, no puede estar vacío"""
+        if not v or (isinstance(v, str) and v.strip() == ""):
+            raise ValueError("creditLineId no puede estar vacío")
+        return str(v).strip()
 
 # Modelos para las solicitudes
 class ClienteRequest(BaseModel):
@@ -230,6 +281,7 @@ async def webhook_product_lines(
                     response = await client.get(API_URL, headers=headers)
                     response.raise_for_status()
                     data = response.json()
+                    logger.info(f"Respuesta recibida de API para buscar la linea: {data}")
                     lines = data.get("data", {}).get("lines", [])
 
                     candidates = []
@@ -372,29 +424,43 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
         async with httpx.AsyncClient() as client:
             
-            logger.info(f"+++++ Parametros recibidos: client_id= ++++++++, \n {client_id} \n")
-            
-            logger.info(f"#####--- Payload entrante ----#### \n {payload} \n")
+            logger.info(f"+++++ Parámetros recibidos: client_id= {client_id}")
+            logger.info(f"#####--- Payload entrante ----####")
+            logger.info(f"creditLineId: {payload.creditLineId}")
+            logger.info(f"principal: {payload.principal} (tipo: {type(payload.principal).__name__})")
+            logger.info(f"time: {payload.time} (tipo: {type(payload.time).__name__})")
+            logger.info(f"initialFee: {payload.initialFee} (tipo: {type(payload.initialFee).__name__})")
+            logger.info(f"disbursementMethod: {payload.disbursementMethod}")
+            logger.info(f"paymentFrequency: {payload.paymentFrequency}")
             
             principal = payload.principal
             initial_fee = payload.initialFee
             
             token = await obtener_token(client)
             
+            # 1) Construimos un payload base con TODOS los campos, incluidos los opcionales
             new_payload = {
-                "creditLineID": payload.creditLineID,
+                "creditLineId": payload.creditLineId,          # ← corregido: antes era creditLineID
                 "principal": principal,
                 "time": payload.time,
                 "disbursementMethod": payload.disbursementMethod,
                 "initialFee": initial_fee,
-                "paymentFrequency": payload.paymentFrequency
+                "paymentFrequency": payload.paymentFrequency,
+                # Nuevos campos opcionales según la doc:
+                "source": payload.source,
+                "redirectUrl": payload.redirectUrl,
+                "callbackUrl": payload.callbackUrl,
+                "meta": payload.meta,
             }
-            logger.info(f"Payload para saliente para el post a kuenta: \n {new_payload} \n")
+            
+            # 2) Eliminamos solo los que son None para no mandar basura ni nulls innecesarios
+            new_payload = {k: v for k, v in new_payload.items() if v is not None}
+
+            logger.info(f"Payload saliente para POST /v1/payable: {new_payload}")
+            
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": client_id,
-                #"Config-Organization-ID":"c269cfcc-0c9c-43e3-bef0-9e95d42ca309",
-                #"Organization-ID":"c8c90e3e-f2a6-4caa-8254-a1403b4416d3",
                 "Authorization": token
             }
             logger.info(f"Iniciando peticion POST a {PAYABLE_URL}")
@@ -410,165 +476,220 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         headers=headers
                     )
                     status_code = response.status_code
+                    
                     logger.info(f"Intento {attempt+1}: status_code={status_code}")
+                    
                     if status_code == 201:
                             logger.info("Procesando respuesta de Kuenta")
                             response_data = response.json()
                             credit = response_data.get("data", {}).get("credit", {})
                             
+                            #logging.info(f"Respuesta completa de Kuenta: {response_data} \n")
+                            
                             # ID credito
                             response_credit_id = credit.get("ID")
-                            logger.info(f"ID del crÃƒÂ©dito creado: {response_credit_id} \n")
-
-                    try:
-
-                            url_prod = f"https://api.kuenta.co/v1/payable/{response_credit_id}"
-                            response_get_simulacion = await client.get(url_prod, headers=headers)
-                            status_code_simulacion = response_get_simulacion.status_code
-                            
-                            logger.info(f"Status code de la simulacion: {status_code_simulacion}")
-                            
-                            
-                            if status_code_simulacion == 200 or status_code_simulacion == 201:
-                                simulacion_data = response_get_simulacion.json()
-                                installments = simulacion_data.get("data", {}).get("credit", {}).get("installments", [])
-                                cuota_inicial = simulacion_data.get("data", {}).get("credit", {}).get("initialFee")
-                                ID_credito = simulacion_data.get("data", {}).get("credit", {}).get("ID")
-                                referencia_credito = simulacion_data.get("data").get("credit").get("reference")
-                                id_cliente = simulacion_data.get("data").get("credit").get("debtorID")
-
-                                if installments:
-                                    # Tomar el primer installment
-                                    first_installment = installments[0]
-                
-                                    # Extraer y redondear valores
-                                    payment = round(float(first_installment.get("payment", 0)))
-                                    capital = round(float(first_installment.get("capital", 0)))
-                                    interest = round(float(first_installment.get("interest", 0)))
-                                    costs = round(float(first_installment.get("costs", 0)))
-                                    taxes = round(float(first_installment.get("taxes", 0)))
-                                    
-                                    # cuota inicial redondeada
-                                    cuota_inicial_rounded = round(float(cuota_inicial))
-
-                                    # Formatear valores para lectura humana
-                                    formatted_values = {
-                                        "payment_formatted": f"${payment:,}",
-                                        "capital_formatted": f"${capital:,}",
-                                        "interest_formatted": f"${interest:,}",
-                                        "costs_formatted": f"${costs:,}",
-                                        "taxes_formatted": f"${taxes:,}",
-                                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
-                                    }
-
-                                    # Agregar valores originales y formateados a la respuesta
-                                    response_data.update({
-                                        "ID del credito creado": response_credit_id,
-                                        "valores_originales": {
-                                            "payment": payment,
-                                            "capital": capital,
-                                            "interest": interest,
-                                            "costs": costs,
-                                            "taxes": taxes
-                                        },
-                                        "valores_formateados": {
-                                            "payment_formatted": formatted_values["payment_formatted"],
-                                            "capital_formatted": formatted_values["capital_formatted"],
-                                            "interest_formatted": formatted_values["interest_formatted"],
-                                            "costs_formatted": formatted_values["costs_formatted"],
-                                            "taxes_formatted": formatted_values["taxes_formatted"],
-                                            "cuota_inicial_formatted": formatted_values["cuota_inicial_formatted"]
-                                        }
-                                    })
-
-                                    logger.info("Valores extraidos y formateados exitosamente")
-                                    logger.info(f"Valores formateados: {formatted_values}")
-                                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
-                                    if id_cliente and installments:
-                                        cuotas_cache[id_cliente] = {
-                                            "cuotas": installments,
-                                            "timestamp": datetime.now(timezone.utc)
-                                        }
-                                    
-                                    #notificacion informativa a telegram y email
-                                    info_message = f"Credito creado y regsitrado en kuenta correctamente \n ID del crÃƒÂ©dito: {ID_credito} \n Referencia del credito :{referencia_credito}\n ID del cliente :{id_cliente} \n Valor total credito:{formatted_values['payment_formatted']}"
-                                    
-                                    # envia notificacion informativa (email + telegram) con id para seguimiento
-                                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
-                
-                                    return response_data
-                                else:
-                                    logger.error("No se encontraron installments en la respuesta")
-                                    await error_notify(method_name, client_id, "No se encontraron cuotas en la simulacion")
-                                    raise HTTPException(status_code=404, detail="No se encontraron cuotas en la simulacion")
-                
-                            else:
-                                logger.error(f"Error en la consulta de simulaciÃƒÂ³n: {status_code_simulacion}")
-                                await error_notify(method_name, client_id, f"Error al consultar la simulacion: {status_code_simulacion}")
-                                raise HTTPException(status_code=status_code_simulacion, 
-                                                detail="Error al consultar la simulacion")
-                            
-                    except httpx.HTTPStatusError as e:
-                            await error_notify(method_name, client_id, f"Error en la respuesta de la API externa kuenta: {str(e)}")
-                            logger.error(f"Intento {attempt+1}: Error en la respuesta de la API externa kuenta: {e.response.status_code}")
-                    except Exception as e:
-                        logger.warning(f"No se pudo enviar notificacion informativa: {e}")
+                            break  # Salir del bucle de reintentos si fue exitoso
+                    else:
                         
+                        logger.error(f"Error: Status code no esperado: {status_code}")
+                        logger.error(f"Respuesta del servidor: {response.text}")
+                        await error_notify(method_name, client_id, f"Error en API externa: status {status_code}")
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            logger.info(f"Reintentando en {wait_time} segundos...")
+                            await asyncio.sleep(wait_time)
+                
                 except httpx.HTTPStatusError as e:
-                        logger.error(f"Intento {attempt+1}: Error en API externa: {e.response.status_code}")
-                        await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # espera exponencial
-            # Si no se logrÃƒÂ³ en los reintentos
-            await error_notify(method_name, client_id, f"Error de conexion tras: {max_retries} intentos o respuesta no vÃƒÂ¡lida")
-            raise HTTPException(status_code=502, detail=f"Error de conexion tras {max_retries} intentos o respuesta no vÃƒÂ¡lida")
+                    logger.error(f"Intento {attempt+1}: Error HTTP {e.response.status_code}")
+                    logger.error(f"Respuesta: {e.response.text}")
+                    await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time} segundos...")
+                        await asyncio.sleep(wait_time)
+                        
+                except httpx.RequestError as e:
+                    logger.error(f"Intento {attempt+1}: Error de conexión: {str(e)}")
+                    await error_notify(method_name, client_id, 
+                        f"Error conexión POST: {str(e)}")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time} segundos...")
+                        await asyncio.sleep(wait_time)
+            
+            # Validar si se obtuvo respuesta exitosa
+            if response_credit_id is None:
+                logger.error(f"No se logró crear el payable tras {max_retries} intentos")
+                await error_notify(method_name, client_id, 
+                    f"POST /payable falló tras {max_retries} intentos")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Error de conexión tras {max_retries} intentos o respuesta no válida"
+                ) 
+                
+                
+            try:
+                url_prod = f"https://api.kuenta.co/v1/payable/{response_credit_id}"
+                logger.info(f"Consultando simulación: {url_prod}")
+                
+                response_get_simulacion = await client.get(url_prod, headers=headers)
+                status_code_simulacion = response_get_simulacion.status_code
+                
+                logger.info(f"Status code de la simulación: {status_code_simulacion}")
+                            
+                            
+                if status_code_simulacion == 200 or status_code_simulacion == 201:
+                    simulacion_data = response_get_simulacion.json()
+                    credit_data = simulacion_data.get("data", {}).get("credit", {})
+
+                    installments = credit_data.get("installments", [])
+                    cuota_inicial = credit_data.get("initialFee")
+                    ID_credito = credit_data.get("ID")
+                    referencia_credito = credit_data.get("reference")
+                    id_cliente = credit_data.get("debtorID")
+
+
+                    if not installments:
+                        logger.error("No se encontraron installments en la respuesta")
+                        await error_notify(method_name, client_id, 
+                            "No se encontraron cuotas en la simulación")
+                        raise HTTPException(
+                            status_code=404,
+                            detail="No se encontraron cuotas en la simulación"
+                        )
+                        
+                    # Tomar el primer installment
+                    first_installment = installments[0]
+                
+                    # Extraer y redondear valores
+                    payment = round(float(first_installment.get("payment", 0)))
+                    capital = round(float(first_installment.get("capital", 0)))
+                    interest = round(float(first_installment.get("interest", 0)))
+                    costs = round(float(first_installment.get("costs", 0)))
+                    taxes = round(float(first_installment.get("taxes", 0)))
+                    # cuota inicial redondeada
+                    cuota_inicial_rounded = round(float(cuota_inicial))
+
+                    # Formatear valores para lectura humana
+                    formatted_values = {
+                        "payment_formatted": f"${payment:,}",
+                        "capital_formatted": f"${capital:,}",
+                        "interest_formatted": f"${interest:,}",
+                        "costs_formatted": f"${costs:,}",
+                        "taxes_formatted": f"${taxes:,}",
+                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
+                    }
+
+                    # Agregar valores originales y formateados a la respuesta
+                    response_data.update({
+                        "ID del credito creado": response_credit_id,
+                        "valores_originales": {
+                            "payment": payment,
+                            "capital": capital,
+                            "interest": interest,
+                            "costs": costs,
+                            "taxes": taxes
+                        },
+                        "valores_formateados": formatted_values
+                    })
+
+                    logger.info("Valores extraidos y formateados exitosamente")
+                    logger.info(f"Valores formateados: {formatted_values}")
+                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
+                    if id_cliente and installments:
+                        cuotas_cache[id_cliente] = {
+                            "cuotas": installments,
+                            "timestamp": datetime.now(timezone.utc)
+                        }
+                                    
+                    # Notificación informativa
+                    info_message = (
+                        f"Crédito creado y registrado en kuenta correctamente\n"
+                        f"ID del crédito: {ID_credito}\n"
+                        f"Referencia del crédito: {referencia_credito}\n"
+                        f"ID del cliente: {id_cliente}\n"
+                        f"Valor total crédito: {formatted_values['payment_formatted']}"
+                    )
+                                    
+                    # envia notificacion informativa (email + telegram) con id para seguimiento
+                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
+                
+                    return response_data
+                else:
+                    logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
+                    logger.error(f"Respuesta: {response_get_simulacion.text}")
+                    await error_notify(method_name, client_id, 
+                        f"Error al consultar simulación: {status_code_simulacion}\nRespuesta: {response_get_simulacion.text}")
+                    raise HTTPException(
+                        status_code=status_code_simulacion,
+                        detail="Error al consultar la simulación"
+                    )
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Error HTTP en GET simulación: {e.response.status_code}")
+                logger.error(f"Respuesta: {e.response.text}")
+                await error_notify(method_name, client_id, 
+                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}")
+                raise HTTPException(
+                    status_code=e.response.status_code,
+                    detail=f"Error en API externa: {e.response.text}"
+                )
+                
+            except httpx.RequestError as e:
+                logger.error(f"Error conexión en GET simulación: {str(e)}")
+                await error_notify(method_name, client_id, 
+                    f"Error conexión GET: {str(e)}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Error de conexión al consultar simulación"
+                )
+                
+    except HTTPException:
+        raise
         
     except ValueError as e:
-        logger.error(f"Error de conversion de datos: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conversion de datos: {str(e)}")
+        logger.error(f"Error de conversión de datos: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conversión: {str(e)}")
         return JSONResponse(
             status_code=400,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_datos"],
-                "detalles_usuario": "Recuerda ingresar solo numeros en los campos de monto y cuota inicial."
+                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
             }
         )
         
     except httpx.RequestError as e:
-        logger.error(f"Error de conexiÃƒÂ³n: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conexion: {str(e)}")
+        logger.error(f"Error de conexión: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
         return JSONResponse(
             status_code=502,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "Nuestro servicio estÃƒÂ¡ experimentando problemas de conexion temporales."
+                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
             }
         )
-    
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Error en API externa: {e.response}")
-        await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
-        return JSONResponse(
-            status_code=e.response.status_code,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                "detalles_usuario": "Por favor intenta mas tarde o contacta a nuestro servicio al cliente."
-            }
-        )
+        
     except Exception as e:
-        logger.error(f"Error interno: {str(e)}")
+        logger.error(f"Error interno: {str(e)}", exc_info=True)
         await error_notify(method_name, client_id, f"Error interno: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_general"],
-                "detalles_usuario": "Nuestro equipo tecnico ha sido notificado y esta trabajando en solucionarlo."
+                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
             }
         )
+                
+                
+                
+                
+                
+                    
 
 
 #manejar diferentes casos de entrada para el valor "principal" y extraer solo los nÃƒÂºmeros
@@ -734,7 +855,7 @@ async def calcular_financiamiento(payload: dict):
             await error_notify(method_name, linea_producto_notify_error, f"Error en el valor principal: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Error en el valor principal: {str(e)}")
 
-        # Porcentaje de cuota (sin sÃƒÂ­mbolo %)
+        # Porcentaje de cuota (sin si­mbolo %)
         porcentaje_str = str(payload.get("porcentaje_cuota", "0")).replace("%", "").strip()
         porcentaje_cuota = float(porcentaje_str) / 100
 
@@ -747,7 +868,7 @@ async def calcular_financiamiento(payload: dict):
         #logger.info (f"plazo escogido para realizar los calculos: {plazo_escogido} \n")
         
 
-        # --- CÃƒLCULOS INICIALES ---
+        # --- CALCULOS INICIALES ---
         valor_cuota_inicial = principal * porcentaje_cuota
         dias_totales = plazo_escogido * payment_frequency
 
@@ -1002,7 +1123,6 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     """
     try:
         
-        
         logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
         
         # logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
@@ -1020,12 +1140,30 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
             logging.info(f"Procesamiento completado para webinar: {payload.input_variables.NOMBRE_TITULAR}")
             
             #Validar explicitamente el resultado
-            if resultado.get("status") == "success" and resultado.get("correo_enviado"):
-                logging.info(f"Webhook webinar EXITOSO: Correo enviado en {resultado.get('intentos_correo')} intento(s)")
+            if resultado.get("status") == "error":
+                
+                logging.info(f"error en la procesamiento del webhook webinar: {resultado.get('message')}")
+                await error_notify(
+                    method_name="handle_webhook_webinar",
+                    client_id=objetivo,
+                    error_message=f"Webhook webinar con problemas: {resultado.get('message')}"
+                )
+                return JSONResponse(status_code=500,
+                                    content={
+                                        "status": "error",
+                                        "message": resultado.get("message", "Error desconocido"),
+                                        "correo_enviado": resultado.get("correo_enviado", False),
+                                        "intentos": resultado.get("intentos_correo", 0),
+                                        "data": resultado
+                                    }
+                )
+            elif resultado.get("status") == "success":   
+                
+                logging.info(f"Webhook webinar EXITOSO: Correo enviado")
                 await info_notify(
                     method_name="webhook_webinar",
                     client_id=objetivo,
-                    info_message=f"Webhook de webinar completado exitosamente. Correo enviado en {resultado.get('intentos_correo')} intento(s) para {payload.input_variables.NOMBRE_TITULAR}"
+                    info_message=f"Webhook de webinar completado exitosamente. Correo enviado en  para {payload.input_variables.NOMBRE_TITULAR}"
                 )
                 return JSONResponse(status_code=200,
                                     content={
@@ -1034,8 +1172,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                                         "correo_enviado": True,
                                         "intentos": resultado.get("intentos_correo"),
                                         "data": resultado,
-                                    },
-        )
+                                    })
             else:
                 logging.warning(f"Webhook webinar con problemas: {resultado}")
                 await error_notify(
@@ -1061,12 +1198,28 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
             logging.info(f"Procesamiento completado para renovacion: {payload.input_variables.NOMBRE_TITULAR}")
             
             #Validar explicitamente el resultado
-            if resultado.get("status") == "success" and resultado.get("correo_enviado"):
-                logging.info(f"Webhook renovacion EXITOSO: Correo enviado en {resultado.get('intentos_correo')} intento(s)")
+            if resultado.get("status") == "error":
+                logging.info(f"error en la procesamiento del webhook renovacion: {resultado.get('message')}")
+                await error_notify(method_name="handle_webhook_renovacion",
+                                client_id=objetivo,
+                                    error_message=f"Webhook renovacion con problemas: {resultado.get('message')}"
+                                    )
+                return JSONResponse(status_code=500,
+                                    content={"status": "error",
+                                            "message": resultado.get("message", "Error desconocido")
+                                            ,
+                                            "correo_enviado": resultado.get("correo_enviado", False),
+                                            "intentos": resultado.get("intentos_correo", 0),
+                                            "data": resultado
+                                            }
+                                    )
+            elif resultado.get("status") == "success":
+                
+                logging.info(f"Webhook renovacion EXITOSO: Correo enviado")
                 await info_notify(
                     method_name="handle_webhook_renovacion",
                     client_id=objetivo,
-                    info_message=f"Webhook de renovacion completado exitosamente. Correo enviado en {resultado.get('intentos_correo')} intento(s) para {payload.input_variables.NOMBRE_TITULAR}"
+                    info_message=f"Webhook de renovacion completado exitosamente. Correo enviado  para {payload.input_variables.NOMBRE_TITULAR}"
                 )
                 return  JSONResponse( status_code=200,
                 content={
@@ -1077,7 +1230,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                     "data": resultado
                 })
             else:
-                logging.warning(f"⚠️ Webhook renovacion con problemas: {resultado}")
+                logging.warning(f"no se encontro el objetivo de la llamada: {resultado}")
                 await error_notify(
                     method_name="handle_webhook_renovacion",
                     client_id=objetivo,
@@ -1090,22 +1243,86 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                     "intentos": resultado.get("intentos_correo", 0),
                     "data": resultado
                 }
-        
-        else:
-            logging.error(f"❌ Objetivo desconocido: {objetivo}")
-            await error_notify(
-                method_name="handle_webhook",
-                client_id="unknown",
-                error_message=f"Objetivo desconocido en webhook: {objetivo}"
-            )
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "error",
-                    "message": f"Objetivo '{objetivo}' no reconocido. Valores validos: 'webinar', 'renovacion'",
-                    "correo_enviado": False,
-                }
-            )
+                
+        elif objetivo == "renovacion y refinanciacion":
+            logging.info("El objetivo es 'renovacion y refinanciacion'. Llamando a procesar_llamada_renovacion_Y_refinanciamiento.")
+            logging.info(f"payload completo recibido: {payload.model_dump_json(indent=2)} \n")
+            
+            try:
+                resultado = await procesar_llamada_renovacion_Y_refinanciamiento(payload)
+                
+                logging.info(f"Procesamiento completado para renovacion y refinanciacion: {payload.input_variables.NOMBRE_TITULAR}")
+                
+                # Validar explicitamente el resultado
+                if resultado.get("status") == "error":
+                    logging.error(f"❌ Error en el procesamiento: {resultado.get('message')}")
+                    await error_notify(
+                        method_name="handle_webhook_renovacion_refinanciacion",
+                        client_id=objetivo,
+                        error_message=f"Error en procesamiento de renovacion y refinanciacion: {resultado.get('message')}"
+                    )
+                    return JSONResponse(
+                        status_code=430,
+                        content={
+                            "status": "error",
+                            "message": resultado.get("message", "Error desconocido"),
+                            "acciones_ejecutadas": resultado.get("acciones", []),
+                            "errores": resultado.get("errores", []),
+                            "data": resultado
+                        }
+                    )
+                elif resultado.get("status") == "success":
+                    logging.info(f"✅ Procesamiento EXITOSO para renovacion y refinanciacion")
+                    await info_notify(
+                        method_name="handle_webhook_renovacion_refinanciacion",
+                        client_id=objetivo,
+                        info_message=f"Procesamiento de renovacion y refinanciacion completado exitosamente para {payload.input_variables.NOMBRE_TITULAR}. Acciones: {', '.join(resultado.get('acciones_ejecutadas', []))}"
+                    )
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "success",
+                            "message": "Procesamiento de renovacion y refinanciacion completado exitosamente",
+                            "cliente": resultado.get("cliente"),
+                            "correo": resultado.get("correo"),
+                            "acciones_ejecutadas": resultado.get("acciones_ejecutadas", []),
+                            "data": resultado
+                        }
+                    )
+                else:
+                    # status == "partial" o "warning"
+                    logging.warning(f"⚠️ Procesamiento parcial: {resultado}")
+                    await error_notify(
+                        method_name="handle_webhook_renovacion_refinanciacion",
+                        client_id=objetivo,
+                        error_message=f"Procesamiento parcial de renovacion y refinanciacion: {resultado.get('message')}"
+                    )
+                    return JSONResponse(
+                        status_code=430,
+                        content={
+                            "status": resultado.get("status", "partial"),
+                            "message": resultado.get("message", "Procesamiento parcial"),
+                            "acciones_ejecutadas": resultado.get("acciones_ejecutadas", []),
+                            "errores": resultado.get("errores", []),
+                            "data": resultado
+                        }
+                    )
+            except Exception as e:
+                logging.error(f"❌ Excepción en procesar_llamada_renovacion_Y_refinanciamiento: {e}", exc_info=True)
+                await error_notify(
+                    method_name="handle_webhook_renovacion_refinanciacion",
+                    client_id=objetivo,
+                    error_message=f"Excepción en renovacion y refinanciacion: {str(e)}"
+                )
+                return JSONResponse(
+                    status_code=430,
+                    content={
+                        "status": "error",
+                        "message": f"Error en el procesamiento de renovacion y refinanciacion",
+                        "detail": str(e),
+                        "cliente": payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"
+                    }
+                )
 
     except Exception as e:
         # No devolver 500 para evitar que el proveedor del webhook reintente
