@@ -1,10 +1,14 @@
 from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
 from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar, procesar_llamada_renovacion_Y_refinanciamiento
 from utils.auth import obtener_token
+from fastapi.encoders import jsonable_encoder
+from utils.export_service import generar_excel_memoria
+from utils.database import insertar_registro_completo, consultar_creditos_filtro
+
 from models.models import WebhookPayload
 import httpx
 import logging
@@ -43,6 +47,34 @@ class RenovacionPayload(BaseModel):
     estado_pago_payvalida: str
     nombre_cliente: str
 
+class CreditoData(BaseModel):
+    ID_Credito_simulacion: str
+    referencia_simulacion: Optional[str] = None
+    nombre_linea_simulacion: Optional[str] = None
+    cuota_inicial_simulacion: Optional[str] = None
+    semestre_renovacion: Optional[str] = None
+    
+    # IMPORTANTE: Aquí definimos que esperamos un entero
+    estado_credito_post_confirmado: Optional[str] = None 
+    
+    valor_solicitud_express: Optional[str] = None
+
+class RenovacionRefactorRequest(BaseModel):
+    numero_telefono: str
+    correo_cliente: str
+    nombre_cliente: str
+    cedula_cliente: str
+    datos_credito: CreditoData
+
+# 1. Modelo para los filtros de búsqueda
+class ConsultaCreditoRequest(BaseModel):
+    cedula: Optional[str] = None
+    telefono: Optional[str] = None
+    estado_id: Optional[int] = None
+    fecha_inicio: Optional[str] = None # Ej: "2026-01-09"
+    fecha_fin: Optional[str] = None    # Ej: "2026-01-10"
+    
+    exportar_excel: Optional[bool] = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -160,7 +192,6 @@ def slugify_nombre(value: str) -> str:
     ascii_str = re.sub(r"\s+", " ", ascii_str).strip().lower()
     return ascii_str.replace(" ", "-")
 
-#pydantc es un validador de datos de entrada y salida
 # Modelo Pydantic para el payload sin validaciones estrictas
 from pydantic import BaseModel, field_validator
 from typing import Optional, Dict, Any
@@ -408,15 +439,472 @@ def format_currency(value: float) -> str:
     """Formatea un nÃƒÂºmero como moneda COP: sin decimales, con $ y separadores de miles."""
     return f"${value:,.0f}"
 
-# Endpoint para crear un nuevo payable o credito despues de la simulacion
-@app.post("/payable/{client_id}")
+
+
+# ===== FUNCIÓN AUXILIAR: EXTRAER INFORMACIÓN DE CAMPOS FALTANTES =====
+def extract_missing_fields_info(missing_fields: list) -> dict:
+    """
+    Extrae información legible de los campos faltantes en la respuesta de Kuenta.
+    
+    Retorna un diccionario con:
+    - total: Cantidad total de campos faltantes
+    - required_count: Campos obligatorios faltantes
+    - optional_count: Campos opcionales faltantes
+    - required_labels: Lista de etiquetas de campos obligatorios
+    - optional_labels: Lista de etiquetas de campos opcionales
+    - by_category: Campos agrupados por categoría
+    """
+    required_labels = []
+    optional_labels = []
+    by_category = {}
+    
+    for field in missing_fields:
+        label = field.get("label", "Campo desconocido")
+        is_required = field.get("required", False)
+        category = field.get("field", {}).get("category", 0)
+        
+        # Mapear categoría a nombre legible
+        category_name = {
+            1: "Documentos",
+            3: "Identificación",
+            4: "Contacto",
+            7: "Económico"
+        }.get(category, "Otro")
+        
+        # Crear información del campo
+        field_info = {
+            "label": label,
+            "type": field.get("field", {}).get("type", "text"),
+            "id": field.get("ID")
+        }
+        
+        # Inicializar categoría si no existe
+        if category_name not in by_category:
+            by_category[category_name] = {"required": [], "optional": []}
+        
+        # Clasificar como obligatorio u opcional
+        if is_required:
+            required_labels.append(label)
+            by_category[category_name]["required"].append(field_info)
+        else:
+            optional_labels.append(label)
+            by_category[category_name]["optional"].append(field_info)
+    
+    return {
+        "total": len(missing_fields),
+        "required_count": len(required_labels),
+        "optional_count": len(optional_labels),
+        "required_labels": required_labels,
+        "optional_labels": optional_labels,
+        "by_category": by_category
+    }
+
+
+# Endpoint para crear un nuevo payable o crédito después de la simulación
+
+
+
+# ===== FUNCIÓN AUXILIAR: EXTRAER INFORMACIÓN DE CAMPOS FALTANTES =====
+def extract_missing_fields_info(missing_fields: list) -> dict:
+    """
+    Extrae información legible de los campos faltantes en la respuesta de Kuenta.
+    """
+    required_labels = []
+    optional_labels = []
+    by_category = {}
+    
+    for field in missing_fields:
+        label = field.get("label", "Campo desconocido")
+        is_required = field.get("required", False)
+        category = field.get("field", {}).get("category", 0)
+        
+        category_name = {
+            1: "Documentos",
+            3: "Identificación",
+            4: "Contacto",
+            7: "Económico"
+        }.get(category, "Otro")
+        
+        field_info = {
+            "label": label,
+            "type": field.get("field", {}).get("type", "text"),
+            "id": field.get("ID")
+        }
+        
+        if category_name not in by_category:
+            by_category[category_name] = {"required": [], "optional": []}
+        
+        if is_required:
+            required_labels.append(label)
+            by_category[category_name]["required"].append(field_info)
+        else:
+            optional_labels.append(label)
+            by_category[category_name]["optional"].append(field_info)
+    
+    return {
+        "total": len(missing_fields),
+        "required_count": len(required_labels),
+        "optional_count": len(optional_labels),
+        "required_labels": required_labels,
+        "optional_labels": optional_labels,
+        "by_category": by_category
+    }
+
+
+@app.post("/payables/{client_id}")
+async def create_payable(client_id: str, payload: PayableRequest):
+    """
+    Endpoint para crear un nuevo payable con manejo inteligente de errores:
+    1. POST a Kuenta para crear payable (3 reintentos)
+    2. Detecta perfil incompleto → HTTP 409
+    3. Detecta errores de conexión → HTTP 502
+    4. Si éxito (201) → GET para obtener simulación
+    5. Procesa y retorna datos formateados
+    """
+    method_name = "create_payable"
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            
+            logger.info(f"Iniciando creación de payable para cliente: {client_id}")
+            logger.info(f"   creditLineId: {payload.creditLineId}")
+            logger.info(f"   principal: ${payload.principal:,.2f}")
+            logger.info(f"   initialFee: ${payload.initialFee:,.2f}")
+            logger.info(f"   time: {payload.time} días")
+            
+            principal = payload.principal
+            initial_fee = payload.initialFee
+            
+            token = await obtener_token(client)
+            
+            # Construir payload para Kuenta
+            new_payload = {
+                "creditLineId": payload.creditLineId,
+                "principal": principal,
+                "time": payload.time,
+                "disbursementMethod": payload.disbursementMethod,
+                "initialFee": initial_fee,
+                "paymentFrequency": payload.paymentFrequency,
+                "source": payload.source,
+                "redirectUrl": payload.redirectUrl,
+                "callbackUrl": payload.callbackUrl,
+                "meta": payload.meta,
+            }
+            
+            # Eliminar campos None
+            new_payload = {k: v for k, v in new_payload.items() if v is not None}
+
+            logger.info(f"Payload para Kuenta: {new_payload}")
+            
+            headers = {
+                "Config-Organization-ID": ORG_ID,
+                "Organization-ID": client_id,
+                "Authorization": token
+            }
+
+            # ===== REINTENTOS PARA POST PAYABLE =====
+            max_retries = 3
+            response_credit_id = None
+            respuesta_error_final = None
+            
+            for attempt in range(max_retries):
+                
+                try:
+                    logger.info(f"Intento {attempt+1}/{max_retries}: POST a {PAYABLE_URL}")
+                    
+                    response = await client.post(
+                        PAYABLE_URL,
+                        json=new_payload,
+                        headers=headers
+                    )
+                    
+                    status_code = response.status_code
+                    logger.info(f"   Response: HTTP {status_code}")
+                    
+                    # ===== CASO 1: ÉXITO (201) =====
+                    if status_code == 201:
+                        logger.info("Payable creado exitosamente (HTTP 201)")
+                        response_data = response.json()
+                        credit = response_data.get("data", {}).get("credit", {})
+                        response_credit_id = credit.get("ID")
+                        logger.info(f"   ID Crédito: {response_credit_id}")
+                        break  # Salir del loop de reintentos
+                    
+                    # ===== CASO 2: ERROR 400 - ANALIZAR TIPO =====
+                    elif status_code == 400:
+                        error_response = response.json()
+                        last_error_response = error_response
+                        
+                        error_code = error_response.get("data", {}).get("code")
+                        error_message = error_response.get("data", {}).get("message", "Unknown")
+                        missing_fields = error_response.get("data", {}).get("missingFields", [])
+                        
+                        logger.error(f"❌ HTTP 400 Error: code={error_code}")
+                        logger.error(f"   Mensaje: {error_message}")
+                        
+                        # ===== SUB-CASO: PERFIL INCOMPLETO =====
+                        if error_code == "IncompleteProfile":
+                            logger.error(f"PERFIL INCOMPLETO DETECTADO")
+                            
+                            # Extraer información legible
+                            missing_info = extract_missing_fields_info(missing_fields)
+                            
+                            logger.error(f"   Total campos faltantes: {missing_info['total']}")
+                            logger.error(f"   Obligatorios: {missing_info['required_count']}")
+                            logger.error(f"   Opcionales: {missing_info['optional_count']}")
+                            logger.error(f"   Campos: {', '.join(missing_info['required_labels'])}")
+                            
+                            # Notificar
+                            error_msg = f"Perfil incompleto. Faltan {missing_info['required_count']} campos obligatorios: {', '.join(missing_info['required_labels'])}"
+                            await error_notify(method_name, client_id, error_msg)
+                            
+                            # NO reintentar - es un problema del cliente
+                            raise HTTPException(
+                                status_code=409,  # ← CONFLICT (no 502)
+                                detail={
+                                    "error": "IncompleteProfile",
+                                    "message": "El perfil del cliente está incompleto en Kuenta",
+                                    "required_fields_count": missing_info['required_count'],
+                                    "required_fields": missing_info['required_labels'],
+                                    "optional_fields": missing_info['optional_labels'],
+                                    "by_category": missing_info['by_category'],
+                                    "instruction": "Complete los datos faltantes en la plataforma Kuenta"
+                                }
+                            )
+                        
+                        # ===== SUB-CASO: OTRO ERROR 400 =====
+                        else:
+                            logger.error(f"   Tipo de error desconocido: {error_code}")
+                            await error_notify(method_name, client_id, 
+                                f"Error 400 en Kuenta: {error_code} - {error_message}")
+                            
+                            # Reintentar
+                            if attempt < max_retries - 1:
+                                wait_time = 2 ** attempt
+                                logger.info(f"Reintentando en {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                            continue
+                    
+                    # ===== CASO 3: OTROS ERRORES (500, 503, etc) =====
+                    else:
+                        logger.error(f"HTTP {status_code}")
+                        logger.error(f"   Respuesta: {response.text[:200]}")
+                        
+                        await error_notify(method_name, client_id, 
+                            f"Error HTTP {status_code} en API Kuenta")
+                        
+                        # Reintentar
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            logger.info(f"Reintentando en {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        continue
+                
+                except httpx.TimeoutException as e:
+                    logger.error(f"❌ Intento {attempt+1}: ⏱️ TIMEOUT ({str(e)})")
+                    await error_notify(method_name, client_id, "Timeout en API Kuenta")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"Intento {attempt+1}: Error HTTP {e.response.status_code}")
+                    logger.error(f"   {e.response.text[:200]}")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        
+                except httpx.RequestError as e:
+                    logger.error(f"Intento {attempt+1}: 🔌 Error de conexión ({str(e)})")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+            
+            # ===== VALIDAR ÉXITO DEL POST =====
+            if response_credit_id is None:
+                logger.error(f"FALLO: No se creó payable tras {max_retries} intentos")
+                await error_notify(method_name, client_id, 
+                    f"No se pudo crear payable tras {max_retries} intentos")
+                
+                # Retornar 502 SOLO si fue error de conexión
+                raise HTTPException(
+                    status_code=502,  # ← BAD GATEWAY (error del servidor)
+                    detail={
+                        "error": "ServiceUnavailable",
+                        "message": f"No se pudo crear el payable tras {max_retries} intentos",
+                        "last_error": last_error_response
+                    }
+                )
+                
+                
+            try:
+                url_prod = f"https://api.kuenta.co/v1/payables/{response_credit_id}"
+                logger.info(f"Consultando simulación: {url_prod}")
+                
+                response_get_simulacion = await client.get(url_prod, headers=headers)
+                status_code_simulacion = response_get_simulacion.status_code
+                
+                logger.info(f"Status code de la simulación: {status_code_simulacion}")
+                            
+                            
+                if status_code_simulacion == 200 or status_code_simulacion == 201:
+                    simulacion_data = response_get_simulacion.json()
+                    credit_data = simulacion_data.get("data", {}).get("credit", {})
+
+                    installments = credit_data.get("installments", [])
+                    cuota_inicial = credit_data.get("initialFee")
+                    ID_credito = credit_data.get("ID")
+                    referencia_credito = credit_data.get("reference")
+                    id_cliente = credit_data.get("debtorID")
+
+
+                    if not installments:
+                        logger.error("No se encontraron installments en la respuesta")
+                        await error_notify(method_name, client_id, 
+                            "No se encontraron cuotas en la simulación")
+                        raise HTTPException(
+                            status_code=404,
+                            detail="No se encontraron cuotas en la simulación"
+                        )
+                        
+                    # Tomar el primer installment
+                    first_installment = installments[0]
+                
+                    # Extraer y redondear valores
+                    payment = round(float(first_installment.get("payment", 0)))
+                    capital = round(float(first_installment.get("capital", 0)))
+                    interest = round(float(first_installment.get("interest", 0)))
+                    costs = round(float(first_installment.get("costs", 0)))
+                    taxes = round(float(first_installment.get("taxes", 0)))
+                    # cuota inicial redondeada
+                    cuota_inicial_rounded = round(float(cuota_inicial))
+
+                    # Formatear valores para lectura humana
+                    formatted_values = {
+                        "payment_formatted": f"${payment:,}",
+                        "capital_formatted": f"${capital:,}",
+                        "interest_formatted": f"${interest:,}",
+                        "costs_formatted": f"${costs:,}",
+                        "taxes_formatted": f"${taxes:,}",
+                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
+                    }
+
+                    # Agregar valores originales y formateados a la respuesta
+                    response_data = {
+                        "status": "success",
+                        "ID del credito creado": response_credit_id,
+                        "valores_originales": {
+                            "payment": payment,
+                            "capital": capital,
+                            "interest": interest,
+                            "costs": costs,
+                            "taxes": taxes
+                        },
+                        "valores_formateados": formatted_values
+                    }
+
+                    logger.info("Valores extraidos y formateados exitosamente")
+                    logger.info(f"Valores formateados: {formatted_values}")
+                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
+                    if id_cliente and installments:
+                        cuotas_cache[id_cliente] = {
+                            "cuotas": installments,
+                            "timestamp": datetime.now(timezone.utc)
+                        }
+                                    
+                    # Notificación informativa
+                    info_message = (
+                        f"Crédito creado y registrado en kuenta correctamente\n"
+                        f"ID del crédito: {ID_credito}\n"
+                        f"Referencia del crédito: {referencia_credito}\n"
+                        f"ID del cliente: {id_cliente}\n"
+                        f"Valor total crédito: {formatted_values['payment_formatted']}"
+                    )
+                                    
+                    # envia notificacion informativa (email + telegram) con id para seguimiento
+                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
+                
+                    return response_data
+                else:
+                    logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
+                    logger.error(f"Respuesta: {response_get_simulacion.text}")
+                    await error_notify(method_name, client_id, 
+                        f"Error al consultar simulación: {status_code_simulacion}\nRespuesta: {response_get_simulacion.text}")
+                    raise HTTPException(
+                        status_code=status_code_simulacion,
+                        detail="Error al consultar la simulación"
+                    )
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Error HTTP en GET simulación: {e.response.status_code}")
+                logger.error(f"Respuesta: {e.response.text}")
+                await error_notify(method_name, client_id, 
+                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}")
+                raise HTTPException(
+                    status_code=e.response.status_code,
+                    detail=f"Error en API externa: {e.response.text}"
+                )
+                
+            except httpx.RequestError as e:
+                logger.error(f"Error conexión en GET simulación: {str(e)}")
+                await error_notify(method_name, client_id, 
+                    f"Error conexión GET: {str(e)}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Error de conexión al consultar simulación"
+                )
+                
+    except HTTPException:
+        raise
+        
+    except ValueError as e:
+        logger.error(f"Error de conversión de datos: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conversión: {str(e)}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_datos"],
+                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
+            }
+        )
+        
+    except httpx.RequestError as e:
+        logger.error(f"Error de conexión: {str(e)}")
+        await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error interno: {str(e)}", exc_info=True)
+        await error_notify(method_name, client_id, f"Error interno: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_general"],
+                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
+            }
+        )
+
 async def create_payable(client_id: str, payload: PayableRequest):
     """
     Endpoint para crear un nuevo payable:
     1. Recibe el ID del cliente como parÃƒÂ¡metro
     2. Transforma los campos principal y initialFee de str a int
     3. Extrae el token de autorizacion del payload
-    4. Realiza la peticiÃƒÂ³n POST al endpoint de payable
+    4. Realiza la peticion POST al endpoint de payable
     
     """
     method_name = "create_payable"
@@ -467,6 +955,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
             logger.info(f"Payload transformado para enviar a kuenta: {new_payload}")
 
             max_retries = 3
+            response_credit_id = None  # Inicializar antes del bucle para evitar UnboundLocalError
             for attempt in range(max_retries):
                 
                 try:
@@ -532,7 +1021,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 
                 
             try:
-                url_prod = f"https://api.kuenta.co/v1/payable/{response_credit_id}"
+                url_prod = f"https://api.kuenta.co/v1/payables/{response_credit_id}"
                 logger.info(f"Consultando simulación: {url_prod}")
                 
                 response_get_simulacion = await client.get(url_prod, headers=headers)
@@ -707,7 +1196,7 @@ async def limpiar_valor_principal(raw_principal: str) -> float:
         ValueError: Si no se puede extraer un valor numÃƒÂ©rico vÃƒÂ¡lido
     """
     if not raw_principal:
-        raise ValueError("El valor principal no puede estar vacÃƒÂ­o")
+        raise ValueError("El valor principal no puede estar vacio")
 
     # Convertir a string y eliminar espacios
     valor = str(raw_principal).strip().lower()
@@ -766,7 +1255,7 @@ async def calcular_financiamiento(payload: dict):
     """
     Calcula el financiamiento basado en:
     1. Cuota inicial = principal * porcentaje_cuota
-    2. Plazo en dÃƒÂ­as = plazo_escogido * paymentFrequency
+    2. Plazo en dias = plazo_escogido * paymentFrequency
     3. Consulta a la API Kuenta para obtener el porcentaje de Aval
     4. Calcula desembolso, deducciones y valor a solicitar
     """
@@ -815,6 +1304,7 @@ async def calcular_financiamiento(payload: dict):
 
         # --- PROCESAR PLAZO_VALOR_PAGAR, el dato entra en string y debe devolverse como un numero ---
         plazo_texto_raw = payload.get("plazo_valor_pagar", "")
+        logging.info(f"plazo_valor_pagar recibido: {plazo_texto_raw} \n")
         plazo_texto = unicodedata.normalize("NFKD", str(plazo_texto_raw)).encode("ascii", "ignore").decode("ascii").strip().lower()
         plazo_map = {
             "1 mes": 1,
@@ -871,6 +1361,15 @@ async def calcular_financiamiento(payload: dict):
         # --- CALCULOS INICIALES ---
         valor_cuota_inicial = principal * porcentaje_cuota
         dias_totales = plazo_escogido * payment_frequency
+        
+        # --- VALIDAR RANGO DE DIAS (API requiere entre 30 y 150 dias) ---
+        #if dias_totales < 30 or dias_totales > 150:
+            #logger.error(f"Días fuera de rango: {dias_totales}. Debe estar entre 30 y 150.")
+            #await error_notify(method_name, linea_producto_notify_error, f"Días fuera de rango: {dias_totales}")
+            #raise HTTPException(
+                #status_code=400,
+                #detail=f"El plazo debe resultar en un número de días entre 30 y 150. Plazo actual: {dias_totales} días"
+            #)
 
         # --- CONSULTA A API KUENTA ---
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -941,7 +1440,7 @@ async def calcular_financiamiento(payload: dict):
         logger.info(f"Plazo en dias (plazo_dias): {dias_totales} \n")
         logger.info(f"Porcentaje escogido (porcentaje_str): {porcentaje_str}% \n")
         
-        logger.info("CAlculo completado correctamente. \n")
+        logger.info("Calculo completado correctamente. \n")
         logger.info("-------------fin de la ejecucion------------------ \n")
         
         #notificacion informativa
@@ -983,7 +1482,7 @@ async def calcular_financiamiento(payload: dict):
             mensaje_usuario = MENSAJES_USUARIO["semestre_invalido"]
         elif "plazo" in str(e.detail):
             mensaje_usuario = MENSAJES_USUARIO["plazo_invalido"]
-        elif "lÃƒÂ­nea_producto" in str(e.detail):
+        elif "li­nea_producto" in str(e.detail):
             mensaje_usuario = MENSAJES_USUARIO["linea_no_existe"]
             
         await error_notify(method_name, linea_producto_notify_error, e.detail)
@@ -999,7 +1498,7 @@ async def calcular_financiamiento(payload: dict):
         return {
             "estado": "error", 
             "mensaje": MENSAJES_USUARIO["error_conexion"],
-            "detalles_usuario": "Nuestro equipo tÃƒÂ©cnico ha sido notificado del inconveniente."
+            "detalles_usuario": "Nuestro equipo tecnico ha sido notificado del inconveniente."
         }
 
 
@@ -1019,20 +1518,20 @@ async def obtener_estado(debtor_id:str,request: Request):
         installmentid = body.get("installmentid")
         orderid = body.get("orderid")
         debtor_id_notify_error = f"debtor_id_cliente =  {debtor_id} y creditid = {creditid}"
-        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: creditid= ++++++++, \n {creditid} \n")
-        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: installmentid= ++++++++, \n {installmentid} \n")
-        logger.info(f"+++++ ParÃƒÂ¡metros recibidos en el body: orderid= ++++++++, \n {orderid} \n")
+        logger.info(f"+++++ Parametros recibidos en el body: creditid= ++++++++, \n {creditid} \n")
+        logger.info(f"+++++ Parametros recibidos en el body: installmentid= ++++++++, \n {installmentid} \n")
+        logger.info(f"+++++ Parametros recibidos en el body: orderid= ++++++++, \n {orderid} \n")
         
 
         if not creditid or not installmentid or not orderid:
-            raise HTTPException(status_code=400, detail="Faltan parÃƒÂ¡metros obligatorios: creditid, installmentid, orderid")
+            raise HTTPException(status_code=400, detail="Faltan parametros obligatorios: creditid, installmentid, orderid")
 
-        url = f"https://api.kuenta.co/v1/payable/{creditid}/installment/0/order/list/{orderid}"
+        url = f"https://api.kuenta.co/v1/payables/{creditid}/installments/0/orders/list/{orderid}"
         intentos = 3
         intervalo_segundos = 10
         intento = 0
 
-        logger.info(f"ParÃƒÂ¡metros recibidos: creditid={creditid}, installmentid={installmentid}, orderid={orderid}")
+        logger.info(f"Parametros recibidos: creditid={creditid}, installmentid={installmentid}, orderid={orderid}")
 
         async with httpx.AsyncClient() as client:
             # Obtener token una sola vez
@@ -1077,6 +1576,139 @@ async def obtener_estado(debtor_id:str,request: Request):
         await error_notify(method_name, debtor_id_notify_error, f"Error en el proceso: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en el proceso: {str(e)}")
     
+
+
+@app.post("/registrar-renovacion", tags=["Renovaciones"])
+async def registrar_renovacion_v2(payload: RenovacionRefactorRequest):
+    method_name = "registrar_renovacion"
+    client_id = payload.nombre_cliente
+
+    try:
+        logger.info(f"Procesando inserccion en la db de renovación para: {client_id}")
+
+        # Preparar datos
+        data_cliente = {
+            "numero_telefono": payload.numero_telefono,
+            "correo_cliente": payload.correo_cliente,
+            "nombre_cliente": payload.nombre_cliente,
+            "cedula_cliente": payload.cedula_cliente
+        }
+        
+        data_credito = payload.datos_credito.model_dump()
+
+        # Inserción en BD
+        resultado = await insertar_registro_completo(data_cliente, data_credito)
+        
+        # Verificar si la inserción falló por duplicado o fue actualización
+        if isinstance(resultado, dict):
+            if resultado["status"] == "success":
+                logger.info(f"Renovación registrada exitosamente: {resultado}")
+                await info_notify(method_name, client_id, f"Renovación registrada. en base de datos ID: {resultado['id_renovacion']}")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "message": "Renovación registrada correctamente",
+                    "data": resultado
+                }
+            )
+        
+        elif resultado["status"] == "updated":
+            logger.info(f"Registro actualizado exitosamente: {resultado}")
+            await info_notify(method_name, client_id, f"Registro actualizado ID: {resultado['id_renovacion']}")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "message": resultado["message"],  # "Registro actualizado exitosamente..."
+                    "data": resultado
+                }
+            )
+        
+        elif resultado["status"] == "error":
+            logger.warning(f"Intento de registro duplicado rechazado: {resultado}")
+            await error_notify(method_name, client_id, f"No se puede registrar la renovación: {resultado['message']}")
+            return JSONResponse(
+                status_code=409,  # Conflict
+                content={
+                    "status": "error",
+                    "message": "No se puede registrar la renovación",
+                    "error": resultado["message"],
+                    "details": resultado.get("details", {})
+                }
+            )
+        
+        else:
+            # Caso inesperado
+            logger.error(f"Estado desconocido en resultadoado: {resultado}")
+            await error_notify(method_name, client_id, "Estado de respuesta desconocido al registrar renovación")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": "Error interno del servidor",
+                    "details": "Estado de respuesta desconocido"
+                }
+            )
+
+    except Exception as e:
+        logger.error(f"Fallo en {method_name}: {str(e)}")
+        await error_notify(method_name, client_id, f"Error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Error interno del servidor", "detail": str(e)}
+        )
+
+# consultar los creditos realizados en el flujo de renovaciones
+@app.post("/consultar-creditos", tags=["Consultas"], summary="Búsqueda avanzada de créditos")
+async def buscar_creditos(filtros: ConsultaCreditoRequest):
+    """
+    Busca créditos combinando filtros opcionales:
+    - Por Cédula
+    - Por Teléfono
+    - Por ID de Estado (0-20)
+    - Por Rango de Fechas
+    """
+    try:
+        resultados = await consultar_creditos_filtro(
+            cedula=filtros.cedula,
+            telefono=filtros.telefono,
+            estado_id=filtros.estado_id,
+            fecha_inicio=filtros.fecha_inicio,
+            fecha_fin=filtros.fecha_fin
+        )
+        
+        if not resultados:
+            return JSONResponse(status_code=404, content={"status": "info", "message": "No se encontraron registros con esos filtros"})
+        
+        
+        # --- LÓGICA DE EXPORTACIÓN ---
+        if filtros.exportar_excel:
+            # Generar el archivo en memoria
+            excel_buffer = generar_excel_memoria(resultados)
+            
+            # Definir nombre del archivo (puedes ponerle fecha dinámica si quieres)
+            filename = "reporte_creditos.xlsx"
+            
+            # Retornar como descarga de archivo
+            return StreamingResponse(
+                excel_buffer,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "total_resultados": len(resultados),
+                "data": jsonable_encoder(resultados)
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error en endpoint búsqueda: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
 #### endpoints para pruebas de notificaciones ###
 
@@ -1464,6 +2096,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
                 "detail": str(e)
             }
         )
+
 
 
 @app.get("/logs")
