@@ -147,11 +147,11 @@ async def check_server_restart(request: Request, call_next):
 # Mensajes amigables para el cliente
 MENSAJES_CLIENTE = {
     "error_conexion": "Lo sentimos, en este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
-    "error_datos": "Los valores ingresados no son vÃƒÂ¡lidos. Por favor verifica que el monto y la cuota inicial sean nÃƒÂºmeros vÃƒÂ¡lidos.",
-    "error_servicio": "En este momento nuestro servicio no estÃƒÂ¡ disponible. Por favor intenta mÃƒÂ¡s tarde.",
-    "error_simulacion": "No pudimos completar la simulaciÃƒÂ³n de tu crÃƒÂ©dito. Por favor verifica los datos e intenta nuevamente.",
-    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crÃƒÂ©dito. Por favor intenta nuevamente.",
-    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente mÃƒÂ¡s tarde."
+    "error_datos": "Los valores ingresados no son válidos. Por favor verifica que el monto y la cuota inicial sean números válidos.",
+    "error_servicio": "En este momento nuestro servicio no está disponible. Por favor intenta más tarde.",
+    "error_simulacion": "No pudimos completar la simulación de tu crédito. Por favor verifica los datos e intenta nuevamente.",
+    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crédito. Por favor intenta nuevamente.",
+    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente más tarde."
 }
 
 MENSAJES_USUARIO = {
@@ -264,7 +264,7 @@ class DetalleCuotaRequest(BaseModel):
 class TestNotifyRequest(BaseModel):
     method_name: str = "test_method"
     client_id: str = "test_client"
-    message: str = "Mensaje de prueba para notificaciÃƒÂ³n"
+    message: str = "Mensaje de prueba para notificación"
 
 
 
@@ -436,7 +436,7 @@ async def webhook_product_lines(
 
 
 def format_currency(value: float) -> str:
-    """Formatea un nÃƒÂºmero como moneda COP: sin decimales, con $ y separadores de miles."""
+    """Formatea un número como moneda COP: sin decimales, con $ y separadores de miles."""
     return f"${value:,.0f}"
 
 
@@ -605,7 +605,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
-            respuesta_error_final = None
+            last_error_response = None
             
             for attempt in range(max_retries):
                 
@@ -660,7 +660,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                             
                             # NO reintentar - es un problema del cliente
                             raise HTTPException(
-                                status_code=409,  # ← CONFLICT (no 502)
+                                status_code=409,
                                 detail={
                                     "error": "IncompleteProfile",
                                     "message": "El perfil del cliente está incompleto en Kuenta",
@@ -673,17 +673,13 @@ async def create_payable(client_id: str, payload: PayableRequest):
                             )
                         
                         # ===== SUB-CASO: OTRO ERROR 400 =====
-                        else:
-                            logger.error(f"   Tipo de error desconocido: {error_code}")
-                            await error_notify(method_name, client_id, 
-                                f"Error 400 en Kuenta: {error_code} - {error_message}")
-                            
-                            # Reintentar
-                            if attempt < max_retries - 1:
-                                wait_time = 2 ** attempt
-                                logger.info(f"Reintentando en {wait_time}s...")
-                                await asyncio.sleep(wait_time)
-                            continue
+                    elif status_code == 400:
+                        error_response = response.json()
+                        last_error_response = error_response  # GUARDAR RESPUESTA DE ERROR
+                        
+                        error_code = error_response.get("data", {}).get("code")
+                        error_message = error_response.get("data", {}).get("message", "Unknown")
+                        missing_fields = error_response.get("data", {}).get("missingFields", [])
                     
                     # ===== CASO 3: OTROS ERRORES (500, 503, etc) =====
                     else:
@@ -701,7 +697,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         continue
                 
                 except httpx.TimeoutException as e:
-                    logger.error(f"❌ Intento {attempt+1}: ⏱️ TIMEOUT ({str(e)})")
+                    logger.error(f"Intento {attempt+1}: ⏱️ TIMEOUT ({str(e)})")
                     await error_notify(method_name, client_id, "Timeout en API Kuenta")
                     
                     if attempt < max_retries - 1:
@@ -898,293 +894,11 @@ async def create_payable(client_id: str, payload: PayableRequest):
             }
         )
 
-async def create_payable(client_id: str, payload: PayableRequest):
-    """
-    Endpoint para crear un nuevo payable:
-    1. Recibe el ID del cliente como parÃƒÂ¡metro
-    2. Transforma los campos principal y initialFee de str a int
-    3. Extrae el token de autorizacion del payload
-    4. Realiza la peticion POST al endpoint de payable
-    
-    """
-    method_name = "create_payable"
-    try:
 
-        async with httpx.AsyncClient() as client:
-            
-            logger.info(f"+++++ Parámetros recibidos: client_id= {client_id}")
-            logger.info(f"#####--- Payload entrante ----####")
-            logger.info(f"creditLineId: {payload.creditLineId}")
-            logger.info(f"principal: {payload.principal} (tipo: {type(payload.principal).__name__})")
-            logger.info(f"time: {payload.time} (tipo: {type(payload.time).__name__})")
-            logger.info(f"initialFee: {payload.initialFee} (tipo: {type(payload.initialFee).__name__})")
-            logger.info(f"disbursementMethod: {payload.disbursementMethod}")
-            logger.info(f"paymentFrequency: {payload.paymentFrequency}")
-            
-            principal = payload.principal
-            initial_fee = payload.initialFee
-            
-            token = await obtener_token(client)
-            
-            # 1) Construimos un payload base con TODOS los campos, incluidos los opcionales
-            new_payload = {
-                "creditLineId": payload.creditLineId,          # ← corregido: antes era creditLineID
-                "principal": principal,
-                "time": payload.time,
-                "disbursementMethod": payload.disbursementMethod,
-                "initialFee": initial_fee,
-                "paymentFrequency": payload.paymentFrequency,
-                # Nuevos campos opcionales según la doc:
-                "source": payload.source,
-                "redirectUrl": payload.redirectUrl,
-                "callbackUrl": payload.callbackUrl,
-                "meta": payload.meta,
-            }
-            
-            # 2) Eliminamos solo los que son None para no mandar basura ni nulls innecesarios
-            new_payload = {k: v for k, v in new_payload.items() if v is not None}
-
-            logger.info(f"Payload saliente para POST /v1/payable: {new_payload}")
-            
-            headers = {
-                "Config-Organization-ID": ORG_ID,
-                "Organization-ID": client_id,
-                "Authorization": token
-            }
-            logger.info(f"Iniciando peticion POST a {PAYABLE_URL}")
-            logger.info(f"Payload transformado para enviar a kuenta: {new_payload}")
-
-            max_retries = 3
-            response_credit_id = None  # Inicializar antes del bucle para evitar UnboundLocalError
-            for attempt in range(max_retries):
-                
-                try:
-                    response = await client.post(
-                        PAYABLE_URL,
-                        json=new_payload,
-                        headers=headers
-                    )
-                    status_code = response.status_code
-                    
-                    logger.info(f"Intento {attempt+1}: status_code={status_code}")
-                    
-                    if status_code == 201:
-                            logger.info("Procesando respuesta de Kuenta")
-                            response_data = response.json()
-                            credit = response_data.get("data", {}).get("credit", {})
-                            
-                            #logging.info(f"Respuesta completa de Kuenta: {response_data} \n")
-                            
-                            # ID credito
-                            response_credit_id = credit.get("ID")
-                            break  # Salir del bucle de reintentos si fue exitoso
-                    else:
-                        
-                        logger.error(f"Error: Status code no esperado: {status_code}")
-                        logger.error(f"Respuesta del servidor: {response.text}")
-                        await error_notify(method_name, client_id, f"Error en API externa: status {status_code}")
-                        
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            logger.info(f"Reintentando en {wait_time} segundos...")
-                            await asyncio.sleep(wait_time)
-                
-                except httpx.HTTPStatusError as e:
-                    logger.error(f"Intento {attempt+1}: Error HTTP {e.response.status_code}")
-                    logger.error(f"Respuesta: {e.response.text}")
-                    await error_notify(method_name, client_id, f"Error en API externa: {e.response.text}")
-                    
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Reintentando en {wait_time} segundos...")
-                        await asyncio.sleep(wait_time)
-                        
-                except httpx.RequestError as e:
-                    logger.error(f"Intento {attempt+1}: Error de conexión: {str(e)}")
-                    await error_notify(method_name, client_id, 
-                        f"Error conexión POST: {str(e)}")
-                    
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Reintentando en {wait_time} segundos...")
-                        await asyncio.sleep(wait_time)
-            
-            # Validar si se obtuvo respuesta exitosa
-            if response_credit_id is None:
-                logger.error(f"No se logró crear el payable tras {max_retries} intentos")
-                await error_notify(method_name, client_id, 
-                    f"POST /payable falló tras {max_retries} intentos")
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Error de conexión tras {max_retries} intentos o respuesta no válida"
-                ) 
-                
-                
-            try:
-                url_prod = f"https://api.kuenta.co/v1/payables/{response_credit_id}"
-                logger.info(f"Consultando simulación: {url_prod}")
-                
-                response_get_simulacion = await client.get(url_prod, headers=headers)
-                status_code_simulacion = response_get_simulacion.status_code
-                
-                logger.info(f"Status code de la simulación: {status_code_simulacion}")
-                            
-                            
-                if status_code_simulacion == 200 or status_code_simulacion == 201:
-                    simulacion_data = response_get_simulacion.json()
-                    credit_data = simulacion_data.get("data", {}).get("credit", {})
-
-                    installments = credit_data.get("installments", [])
-                    cuota_inicial = credit_data.get("initialFee")
-                    ID_credito = credit_data.get("ID")
-                    referencia_credito = credit_data.get("reference")
-                    id_cliente = credit_data.get("debtorID")
-
-
-                    if not installments:
-                        logger.error("No se encontraron installments en la respuesta")
-                        await error_notify(method_name, client_id, 
-                            "No se encontraron cuotas en la simulación")
-                        raise HTTPException(
-                            status_code=404,
-                            detail="No se encontraron cuotas en la simulación"
-                        )
-                        
-                    # Tomar el primer installment
-                    first_installment = installments[0]
-                
-                    # Extraer y redondear valores
-                    payment = round(float(first_installment.get("payment", 0)))
-                    capital = round(float(first_installment.get("capital", 0)))
-                    interest = round(float(first_installment.get("interest", 0)))
-                    costs = round(float(first_installment.get("costs", 0)))
-                    taxes = round(float(first_installment.get("taxes", 0)))
-                    # cuota inicial redondeada
-                    cuota_inicial_rounded = round(float(cuota_inicial))
-
-                    # Formatear valores para lectura humana
-                    formatted_values = {
-                        "payment_formatted": f"${payment:,}",
-                        "capital_formatted": f"${capital:,}",
-                        "interest_formatted": f"${interest:,}",
-                        "costs_formatted": f"${costs:,}",
-                        "taxes_formatted": f"${taxes:,}",
-                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
-                    }
-
-                    # Agregar valores originales y formateados a la respuesta
-                    response_data.update({
-                        "ID del credito creado": response_credit_id,
-                        "valores_originales": {
-                            "payment": payment,
-                            "capital": capital,
-                            "interest": interest,
-                            "costs": costs,
-                            "taxes": taxes
-                        },
-                        "valores_formateados": formatted_values
-                    })
-
-                    logger.info("Valores extraidos y formateados exitosamente")
-                    logger.info(f"Valores formateados: {formatted_values}")
-                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
-                    if id_cliente and installments:
-                        cuotas_cache[id_cliente] = {
-                            "cuotas": installments,
-                            "timestamp": datetime.now(timezone.utc)
-                        }
-                                    
-                    # Notificación informativa
-                    info_message = (
-                        f"Crédito creado y registrado en kuenta correctamente\n"
-                        f"ID del crédito: {ID_credito}\n"
-                        f"Referencia del crédito: {referencia_credito}\n"
-                        f"ID del cliente: {id_cliente}\n"
-                        f"Valor total crédito: {formatted_values['payment_formatted']}"
-                    )
-                                    
-                    # envia notificacion informativa (email + telegram) con id para seguimiento
-                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
-                
-                    return response_data
-                else:
-                    logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
-                    logger.error(f"Respuesta: {response_get_simulacion.text}")
-                    await error_notify(method_name, client_id, 
-                        f"Error al consultar simulación: {status_code_simulacion}\nRespuesta: {response_get_simulacion.text}")
-                    raise HTTPException(
-                        status_code=status_code_simulacion,
-                        detail="Error al consultar la simulación"
-                    )
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Error HTTP en GET simulación: {e.response.status_code}")
-                logger.error(f"Respuesta: {e.response.text}")
-                await error_notify(method_name, client_id, 
-                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}")
-                raise HTTPException(
-                    status_code=e.response.status_code,
-                    detail=f"Error en API externa: {e.response.text}"
-                )
-                
-            except httpx.RequestError as e:
-                logger.error(f"Error conexión en GET simulación: {str(e)}")
-                await error_notify(method_name, client_id, 
-                    f"Error conexión GET: {str(e)}")
-                raise HTTPException(
-                    status_code=502,
-                    detail="Error de conexión al consultar simulación"
-                )
-                
-    except HTTPException:
-        raise
-        
-    except ValueError as e:
-        logger.error(f"Error de conversión de datos: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conversión: {str(e)}")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_datos"],
-                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
-            }
-        )
-        
-    except httpx.RequestError as e:
-        logger.error(f"Error de conexión: {str(e)}")
-        await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
-        return JSONResponse(
-            status_code=502,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error interno: {str(e)}", exc_info=True)
-        await error_notify(method_name, client_id, f"Error interno: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_general"],
-                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
-            }
-        )
-                
-                
-                
-                
-                
-                    
-
-
-#manejar diferentes casos de entrada para el valor "principal" y extraer solo los nÃƒÂºmeros
+#manejar diferentes casos de entrada para el valor "principal" y extraer solo los números
 async def limpiar_valor_principal(raw_principal: str) -> float:
     """
-    Limpia y extrae el valor numÃƒÂ©rico de una cadena que contiene un monto.
+    Limpia y extrae el valor numérico de una cadena que contiene un monto.
     
     Args:
         raw_principal (str): Cadena con el valor principal en diferentes formatos
@@ -1193,7 +907,7 @@ async def limpiar_valor_principal(raw_principal: str) -> float:
         float: Valor numerico extraido
         
     Raises:
-        ValueError: Si no se puede extraer un valor numÃƒÂ©rico vÃƒÂ¡lido
+        ValueError: Si no se puede extraer un valor numérico válido
     """
     if not raw_principal:
         raise ValueError("El valor principal no puede estar vacio")
@@ -1215,7 +929,7 @@ async def limpiar_valor_principal(raw_principal: str) -> float:
     # "2millones500mil"
     # "dos millones quinientos mil"
 
-    # Eliminar caracteres especiales y texto comÃƒÂºn
+    # Eliminar caracteres especiales y texto común
     palabras_a_eliminar = [
         'cop', 'pesos', 'valor', 'seria', 'de', 'quiero', 
         'financiar', 'necesito', 'el', 'aproximadamente',
@@ -1225,20 +939,19 @@ async def limpiar_valor_principal(raw_principal: str) -> float:
     for palabra in palabras_a_eliminar:
         valor = valor.replace(palabra, '')
 
-    # Eliminar sÃƒÂ­mbolos monetarios y caracteres especiales
+    # Eliminar símbolos monetarios y caracteres especiales
     valor = re.sub(r'[$ \'"]', '', valor)
 
     # Convertir puntos y comas usados como separadores de miles
     valor = valor.replace('.', '')
     valor = valor.replace(',', '')
 
-    # Extraer solo dÃƒÂ­gitos
+    # Extraer solo dígitos
     numeros = re.findall(r'\d+', valor)
     
     if not numeros:
-        raise ValueError(f"No se pudo extraer un valor numÃƒÂ©rico de: {raw_principal}")
-
-    # Unir todos los nÃƒÂºmeros encontrados
+        raise ValueError(f"No se pudo extraer un valor numérico de: {raw_principal}")
+    # Unir todos los números encontrados
     valor_limpio = ''.join(numeros)
     
     try:
@@ -1329,9 +1042,9 @@ async def calcular_financiamiento(payload: dict):
 
         # Definir MENSAJES_USUARIO antes del try para que sea accesible en los bloques except
         MENSAJES_USUARIO = {
-            "valor_invalido": "El monto ingresado no es vÃƒÂ¡lido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
-            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no estÃƒÂ¡ disponible en este momento. Por favor intenta nuevamente mÃƒÂ¡s tarde.",
-            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'dÃƒÂ©cimo semestre'.",
+            "valor_invalido": "El monto ingresado no es válido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
+            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no está disponible en este momento. Por favor intenta nuevamente más tarde.",
+            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'décimo semestre'.",
             "plazo_invalido": "El plazo seleccionado no es valido. Por favor escoge entre 1 y 6 meses.",
             "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
             "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
@@ -1712,7 +1425,7 @@ async def buscar_creditos(filtros: ConsultaCreditoRequest):
 
 #### endpoints para pruebas de notificaciones ###
 
-# Endpoint que llama a error_notify (envÃƒÂ­a email + telegram)
+# Endpoint que llama a error_notify (envía email + telegram)
 @app.post("/test-notify")
 async def test_notify(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1722,7 +1435,7 @@ async def test_notify(payload: TestNotifyRequest = Body(...)):
         logger.exception("Error en /test-notify")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# Endpoint para probar solo envÃƒÂ­o por email
+# Endpoint para probar solo envi­o por email
 @app.post("/test-email")
 async def test_email(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1732,7 +1445,7 @@ async def test_email(payload: TestNotifyRequest = Body(...)):
         logger.exception("Error en /test-email")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# Endpoint para probar solo envÃƒÂ­o a Telegram
+# Endpoint para probar solo envío a Telegram
 @app.post("/test-telegram")
 async def test_telegram(payload: TestNotifyRequest = Body(...)):
     try:
@@ -1744,7 +1457,7 @@ async def test_telegram(payload: TestNotifyRequest = Body(...)):
 
 
 # Endpoint para enviar correo de renovacion de credito con validaciones
-@app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraÃƒÂ­das.",tags=["Correo_post_llamada"])
+@app.post("/Correo_post_llamada", summary="Receptor de variables despues de la llamada",description="Recibe el payload con las variables de entrada y extraídas.",tags=["Correo_post_llamada"])
 async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     """
     Endpoint principal que recibe el payload del webhook.
@@ -1887,7 +1600,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                 
                 # Validar explicitamente el resultado
                 if resultado.get("status") == "error":
-                    logging.error(f"❌ Error en el procesamiento: {resultado.get('message')}")
+                    logging.error(f"Error en el procesamiento: {resultado.get('message')}")
                     await error_notify(
                         method_name="handle_webhook_renovacion_refinanciacion",
                         client_id=objetivo,
@@ -1904,7 +1617,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                         }
                     )
                 elif resultado.get("status") == "success":
-                    logging.info(f"✅ Procesamiento EXITOSO para renovacion y refinanciacion")
+                    logging.info(f"Procesamiento EXITOSO para renovacion y refinanciacion")
                     await info_notify(
                         method_name="handle_webhook_renovacion_refinanciacion",
                         client_id=objetivo,
@@ -1940,7 +1653,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                         }
                     )
             except Exception as e:
-                logging.error(f"❌ Excepción en procesar_llamada_renovacion_Y_refinanciamiento: {e}", exc_info=True)
+                logging.error(f"Excepción en procesar_llamada_renovacion_Y_refinanciamiento: {e}", exc_info=True)
                 await error_notify(
                     method_name="handle_webhook_renovacion_refinanciacion",
                     client_id=objetivo,
@@ -1980,7 +1693,7 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
 
 
 # Endpoint para registrar renovaciones en la base de datos
-@app.post("/renovaciones", tags=["Renovaciones"], summary="Registrar renovaciÃƒÂ³n de cliente")
+@app.post("/renovaciones", tags=["Renovaciones"], summary="Registrar renovación de cliente")
 async def registrar_renovacion(payload: RenovacionPayload):
     """
     Endpoint para registrar una renovacion de credito en la base de datos.
@@ -1996,10 +1709,10 @@ async def registrar_renovacion(payload: RenovacionPayload):
     method_name = "registrar_renovacion"
     
     try:
-        
-        logger.info(f"Intentando registrar renovaciÃƒÂ³n para: {payload.nombre_cliente}")
-        
-        # Crear conexiÃƒÂ³n asincrÃƒÂ³nica a la base de datos
+
+        logger.info(f"Intentando registrar renovación para: {payload.nombre_cliente}")
+
+        # Crear conexión asincrónica a la base de datos
         connection = await aiomysql.connect(
             host=db_host,
             user=db_user,
@@ -2016,7 +1729,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     VALUES (%s, %s, %s)
                 """
                 
-                # Ejecutar la inserciÃƒÂ³n
+                # Ejecutar la inserción
                 await cursor.execute(
                     query,
                     (
@@ -2026,17 +1739,17 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     )
                 )
                 
-                # Confirmar la transacciÃƒÂ³n
+                # Confirmar la transacción
                 await connection.commit()
                 
-                # Obtener el ID de la renovaciÃƒÂ³n insertada
+                # Obtener el ID de la renovación insertada
                 insertado_id = cursor.lastrowid
                 
-                logger.info(f"RenovaciÃƒÂ³n registrada exitosamente con ID: {insertado_id}")
+                logger.info(f"Renovación registrada exitosamente con ID: {insertado_id}")
                 
-                # Enviar notificaciÃƒÂ³n informativa
+                # Enviar notificación informativa
                 info_message = (
-                    f"RenovaciÃƒÂ³n registrada exitosamente en la base de datos\n"
+                    f"Renovación registrada exitosamente en la base de datos\n"
                     f"Cliente: {payload.nombre_cliente}\n"
                     f"Estado Final: {payload.estado_final_renovacion}\n"
                     f"Estado Pago: {payload.estado_pago_payvalida}\n"
@@ -2054,7 +1767,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
                     status_code=201,
                     content={
                         "status": "success",
-                        "message": "RenovaciÃƒÂ³n registrada exitosamente",
+                        "message": "Renovación registrada exitosamente",
                         "id_registro": insertado_id,
                         "cliente": payload.nombre_cliente,
                         "estado_final_renovacion": payload.estado_final_renovacion,
@@ -2077,7 +1790,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
             content={
                 "status": "error",
                 "message": "Error al conectar con la base de datos",
-                "detail": "No se pudo registrar la renovaciÃƒÂ³n"
+                "detail": "No se pudo registrar la renovación"
             }
         )
     
@@ -2102,9 +1815,9 @@ async def registrar_renovacion(payload: RenovacionPayload):
 @app.get("/logs")
 async def get_logs(limit: int = 20):
     """
-    Devuelve los ÃƒÂºltimos logs enviados (correo + Telegram).
+    Devuelve los últimos logs enviados (correo + Telegram).
     Se puede consultar por Postman o navegador.
-    Manejo seguro cuando la cachÃƒÂ© estÃƒÂ© vacÃƒÂ­a o ocurra un error.
+    Manejo seguro cuando la caché esté vacía o ocurra un error.
     """
     try:
         logs = await get_cached_logs(limit)
@@ -2112,6 +1825,6 @@ async def get_logs(limit: int = 20):
             return {"count": 0, "logs": []}
         return {"count": len(logs), "logs": logs}
     except Exception as e:
-        logger.exception("Error al obtener logs desde la cachÃƒÂ©")
-        # No lanzar excepciÃƒÂ³n para no interrumpir el servidor; devolver estructura vacÃƒÂ­a
+        logger.exception("Error al obtener logs desde la caché")
+        # No lanzar excepción para no interrumpir el servidor; devolver estructura vacía
         return {"count": 0, "logs": []}
