@@ -641,6 +641,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         
                         logger.error(f"❌ HTTP 400 Error: code={error_code}")
                         logger.error(f"   Mensaje: {error_message}")
+                        await error_notify(method_name, client_id, f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message}")
                         
                         # ===== SUB-CASO: PERFIL INCOMPLETO =====
                         if error_code == "IncompleteProfile":
@@ -655,7 +656,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                             logger.error(f"   Campos: {', '.join(missing_info['required_labels'])}")
                             
                             # Notificar
-                            error_msg = f"Perfil incompleto. Faltan {missing_info['required_count']} campos obligatorios: {', '.join(missing_info['required_labels'])}"
+                            error_msg = f"Perfil incompleto. Faltan {missing_info['required_count']} campos obligatorios: {', '.join(missing_info['required_labels'])} error_completo: {error_response}"
                             await error_notify(method_name, client_id, error_msg)
                             
                             # NO reintentar - es un problema del cliente
@@ -687,7 +688,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         logger.error(f"   Respuesta: {response.text[:200]}")
                         
                         await error_notify(method_name, client_id, 
-                            f"Error HTTP {status_code} en API Kuenta")
+                            f"Error HTTP {status_code} en API Kuenta, error completo: {response.text[:500]}, {error_message}")
                         
                         # Reintentar
                         if attempt < max_retries - 1:
@@ -698,7 +699,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 
                 except httpx.TimeoutException as e:
                     logger.error(f"Intento {attempt+1}: ⏱️ TIMEOUT ({str(e)})")
-                    await error_notify(method_name, client_id, "Timeout en API Kuenta")
+                    await error_notify(method_name, client_id, "Timeout en API Kuenta, excepción: " + str(e))
                     
                     if attempt < max_retries - 1:
                         wait_time = 2 ** attempt
@@ -708,6 +709,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 except httpx.HTTPStatusError as e:
                     logger.error(f"Intento {attempt+1}: Error HTTP {e.response.status_code}")
                     logger.error(f"   {e.response.text[:200]}")
+                    await error_notify(method_name, client_id,f"intento {attempt+1}: Error HTTP en API Kuenta: " + e.response.text[:200]+"excepción: " + str(e))
                     
                     if attempt < max_retries - 1:
                         wait_time = 2 ** attempt
@@ -726,7 +728,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
             if response_credit_id is None:
                 logger.error(f"FALLO: No se creó payable tras {max_retries} intentos")
                 await error_notify(method_name, client_id, 
-                    f"No se pudo crear payable tras {max_retries} intentos")
+                    f"No se pudo crear payable tras {max_retries} intentos, error_completo: {last_error_response}")
                 
                 # Retornar 502 SOLO si fue error de conexión
                 raise HTTPException(
@@ -840,7 +842,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 logger.error(f"Error HTTP en GET simulación: {e.response.status_code}")
                 logger.error(f"Respuesta: {e.response.text}")
                 await error_notify(method_name, client_id, 
-                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}")
+                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}, excepción: " + str(e))
                 raise HTTPException(
                     status_code=e.response.status_code,
                     detail=f"Error en API externa: {e.response.text}"
@@ -853,6 +855,15 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 raise HTTPException(
                     status_code=502,
                     detail="Error de conexión al consultar simulación"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error general en GET simulación: {str(e)}", exc_info=True)
+                await error_notify(method_name, client_id, 
+                    f"Error general GET simulación: {str(e)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Error interno al consultar simulación"
                 )
                 
     except HTTPException:
@@ -1039,17 +1050,6 @@ async def calcular_financiamiento(payload: dict):
         
         logger.info(f"plazo_valor procesado: {plazo_valor} \n")
         logger.info (f"numero de semestre procesado: {numero_semestre} \n")
-
-        # Definir MENSAJES_USUARIO antes del try para que sea accesible en los bloques except
-        MENSAJES_USUARIO = {
-            "valor_invalido": "El monto ingresado no es válido. Por favor ingresa un valor numerico, por ejemplo: 2500000 o $2.500.000",
-            "linea_no_existe": "Lo sentimos, el producto financiero seleccionado no está disponible en este momento. Por favor intenta nuevamente más tarde.",
-            "semestre_invalido": "El semestre ingresado no es valido. Por favor selecciona una opcion entre 'primer semestre' y 'décimo semestre'.",
-            "plazo_invalido": "El plazo seleccionado no es valido. Por favor escoge entre 1 y 6 meses.",
-            "error_conexion": "En este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
-            "error_calculo": "Hubo un problema al calcular tu financiamiento. Por favor verifica los valores ingresados e intenta nuevamente.",
-            "datos_faltantes": "Por favor completa todos los campos requeridos para calcular tu financiamiento."
-        }
 
         try:
             raw_principal = str(payload.get("principal", "0"))
