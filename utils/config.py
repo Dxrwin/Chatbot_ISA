@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     ORG_ID: Optional[str] = Field(None, env="ORG_ID")
     PAYABLE_URL: Optional[str] = Field(None, env="PAYABLE_URL")
     GET_PAYABLE_URL: Optional[str] = Field(None, env="GET_PAYABLE_URL")
+    ASSISTANCE_URL: Optional[str] = Field(None, env="ASSISTANCE_URL")
 
     # --- Payloads de Autenticación (JSON parseadas) ---
     AUTH_PAYLOAD_PROD: Dict[str, Any] = Field(default_factory=dict, env="AUTH_PAYLOAD_PROD")

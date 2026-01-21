@@ -6,6 +6,7 @@ from models.models import WebhookPayload
 from utils.database import insertar_flujo_correo_post_agente
 from utils.email_service import enviar_correo_renovacion, enviar_correo_webinar
 from utils.notify_error import info_notify, error_notify
+from utils.database import insertar_log, consultar_logs_filtrados
 from utils.config import settings
 
 # Cache liviano en memoria para evitar reintentos inmediatos de envios webinar
@@ -473,6 +474,13 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
         else:
             destinatario = variables_entrada.EMAIL
             logging.info(f"Correo cliente vacio, usando correo guardado por defecto: {destinatario}")
+            await insertar_log(
+                method_name="procesar_webhook_webinar",
+                client_id=variables_entrada.Nombre,
+                error_message=f"Correo cliente vacio, usando correo guardado por defecto: {destinatario}",
+                http_code=200,
+                tipo="info"
+            )
     else:
         # Si desicion_correo no se proporciona, intentar correo_cliente; si no, usar guardado
         correo_cliente = getattr(variables_extraidas, "correo_cliente", None)
@@ -489,6 +497,13 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
             error_message=f"No se pudo enviar correo por falta de destinatario.",
+        )
+        await insertar_log(
+            method_name="procesar_webhook_webinar",
+            client_id=variables_entrada.Nombre,
+            error_message=f"No se pudo enviar correo por falta de destinatario.",
+            http_code=400,
+            tipo="error"
         )
         return {
             "status": "warning",
@@ -611,6 +626,13 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
                     client_id=variables_entrada.Nombre,
                     error_message=f"Correo webinar enviado pero error al registrar flujo en BD: {e}",
                 )
+                await insertar_log(
+                    method_name="procesar_webhook_webinar",
+                    client_id=variables_entrada.Nombre,
+                    error_message=f"Correo webinar enviado pero error al registrar flujo en BD: {e}",
+                    http_code=500,
+                    tipo="error"
+                )
         else:
             logging.warning(f"No se registró flujo de webinar: número telefónico faltante para {variables_entrada.Nombre}")
         
@@ -629,6 +651,14 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
             method_name="procesar_webhook_webinar",
             client_id=variables_entrada.Nombre,
             error_message=f"Excepción en servicio de correo de webinar: {e}",
+        )
+        #insertar en la base de datos el error
+        await insertar_log(
+            method_name="procesar_webhook_webinar",
+            client_id=variables_entrada.Nombre,
+            error_message=f"Excepción en servicio de correo de webinar: {e}",
+            http_code=500,
+            tipo="error"
         )
         return {
             "status": "error",

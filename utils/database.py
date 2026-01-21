@@ -414,3 +414,348 @@ async def consultar_creditos_filtro(
     finally:
         if 'connection' in locals() and connection:
             connection.close()
+            
+
+# insertar logs de errores en tabla logs_errores
+# AGREGAR AL FINAL DEL ARCHIVO
+
+async def insertar_log(
+    method_name: str,
+    client_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+    http_code: Optional[int] = None,
+    tipo: str = "error",
+    nombre_archivo: Optional[str] = None,
+    numero_linea: Optional[int] = None,
+    traceback_str: Optional[str] = None,
+    respuesta_api: Optional[str] = None,
+    payload_enviado: Optional[str] = None
+) -> bool:
+    """
+    Inserta un log en la tabla 'logs' de la base de datos.
+    
+    Args:
+        method_name: Nombre del método/función donde ocurrió el evento (REQUERIDO)
+        client_id: ID del cliente afectado (opcional)
+        error_message: Mensaje descriptivo del error o evento (opcional)
+        http_code: Código HTTP si aplica (ej: 500, 401, 409) (opcional)
+        tipo: "error" o "info" (default: "error")
+        nombre_archivo: Nombre del archivo donde ocurrió (opcional)
+        numero_linea: Número de línea donde ocurrió (opcional)
+        traceback_str: Stack trace completo del error (opcional)
+        respuesta_api: Respuesta de API que causó el error (opcional)
+        payload_enviado: Payload que se envió (opcional)
+        
+    Returns:
+        True si se insertó exitosamente, False si falló
+        
+    Ejemplo:
+        await insertar_log(
+            method_name="create_payable",
+            client_id="cliente_123",
+            error_message="Error 500 en API Kuenta",
+            http_code=500,
+            tipo="error",
+            nombre_archivo="logica.py",
+            numero_linea=452
+        )
+    """
+    try:
+        connection = await aiomysql.connect(
+            host=db_config["host"],
+            user=db_config["user"],
+            password=db_config["password"],
+            db=db_config["database"]
+        )
+        
+        try:
+            async with connection.cursor() as cursor:
+                query = """
+                    INSERT INTO logs (
+                        method_name,
+                        client_id,
+                        error_message,
+                        http_code,
+                        tipo,
+                        nombre_archivo,
+                        numero_linea,
+                        traceback,
+                        respuesta_api,
+                        payload_enviado,
+                        timestamp
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    )
+                """
+                
+                valores = (
+                    method_name,
+                    str(client_id)[:255] if client_id else None,
+                    error_message,
+                    http_code,
+                    tipo,
+                    nombre_archivo,
+                    numero_linea,
+                    traceback_str,
+                    respuesta_api,
+                    payload_enviado
+                )
+                
+                await cursor.execute(query, valores)
+                await connection.commit()
+                
+                logger.info(f"Log insertado: {method_name} | {tipo}")
+                return True
+                
+        finally:
+            connection.close()
+            
+    except aiomysql.Error as db_error:
+        logger.error(f"Error al insertar log: {str(db_error)}")
+        return False
+    except Exception as e:
+        logger.error(f"Error general en insertar_log: {str(e)}")
+        return False
+    
+
+# consumir los logs de errores
+# REEMPLAZAR LA FUNCIÓN consultar_logs_filtrados
+
+async def consultar_logs_filtrados(
+    fecha: Optional[str] = None,
+    fecha_inicio: Optional[str] = None,
+    fecha_fin: Optional[str] = None,
+    log_id: Optional[int] = None,
+    metodo: Optional[str] = None,
+    client_id: Optional[str] = None,
+    codigo_http: Optional[int] = None,
+    tipo: Optional[str] = None,
+    limite: int = 100,
+    offset: int = 0
+) -> dict[str, any]:
+    """
+    Consulta logs con múltiples filtros opcionales.
+    
+    Args:
+        fecha: Fecha exacta en formato "D-M-Y" (ej: "12-02-2025")
+        fecha_inicio: Inicio de rango en formato "D-M-Y" (ej: "01-01-2025")
+        fecha_fin: Fin de rango en formato "D-M-Y" (ej: "31-12-2025")
+        log_id: ID específico del log
+        metodo: Nombre del método/función que generó el log
+        client_id: ID del cliente
+        codigo_http: Código HTTP del error
+        tipo: "error" o "info"
+        limite: Cantidad máxima de registros (default 100, máximo 1000)
+        offset: Desplazamiento para paginación
+        
+    Returns:
+        Diccionario con total, límite, offset y registros
+    """
+    try:
+        connection = await aiomysql.connect(
+            host=db_config["host"],
+            user=db_config["user"],
+            password=db_config["password"],
+            db=db_config["database"]
+        )
+        
+        try:
+            async with connection.cursor(aiomysql.DictCursor) as cursor:
+                # Construir consulta dinámica
+                query = "SELECT * FROM logs WHERE 1=1"
+                params = []
+                
+                # Filtro por ID específico
+                if log_id:
+                    query += " AND id = %s"
+                    params.append(log_id)
+                
+                # Función auxiliar para convertir formato D-M-Y a Y-M-D
+                def convertir_fecha_dmy_a_ymd(fecha_dmy: str) -> str:
+                    """Convierte formato D-M-Y a Y-M-D para SQL"""
+                    try:
+                        partes = fecha_dmy.split("-")
+                        if len(partes) != 3:
+                            raise ValueError("Formato inválido")
+                        dia, mes, año = partes
+                        # Validar que sean números válidos
+                        int(dia)
+                        int(mes)
+                        int(año)
+                        return f"{año}-{mes}-{dia}"
+                    except Exception as e:
+                        logger.error(f"Error al convertir fecha {fecha_dmy}: {e}")
+                        raise ValueError(f"Formato de fecha inválido. Use D-M-Y (ej: 12-02-2025)")
+                
+                # Filtro por fecha exacta
+                if fecha:
+                    try:
+                        fecha_ymd = convertir_fecha_dmy_a_ymd(fecha)
+                        query += " AND DATE(timestamp) = %s"
+                        params.append(fecha_ymd)
+                    except ValueError as e:
+                        logger.error(f"Error en fecha: {e}")
+                        return {
+                            "total": 0,
+                            "limite": limite,
+                            "offset": offset,
+                            "registros": [],
+                            "error": str(e)
+                        }
+                
+                # Filtro por rango de fechas
+                if fecha_inicio and fecha_fin:
+                    try:
+                        fecha_inicio_ymd = convertir_fecha_dmy_a_ymd(fecha_inicio)
+                        fecha_fin_ymd = convertir_fecha_dmy_a_ymd(fecha_fin)
+                        query += " AND DATE(timestamp) BETWEEN %s AND %s"
+                        params.extend([fecha_inicio_ymd, fecha_fin_ymd])
+                    except ValueError as e:
+                        logger.error(f"Error en rango de fechas: {e}")
+                        return {
+                            "total": 0,
+                            "limite": limite,
+                            "offset": offset,
+                            "registros": [],
+                            "error": str(e)
+                        }
+                elif fecha_inicio:
+                    try:
+                        fecha_inicio_ymd = convertir_fecha_dmy_a_ymd(fecha_inicio)
+                        query += " AND DATE(timestamp) >= %s"
+                        params.append(fecha_inicio_ymd)
+                    except ValueError as e:
+                        logger.error(f"Error en fecha_inicio: {e}")
+                        return {
+                            "total": 0,
+                            "limite": limite,
+                            "offset": offset,
+                            "registros": [],
+                            "error": str(e)
+                        }
+                elif fecha_fin:
+                    try:
+                        fecha_fin_ymd = convertir_fecha_dmy_a_ymd(fecha_fin)
+                        query += " AND DATE(timestamp) <= %s"
+                        params.append(fecha_fin_ymd)
+                    except ValueError as e:
+                        logger.error(f"Error en fecha_fin: {e}")
+                        return {
+                            "total": 0,
+                            "limite": limite,
+                            "offset": offset,
+                            "registros": [],
+                            "error": str(e)
+                        }
+                
+                # Filtro por método
+                if metodo:
+                    query += " AND method_name LIKE %s"
+                    params.append(f"%{metodo}%")
+                
+                # Filtro por client_id
+                if client_id:
+                    query += " AND client_id LIKE %s"
+                    params.append(f"%{client_id}%")
+                
+                # Filtro por código HTTP
+                if codigo_http:
+                    query += " AND http_code = %s"
+                    params.append(codigo_http)
+                
+                # Filtro por tipo (error o info)
+                if tipo and tipo.lower() in ["error", "info"]:
+                    query += " AND tipo = %s"
+                    params.append(tipo.lower())
+                
+                # Ordenamiento y paginación
+                query += " ORDER BY timestamp DESC LIMIT %s OFFSET %s"
+                params.extend([limite, offset])
+                
+                logger.info(f"Ejecutando consulta de logs")
+                
+                await cursor.execute(query, params)
+                registros = await cursor.fetchall()
+                
+                # Obtener total sin LIMIT
+                query_count = "SELECT COUNT(*) as total FROM logs WHERE 1=1"
+                params_count = []
+                
+                if log_id:
+                    query_count += " AND id = %s"
+                    params_count.append(log_id)
+                if fecha:
+                    try:
+                        fecha_ymd = convertir_fecha_dmy_a_ymd(fecha)
+                        query_count += " AND DATE(timestamp) = %s"
+                        params_count.append(fecha_ymd)
+                    except ValueError:
+                        pass
+                if fecha_inicio and fecha_fin:
+                    try:
+                        fecha_inicio_ymd = convertir_fecha_dmy_a_ymd(fecha_inicio)
+                        fecha_fin_ymd = convertir_fecha_dmy_a_ymd(fecha_fin)
+                        query_count += " AND DATE(timestamp) BETWEEN %s AND %s"
+                        params_count.extend([fecha_inicio_ymd, fecha_fin_ymd])
+                    except ValueError:
+                        pass
+                elif fecha_inicio:
+                    try:
+                        fecha_inicio_ymd = convertir_fecha_dmy_a_ymd(fecha_inicio)
+                        query_count += " AND DATE(timestamp) >= %s"
+                        params_count.append(fecha_inicio_ymd)
+                    except ValueError:
+                        pass
+                elif fecha_fin:
+                    try:
+                        fecha_fin_ymd = convertir_fecha_dmy_a_ymd(fecha_fin)
+                        query_count += " AND DATE(timestamp) <= %s"
+                        params_count.append(fecha_fin_ymd)
+                    except ValueError:
+                        pass
+                if metodo:
+                    query_count += " AND method_name LIKE %s"
+                    params_count.append(f"%{metodo}%")
+                if client_id:
+                    query_count += " AND client_id LIKE %s"
+                    params_count.append(f"%{client_id}%")
+                if codigo_http:
+                    query_count += " AND http_code = %s"
+                    params_count.append(codigo_http)
+                if tipo and tipo.lower() in ["error", "info"]:
+                    query_count += " AND tipo = %s"
+                    params_count.append(tipo.lower())
+                
+                await cursor.execute(query_count, params_count)
+                total_result = await cursor.fetchone()
+                total = total_result['total'] if total_result else 0
+                
+                return {
+                    "total": total,
+                    "limite": limite,
+                    "offset": offset,
+                    "registros": registros or []
+                }
+        
+        finally:
+            connection.close()
+    
+    except aiomysql.Error as db_error:
+        logger.error(f"Error al consultar logs: {str(db_error)}")
+        return {
+            "total": 0,
+            "limite": limite,
+            "offset": offset,
+            "registros": [],
+            "error": str(db_error)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error general en consultar_logs_filtrados: {str(e)}")
+        return {
+            "total": 0,
+            "limite": limite,
+            "offset": offset,
+            "registros": [],
+            "error": str(e)
+        }
