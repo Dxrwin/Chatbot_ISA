@@ -1,6 +1,6 @@
 from typing import Optional, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class InputVariables(BaseModel):
@@ -82,3 +82,49 @@ class WebhookPayload(BaseModel):
 
     # Permite cualquier otro campo en el nivel superior del payload y alias/camelCase
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_extracted_variables(cls, data: Any) -> Any:
+        """
+        Normaliza extracted_variables si viene como lista vacía o None.
+        Convierte listas vacías a diccionarios vacíos.
+        """
+        if isinstance(data, dict):
+            # Intenta ambos nombres: alias y nombre real
+            extracted = data.get("extractedVariables") or data.get("extracted_variables")
+            
+            # Si es una lista (incluso vacía), convertir a diccionario vacío
+            if isinstance(extracted, list):
+                data["extracted_variables"] = {}
+                if "extractedVariables" in data:
+                    data["extractedVariables"] = {}
+            
+            # Si es None, usa diccionario vacío
+            elif extracted is None:
+                data["extracted_variables"] = {}
+                if "extractedVariables" in data:
+                    data["extractedVariables"] = {}
+        
+        return data
+
+
+class ServicioExternoSchema(BaseModel):
+    """
+    Schema base para config de servicios externos.
+    """
+
+    id: Optional[int] = None
+    nombre_servicio: str
+    codigo: str
+    url: str
+    metodo: str
+    timeout_ms: int = 10000
+    reintentos: int = 0
+    activo: int = 1
+    header: Optional[dict[str, Any]] = None
+    body: Optional[dict[str, Any]] = None
+    creado_en: Optional[str] = None
+    actualizado_en: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")

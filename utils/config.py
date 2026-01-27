@@ -34,6 +34,7 @@ class Settings(BaseSettings):
         
 
     # --- Variables de Autenticación y API ---
+    # DEBEN VENIR DE LA BASE DE DATOS, ESTO ES SOLO UN RESPALDO
     AUTH_URL: Optional[str] = Field(None, env="AUTH_URL")
     API_URL: Optional[str] = Field(None, env="API_URL")
     ORG_ID: Optional[str] = Field(None, env="ORG_ID")

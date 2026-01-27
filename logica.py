@@ -5,10 +5,16 @@ from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
 from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar, procesar_llamada_renovacion_Y_refinanciamiento
 from utils.auth import obtener_token
+from utils.external_client import ExternalClient
 from fastapi.encoders import jsonable_encoder
 from utils.export_service import generar_excel_memoria
 from utils.database import insertar_registro_completo, consultar_creditos_filtro
 from utils.database import insertar_log, consultar_logs_filtrados
+from utils.servicios_externos_service import (
+    crear_servicio_externo,
+    actualizar_servicio_externo,
+    obtener_servicio_externo_por_codigo,
+)
 from models.models import WebhookPayload
 import traceback
 import httpx
@@ -100,6 +106,29 @@ class ConsultaLogsRequest(BaseModel):
                 "offset": 0
             }
         }
+
+
+class ServicioExternoCreateRequest(BaseModel):
+    nombre_servicio: str
+    codigo: str
+    url: str
+    metodo: str
+    timeout_ms: int = 10000
+    reintentos: int = 0
+    activo: int = 1
+    header: Optional[Dict[str, Any]] = None
+    body: Optional[Dict[str, Any]] = None
+
+
+class ServicioExternoUpdateRequest(BaseModel):
+    nombre_servicio: Optional[str] = None
+    url: Optional[str] = None
+    metodo: Optional[str] = None
+    timeout_ms: Optional[int] = None
+    reintentos: Optional[int] = None
+    activo: Optional[int] = None
+    header: Optional[Dict[str, Any]] = None
+    body: Optional[Dict[str, Any]] = None
 
 
 
@@ -372,15 +401,27 @@ async def confirmar_totp(codigo_totp: str, ConfirmarTOTPRequest: ConfirmarTOTPRe
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": ORG_ID,
-                "Authorization": f"{access_token}"
+                "Authorization": access_token
             }
 
             # Construir payload correctamente con interpolación
-            payload_totp = {"totp": codigo_totp}
+            payload_totp = {"totp": codigo_totp}  # payload para confirmacion TOTP
+            ext_client_totp = None  # cliente externo opcional para TOTP
+            try:  # intenta cargar configuracion desde BD
+                ext_client_totp = await ExternalClient.from_code("KUENTA_TOTP_APPROVE")  # codigo de servicio en BD
+            except ValueError:  # si no existe en BD
+                ext_client_totp = None  # fallback a settings
+            
+            # validacion de la URL de asistencia, SI ext_client_totp tiene URL, usa esa, sino usa ASSISTANCE_URL de settings    
+            assistance_base_url = ext_client_totp.url if ext_client_totp and ext_client_totp.url else ASSISTANCE_URL  # base desde BD o settings
+            assistance_base_url = assistance_base_url.rstrip("/") + "/"  # asegura slash final
+            assistance_url_template = f"{assistance_base_url}{{id_debtor}}/assistances/{{id_asistance}}/approve"  # plantilla con placeholders, se concatena la url base con el path dinamico
+            assistance_url = assistance_url_template.format(  # construye URL final, asignando parametros
+                id_debtor=ConfirmarTOTPRequest.id_debtor,  # parametro id_debtor
+                id_asistance=ConfirmarTOTPRequest.id_asistance,  # parametro id_asistance
+            )  # URL final de confirmacion
 
-            assistance_url = f"{ASSISTANCE_URL}{ConfirmarTOTPRequest.id_debtor}/assistances/{ConfirmarTOTPRequest.id_asistance}/approve"
-
-            logger.info(f"Iniciando confirmación de TOTP para deudor: {ConfirmarTOTPRequest.id_debtor}")
+            logger.info(f"Iniciando confirmación de TOTP para deudor: {ConfirmarTOTPRequest.id_debtor} \n con url: {assistance_url}")
 
             # ===== REINTENTOS CON MANEJO INTELIGENTE DE ERRORES =====
 
@@ -388,27 +429,54 @@ async def confirmar_totp(codigo_totp: str, ConfirmarTOTPRequest: ConfirmarTOTPRe
                 try:
                     logger.info(f"Intento {attempt}/{MAX_RETRIES} para confirmar TOTP")
 
-                    response = await client.post(
-                        assistance_url,
-                        headers=headers,
-                        json=payload_totp
-                    )
-
-                    # Intentar parsear la respuesta como JSON
-                    try:
-                        response_data = response.json()
-                    except Exception as json_err:
-                        logger.error(f"Error al parsear JSON: {json_err}")
-                        #insertar log del error de parseo en la base de datos
-                        await insertar_log(
-                            method_name=method_name,
-                            client_id=client_id,
-                            error_message=f"Error al parsear JSON en intento {attempt}: {str(json_err)}",
-                            http_code=response.status_code,
-                            tipo="error"
-                        )
+                    response_data = {}  # contenedor de respuesta
+                    
+                    if ext_client_totp:  # usa servicio externo si existe
+                        ext_client_totp.set_headers(headers)  # se le asigna los headers para la peticion
+                        ext_client_totp.set_url(assistance_url)  # URL final de TOTP
+                        ext_client_totp.set_body(payload_totp)  # payload de TOTP
                         
-                        response_data = {}
+                        # imprimir configuracion del cliente externo para debug
+                        logger.info(f"Configuración ExternalClient TOTP para ejecutar la peticion: {ext_client_totp.__dict__}")
+                        
+                        response = await ext_client_totp.run()  # ejecuta peticion externa
+                        
+                        if not isinstance(response, dict):  # valida tipo de respuesta
+                            await error_notify(
+                                method_name,
+                                client_id,
+                                "Respuesta invalida del servicio externo TOTP"
+                            )
+                            raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
+                        
+                        status_code = response.get("status", 500)  # status HTTP simulado
+
+                        response_data = response.get("data") or {}  # data de respuesta
+                        if not isinstance(response_data, dict):  # valida data
+                            response_data = {}  # fallback a dict vacio
+                        response = type("Resp", (), {"status_code": status_code})()  # wrapper para status_code
+                    else:  # fallback a httpx directo
+                        response = await client.post(  # request httpx original
+                            assistance_url,  # URL de confirmacion
+                            headers=headers,  # headers con token
+                            json=payload_totp  # payload TOTP
+                        )
+                        status_code = response.status_code  # status HTTP real
+                        # Intentar parsear la respuesta como JSON
+                        try:
+                            response_data = response.json()  # parse JSON
+                        except Exception as json_err:
+                            logger.error(f"Error al parsear JSON: {json_err}")
+                            #insertar log del error de parseo en la base de datos
+                            await insertar_log(
+                                method_name=method_name,
+                                client_id=client_id,
+                                error_message=f"Error al parsear JSON en intento {attempt}: {str(json_err)}",
+                                http_code=status_code,
+                                tipo="error"
+                            )
+                            
+                            response_data = {}
 
                     logger.info(f"Respuesta de API (status {response.status_code}): {response_data}")
 
@@ -736,12 +804,59 @@ async def webhook_product_lines(
                 "Authorization": f"{access_token}"
             }
 
+            # Servicio externo para listar lineas (configurado en BD)
+            ext_client = None
+            try:
+                ext_client = await ExternalClient.from_code("KUENTA_LINES_LIST")
+            except ValueError:
+                ext_client = None
+
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    response = await client.get(API_URL, headers=headers)
-                    response.raise_for_status()
-                    data = response.json()
-                    logger.info(f"Respuesta recibida de API para buscar la linea: {data}")
+                    if ext_client:
+                        ext_client.set_headers(headers)
+                        if not ext_client.url:
+                            ext_client.set_url(API_URL)
+                        response = await ext_client.run()
+                        if not isinstance(response, dict):
+                            raise Exception("Respuesta invalida del servicio externo")
+                        status_code = response.get("status", 500)
+                        if not isinstance(status_code, int):
+                            raise Exception("Respuesta de servicio sin status valido")
+                        if status_code >= 400:
+                            error_traceback = traceback.format_exc()
+                            error_detail = response.get("data")
+                            logger.error(f"Error HTTP {status_code} en API externa: {error_detail}")
+                            await error_notify(
+                                method_name,
+                                parent_id_notify_error,
+                                f"Error en API externa: {error_detail} error capturado: {status_code}"
+                            )
+                            await insertar_log(
+                                method_name=method_name,
+                                client_id=parent_id_notify_error,
+                                error_message=f"Error en API externa: {error_detail} error capturado: {status_code}",
+                                http_code=status_code,
+                                tipo="error",
+                                traceback_str=error_traceback
+                            )
+                            if 500 <= status_code < 600 and attempt < MAX_RETRIES:
+                                await asyncio.sleep(RETRY_DELAY * attempt)
+                                continue
+                            return {
+                                "estado": "error",
+                                "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                                "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
+                            }
+
+                        data = response.get("data") or {}
+                        if not isinstance(data, dict):
+                            data = {}
+                    else:
+                        response = await client.get(API_URL, headers=headers)
+                        response.raise_for_status()
+                        data = response.json()
+                    #logger.info(f"Respuesta recibida de API para buscar la linea: {data}")
                     lines = data.get("data", {}).get("lines", [])
 
                     candidates = []
@@ -1068,6 +1183,14 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "Authorization": token
             }
 
+            # Servicio externo para crear payable (configurado en BD)
+            ext_client_post = None
+            try:
+                # Intentar cargar configuración de servicio externo consultando la base de datos
+                ext_client_post = await ExternalClient.from_code("KUENTA_PAYABLE_CREATE")
+            except ValueError:
+                ext_client_post = None
+
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
@@ -1078,35 +1201,62 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 try:
                     logger.info(f"Intento {attempt+1}/{max_retries}: POST a {PAYABLE_URL}")
                     
-                    response = await client.post(
-                        PAYABLE_URL,
-                        json=new_payload,
-                        headers=headers
-                    )
+                    response_data = {}
                     
-                    status_code = response.status_code
-                    logger.info(f"   Response: HTTP {status_code}")
+                    # valida las configuraciones del servicio externo que se obtuvieron de la base de datos
+                    if ext_client_post:
+                        # asigna los headers ya que las variables sensibles no se guardan en la base de datos
+                        ext_client_post.set_headers(headers)
+                        # asigna la url si no está definida en la configuración del servicio externo
+                        if not ext_client_post.url:
+                            ext_client_post.set_url(PAYABLE_URL)
+                        # asigna el payload
+                        ext_client_post.set_body(new_payload)
+                        
+                        # ejecuta el servicio externo
+                        response = await ext_client_post.run()
+                        
+                        logger.info(f"   Response completo del servicio externo: {str(response)}")
+                        
+                        if not isinstance(response, dict):
+                            raise Exception("Respuesta invalida del servicio externo")
+                        status_code = response.get("status", 500)
+                        response_data = response.get("data") or "no se accedio a data"
+                        if not isinstance(response_data, dict):
+                            response_data = {}
+                    else:
+                        response = await client.post(
+                            PAYABLE_URL,
+                            json=new_payload,
+                            headers=headers
+                        )
+                        response_data = response.json()
+                        status_code = response.status_code
+
+                    #logger.info(f"   Response Data: {str(response_data)}")
                     
                     # ===== CASO 1: ÉXITO (201) =====
-                    if status_code == 201:
-                        logger.info("Payable creado exitosamente (HTTP 201)")
-                        response_data = response.json()
+                    if status_code == 201 or status_code == 200:
+                        #logger.info("Payable creado exitosamente (HTTP 201)")
                         credit = response_data.get("data", {}).get("credit", {})
+                        
+                        #logger.info(f"Respuesta completa de Kuenta: {str(credit)}")
                         response_credit_id = credit.get("ID")
-                        logger.info(f"   ID Crédito: {response_credit_id}")
+                        #logger.info(f"ID Crédito: {response_credit_id}")
+                        logger.info(f"Response: HTTP {status_code}, \n ID del credito: {response_data.get('data', {}).get('credit', {}).get('ID', 'no se pudo obtener ID')}")
                         break  # Salir del loop de reintentos
                     
-                    # ===== CASO 2: ERROR 400 - ANALIZAR TIPO =====
+                    # ===== CASO 2: ERROR 400 =====
                     elif status_code == 400:
                         error_traceback = traceback.format_exc()
-                        error_response = response.json()
+                        error_response = response_data
                         last_error_response = error_response
                         
                         error_code = error_response.get("data", {}).get("code")
                         error_message = error_response.get("data", {}).get("message", "Unknown")
                         missing_fields = error_response.get("data", {}).get("missingFields", [])
                         
-                        logger.error(f"❌ HTTP 400 Error: code={error_code}")
+                        logger.error(f"HTTP 400 Error: code={error_code}")
                         logger.error(f"   Mensaje: {error_message}")
                         await error_notify(method_name, client_id, f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message}")
                         #insertar log del error en la base de datos
@@ -1158,7 +1308,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         
                         # ===== SUB-CASO: OTRO ERROR 400 =====
                     elif status_code == 400:
-                        error_response = response.json()
+                        error_response = response_data
                         last_error_response = error_response
                         
                         error_code = error_response.get("data", {}).get("code")
@@ -1168,13 +1318,64 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         await error_notify(method_name, client_id, 
                             f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message} error completo: {last_error_response}")
                     
+                    # ===== CASO 2B: ERROR 403 (FORBIDDEN - TOKEN INVÁLIDO) =====
+                    elif status_code == 403:
+                        error_traceback = traceback.format_exc()
+                        error_response = response_data
+                        last_error_response = error_response
+                        
+                        logger.error(f"HTTP 403 Forbidden: Token inválido o expirado")
+                        logger.error(f"   Respuesta: {error_response}")
+                        await error_notify(method_name, client_id, 
+                            f"Error 403 en API Kuenta: Token inválido o sin autorización. Error completo: {error_response}")
+                        
+                        # Insertar log del error en la base de datos
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=client_id,
+                            error_message=f"Error 403 en API Kuenta: Token inválido o sin autorización. Respuesta: {error_response}",
+                            http_code=403,
+                            tipo="error",
+                            traceback_str=error_traceback
+                        )
+                        
+                        # Intentar obtener un nuevo token en el siguiente intento
+                        if attempt < max_retries - 1:
+                            logger.info(f"Obteniendo nuevo token e intentando nuevamente...")
+                            try:
+                                token = await obtener_token(client)
+                                headers["Authorization"] = token
+                                logger.info("Token renovado exitosamente")
+                            except Exception as token_error:
+                                logger.error(f"Error al renovar token: {str(token_error)}")
+                                await error_notify(method_name, client_id, 
+                                    f"Error al renovar token de autorización: {str(token_error)}")
+                            
+                            wait_time = 2 ** attempt
+                            logger.info(f"Reintentando en {wait_time}s con nuevo token...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            # Si falló en el último intento, retornar error de autorización
+                            logger.error(f"Fallo de autorización tras {max_retries} intentos")
+                            raise HTTPException(
+                                status_code=401,  # Unauthorized - para que el cliente sepa que hay problema de credenciales
+                                detail={
+                                    "error": "UnauthorizedToken",
+                                    "message": "No se pudo obtener autorización para acceder a la API",
+                                    "instruction": "Por favor contacta con soporte técnico para verificar las credenciales de la API",
+                                    "last_error": error_response
+                                }
+                            )
+                        continue
+                    
                     # ===== CASO 3: OTROS ERRORES (500, 503, etc) =====
                     else:
                         logger.error(f"HTTP {status_code}")
-                        logger.error(f"   Respuesta: {response.text[:200]}")
+                        error_text = str(response_data) if ext_client_post else response.text
+                        logger.error(f"   Respuesta: {error_text[:200]}")
                         
                         await error_notify(method_name, client_id, 
-                            f"Error HTTP {status_code} en API Kuenta, error completo: {response.text[:500]}, {error_message} error completo: {last_error_response}")
+                            f"Error HTTP {status_code} en API Kuenta, error completo: {error_text[:500]},error completo: {last_error_response}")
                         
                         # Reintentar
                         if attempt < max_retries - 1:
@@ -1185,7 +1386,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 
                 except httpx.TimeoutException as e:
                     error_traceback = traceback.format_exc()
-                    logger.error(f"Intento {attempt+1}: ⏱️ TIMEOUT ({str(e)})")
+                    logger.error(f"Intento {attempt+1}:TIMEOUT ({str(e)})")
                     await error_notify(method_name, client_id, "Timeout en API Kuenta, excepción: " + str(e))
                     # insertar log del error en la base de datos
                     await insertar_log(
@@ -1263,147 +1464,232 @@ async def create_payable(client_id: str, payload: PayableRequest):
                     }
                 )
                 
-                
-            try:
-                url_prod = f"https://api.kuenta.co/v1/payables/{response_credit_id}"
-                logger.info(f"Consultando simulación: {url_prod}")
-                
-                response_get_simulacion = await client.get(url_prod, headers=headers)
-                status_code_simulacion = response_get_simulacion.status_code
-                
-                logger.info(f"Status code de la simulación: {status_code_simulacion}")
-                            
-                            
-                if status_code_simulacion == 200 or status_code_simulacion == 201:
-                    simulacion_data = response_get_simulacion.json()
-                    credit_data = simulacion_data.get("data", {}).get("credit", {})
-
-                    installments = credit_data.get("installments", [])
-                    cuota_inicial = credit_data.get("initialFee")
-                    ID_credito = credit_data.get("ID")
-                    referencia_credito = credit_data.get("reference")
-                    id_cliente = credit_data.get("debtorID")
-
-
-                    if not installments:
-                        logger.error("No se encontraron installments en la respuesta")
-                        await error_notify(method_name, client_id, 
-                            "No se encontraron cuotas en la simulación")
-                        raise HTTPException(
-                            status_code=404,
-                            detail="No se encontraron cuotas en la simulación"
-                        )
+            #realizar consulta inmediata para obtener la simulación del crédito creado
+            logger.info(f"Payable creado con ID: {response_credit_id}, procediendo a obtener simulación...") 
+            
+            # ===== LOOP DE REINTENTOS PARA GET SIMULACIÓN (MÁXIMO 2 INTENTOS) =====
+            max_retries_simulacion = 2
+            response_get_simulacion = None
+            simulacion_data = {}
+            status_code_simulacion = None
+            last_error_simulacion = None
+            ext_client_get = None
+            
+            for attempt_get in range(max_retries_simulacion):
+                try:
+                    # Intentar cargar configuración del servicio externo
+                    try:
+                        ext_client_get = await ExternalClient.from_code("KUENTA_PAYABLE_GET")
+                        logger.info(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Configuración de servicio externo para GET simulación cargada desde BD")
                         
-                    # Tomar el primer installment
-                    first_installment = installments[0]
+                        # Agregar el ID del crédito al path
+                        ext_client_get.set_path(f"/{response_credit_id}")
+                        ext_client_get.set_headers(headers)
+                        
+                        if not ext_client_get.url:
+                            logger.error("La configuración del servicio externo para GET simulación no tiene URL definida")
+                            raise ValueError("URL no definida en configuración")
+                        
+                        # Ejecutar request con servicio externo
+                        response_get_simulacion = await ext_client_get.run()
+                        
+                        if not isinstance(response_get_simulacion, dict):
+                            raise Exception("Respuesta invalida del servicio externo")
+                        
+                        status_code_simulacion = response_get_simulacion.get("status")
+                        simulacion_data = response_get_simulacion.get("data") or "no se encontro la data de la peticion"
+                        
+                    except (ValueError, Exception) as e:
+                        # Si falla el servicio externo, usar cliente HTTP directo
+                        logger.warning(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Usando cliente HTTP directo para GET simulación")
+                        response_get_simulacion = await client.get(
+                            f"https://api.kuenta.co/v1/payables/{response_credit_id}", 
+                            headers=headers
+                        )
+                        status_code_simulacion = response_get_simulacion.status_code
+                        simulacion_data = response_get_simulacion.json()
+                    
+                    logger.info(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Status code de la simulación obtenido: {status_code_simulacion}")
+                    
+                    # Si el status es exitoso, salir del loop
+                    if status_code_simulacion in [200, 201]:
+                        logger.info(f"GET simulación exitoso en intento {attempt_get + 1}")
+                        break
+                    else:
+                        # Si no es exitoso, guardar el error para reintentar
+                        last_error_simulacion = simulacion_data
+                        logger.warning(f"GET simulación falló con status {status_code_simulacion}, reintentando...")
+                        
+                        # Esperar 5 segundos antes de reintentar (solo si no es el último intento)
+                        if attempt_get < max_retries_simulacion - 1:
+                            logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
+                            await asyncio.sleep(5)
+                        continue
                 
-                    # Extraer y redondear valores
-                    payment = round(float(first_installment.get("payment", 0)))
-                    capital = round(float(first_installment.get("capital", 0)))
-                    interest = round(float(first_installment.get("interest", 0)))
-                    costs = round(float(first_installment.get("costs", 0)))
-                    taxes = round(float(first_installment.get("taxes", 0)))
-                    # cuota inicial redondeada
-                    cuota_inicial_rounded = round(float(cuota_inicial))
-
-                    # Formatear valores para lectura humana
-                    formatted_values = {
-                        "payment_formatted": f"${payment:,}",
-                        "capital_formatted": f"${capital:,}",
-                        "interest_formatted": f"${interest:,}",
-                        "costs_formatted": f"${costs:,}",
-                        "taxes_formatted": f"${taxes:,}",
-                        "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
-                    }
-
-                    # Agregar valores originales y formateados a la respuesta
-                    response_data = {
-                        "status": "success",
-                        "ID del credito creado": response_credit_id,
-                        "valores_originales": {
-                            "payment": payment,
-                            "capital": capital,
-                            "interest": interest,
-                            "costs": costs,
-                            "taxes": taxes
-                        },
-                        "valores_formateados": formatted_values
-                    }
-
-                    logger.info("Valores extraidos y formateados exitosamente")
-                    logger.info(f"Valores formateados: {formatted_values}")
-                    # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
-                    if id_cliente and installments:
-                        cuotas_cache[id_cliente] = {
-                            "cuotas": installments,
-                            "timestamp": datetime.now(timezone.utc)
-                        }
-                                    
-                    # Notificación informativa
-                    info_message = (
-                        f"Crédito creado y registrado en kuenta correctamente\n"
-                        f"ID del crédito: {ID_credito}\n"
-                        f"Referencia del crédito: {referencia_credito}\n"
-                        f"ID del cliente: {id_cliente}\n"
-                        f"Valor total crédito: {formatted_values['payment_formatted']}"
-                    )
-                                    
-                    # envia notificacion informativa (email + telegram) con id para seguimiento
-                    await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
+                except httpx.HTTPStatusError as e:
+                    last_error_simulacion = str(e.response.text)
+                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error HTTP {e.response.status_code} en GET simulación")
+                    
+                    if attempt_get < max_retries_simulacion - 1:
+                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
+                        await asyncio.sleep(5)
+                    continue
                 
-                    return response_data
-                else:
-                    logger.error(f"Error en la consulta de simulación: {status_code_simulacion}")
-                    logger.error(f"Respuesta: {response_get_simulacion.text}")
-                    await error_notify(method_name, client_id, 
-                        f"Error al consultar simulación: {status_code_simulacion}\nRespuesta: {response_get_simulacion.text}")
-                    # insertar log del error en la base de datos
-                    await insertar_log(
-                        method_name=method_name,
-                        client_id=client_id,
-                        error_message=f"Error al consultar simulación: {status_code_simulacion}\nRespuesta: {response_get_simulacion.text}",
-                        http_code=status_code_simulacion,
-                        tipo="error"
-                    )
-                    raise HTTPException(
-                        status_code=status_code_simulacion,
-                        detail="Error al consultar la simulación"
-                    )
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Error HTTP en GET simulación: {e.response.status_code}")
-                logger.error(f"Respuesta: {e.response.text}")
+                except httpx.RequestError as e:
+                    last_error_simulacion = str(e)
+                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error de conexión en GET simulación: {str(e)}")
+                    
+                    if attempt_get < max_retries_simulacion - 1:
+                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
+                        await asyncio.sleep(5)
+                    continue
+                
+                except Exception as e:
+                    last_error_simulacion = str(e)
+                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error general en GET simulación: {str(e)}")
+                    
+                    if attempt_get < max_retries_simulacion - 1:
+                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
+                        await asyncio.sleep(5)
+                    continue
+            
+            # Validar si la consulta GET fue exitosa
+            if status_code_simulacion not in [200, 201] or not simulacion_data:
+                logger.error(f"FALLO: No se obtuvo la simulación tras {max_retries_simulacion} intentos")
                 await error_notify(method_name, client_id, 
-                    f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}, excepción: " + str(e))
-                #insertar log del error en la base de datos
+                    f"Error al consultar simulación tras {max_retries_simulacion} intentos: {last_error_simulacion}")
                 await insertar_log(
                     method_name=method_name,
                     client_id=client_id,
-                    error_message=f"Error en API Kuenta GET: {e.response.status_code}\n{e.response.text}, excepción: " + str(e),
-                    http_code=e.response.status_code,
+                    error_message=f"Error al consultar simulación tras {max_retries_simulacion} intentos: {last_error_simulacion}",
+                    http_code=status_code_simulacion or 502,
                     tipo="error"
                 )
                 raise HTTPException(
-                    status_code=e.response.status_code,
-                    detail=f"Error en API externa: {e.response.text}"
+                    status_code=status_code_simulacion or 502,
+                    detail={
+                        "error": "SimulationRetrievalFailed",
+                        "message": f"No se pudo obtener la simulación del crédito tras {max_retries_simulacion} intentos",
+                        "last_error": last_error_simulacion
+                    }
                 )
+            
+            logger.info(f"Status code de la simulación: {status_code_simulacion} \n")
+            
+            # ===== PROCESAR RESPUESTA EXITOSA DE SIMULACIÓN =====
+            try:
+                # Extraer datos de crédito de la respuesta
+                credits_data = simulacion_data.get("credit")
                 
-            except httpx.RequestError as e:
-                logger.error(f"Error conexión en GET simulación: {str(e)}")
-                await error_notify(method_name, client_id, 
-                    f"Error conexión GET: {str(e)}")
-                raise HTTPException(
-                    status_code=502,
-                    detail="Error de conexión al consultar simulación"
+                #tipo de dato puede ser lista o diccionario
+                logger.info(f"Tipo de dato de credits en la simulación: {type(credits_data)}")
+                
+                if isinstance(credits_data, list):
+                    if not credits_data:
+                        raise ValueError("Empty credits list in simulation response")
+                    credit_data = credits_data[0]
+                elif isinstance(credits_data, dict):
+                    credit_data = credits_data
+                else:
+                    logger.error(f"Formato inesperado de credits: {type(credits_data)}")
+                    raise ValueError("Unexpected credits format in simulation response")
+                
+                logger.info(f"Datos del crédito obtenidos: {credit_data} \n")
+
+                # Los installments están dentro de cada crédito
+                installments = credit_data.get("installments", [])
+                
+                logger.info(f"Installments obtenidas: {installments} \n")
+                cuota_inicial = credit_data.get("initialFee")
+                ID_credito = credit_data.get("ID")
+                logger.info(f"ID del crédito obtenido: {ID_credito} \n")
+                referencia_credito = credit_data.get("reference")
+                id_cliente = credit_data.get("debtorID")
+
+                if not installments:
+                    logger.error("No se encontraron installments en la respuesta")
+                    await error_notify(method_name, client_id, 
+                        "No se encontraron cuotas en la simulación")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No se encontraron cuotas en la simulación"
+                    )
+                    
+                # Tomar el primer installment
+                first_installment = installments[0]
+            
+                # Extraer y redondear valores
+                payment = round(float(first_installment.get("payment", 0)))
+                capital = round(float(first_installment.get("capital", 0)))
+                interest = round(float(first_installment.get("interest", 0)))
+                costs = round(float(first_installment.get("costs", 0)))
+                taxes = round(float(first_installment.get("taxes", 0)))
+                # cuota inicial redondeada
+                cuota_inicial_rounded = round(float(cuota_inicial))
+
+                # Formatear valores para lectura humana
+                formatted_values = {
+                    "payment_formatted": f"${payment:,}",
+                    "capital_formatted": f"${capital:,}",
+                    "interest_formatted": f"${interest:,}",
+                    "costs_formatted": f"${costs:,}",
+                    "taxes_formatted": f"${taxes:,}",
+                    "cuota_inicial_formatted": f"${cuota_inicial_rounded:,}"
+                }
+
+                # Agregar valores originales y formateados a la respuesta
+                response_data = {
+                    "status": "success",
+                    "ID del credito creado": response_credit_id,
+                    "valores_originales": {
+                        "payment": payment,
+                        "capital": capital,
+                        "interest": interest,
+                        "costs": costs,
+                        "taxes": taxes
+                    },
+                    "valores_formateados": formatted_values
+                }
+
+                logger.info("Valores extraidos y formateados exitosamente")
+                logger.info(f"Valores formateados: {formatted_values}")
+                # Cacheamos las cuotas simuladas para servirlas rapido en /detalle_cuota_vencida
+                if id_cliente and installments:
+                    cuotas_cache[id_cliente] = {
+                        "cuotas": installments,
+                        "timestamp": datetime.now(timezone.utc)
+                    }
+                                
+                # Notificación informativa
+                info_message = (
+                    f"Crédito creado y registrado en kuenta correctamente\n"
+                    f"ID del crédito: {ID_credito}\n"
+                    f"Referencia del crédito: {referencia_credito}\n"
+                    f"ID del cliente: {id_cliente}\n"
+                    f"Valor total crédito: {formatted_values['payment_formatted']}"
                 )
-                
-            except Exception as e:
-                logger.error(f"Error general en GET simulación: {str(e)}", exc_info=True)
+                                
+                # envia notificacion informativa (email + telegram) con id para seguimiento
+                await info_notify(method_name, client_id, info_message, entity_id=str(id_cliente))
+            
+                return response_data
+            
+            except (KeyError, AttributeError, ValueError, IndexError) as e:
+                logger.error(f"Error extrayendo datos de simulación: {str(e)}")
                 await error_notify(method_name, client_id, 
-                    f"Error general GET simulación: {str(e)}")
+                    f"Error procesando respuesta de simulación: {str(e)}")
+                await insertar_log(
+                    method_name=method_name,
+                    client_id=client_id,
+                    error_message=f"Error procesando respuesta de simulación: {str(e)}",
+                    http_code=500,
+                    tipo="error"
+                )
                 raise HTTPException(
                     status_code=500,
-                    detail="Error interno al consultar simulación"
-                )   
+                    detail=f"Error procesando datos de simulación: {str(e)}"
+                )
+    
     except ValueError as e:
         error_traceback = traceback.format_exc()
         logger.error(f"Error de conversión de datos: {str(e)}")
@@ -1686,7 +1972,28 @@ async def calcular_financiamiento(payload: dict):
                 await error_notify(method_name, linea_producto_notify_error, "No se pudo obtener token de autenticacion")
                 raise HTTPException(status_code=401, detail="No se pudo obtener token de autenticacion")
 
-            KUENTA_URL = f"https://api.kuenta.co/v1/products/{linea_producto}"
+            ext_client_product = None  # cliente externo opcional para productos
+            try:  # intenta cargar configuracion desde BD
+                ext_client_product = await ExternalClient.from_code("KUENTA_PRODUCT_GET")  # codigo de servicio en BD
+                
+                logger.info(f"Cliente externo KUENTA_PRODUCT_GET cargado desde BD: {ext_client_product.__dict__}\n")
+            except ValueError:  # si no existe en BD
+                ext_client_product = None  # fallback a settings
+            product_base_url = ext_client_product.url if ext_client_product and ext_client_product.url else API_URL  # base desde BD o settings
+            product_base_url = product_base_url or "https://api.kuenta.co/v1"  # fallback por seguridad
+            product_base_url = product_base_url.rstrip("/")  # limpia slash final
+            if "{linea_producto}" in product_base_url:  # si ya viene plantilla desde BD
+                product_url_template = product_base_url  # usa plantilla directa
+                
+            else:  # arma plantilla desde base
+                if product_base_url.endswith("product-lines"):  # si viene API_URL de product-lines
+                    product_base_url = product_base_url.rsplit("/", 1)[0]  # elimina el segmento final
+                product_url_template = f"{product_base_url}/products/{{linea_producto}}"  # construye plantilla
+                
+            KUENTA_URL = product_url_template.format(  # construye URL final con format
+                linea_producto=linea_producto,  # parametro linea_producto
+            )  # URL final de consulta
+            
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": ORG_ID,
@@ -1694,9 +2001,32 @@ async def calcular_financiamiento(payload: dict):
             }
 
             try:
-                resp = await client.get(KUENTA_URL, headers=headers)
-                resp.raise_for_status()
-                product_data = resp.json().get("data", {}).get("product", {})
+                if ext_client_product:  # usa cliente externo si existe
+                    ext_client_product.set_headers(headers)  # headers para auth
+                    ext_client_product.set_url(KUENTA_URL)  # URL final de producto
+                    resp = await ext_client_product.run()  # ejecuta request externa
+                    if not isinstance(resp, dict):  # valida tipo de respuesta
+                        raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
+                    status_code = resp.get("status", 500)  # status HTTP simulado
+                    if status_code >= 400:  # maneja error HTTP en respuesta
+                        await error_notify(  # notifica error de API
+                            method_name,  # metodo
+                            linea_producto_notify_error,  # id de contexto
+                            f"Error de respuesta de Kuenta: {resp.get('data')}"  # detalle del error
+                        )
+                        await insertar_log(  # registra error en BD
+                            method_name=method_name,  # metodo
+                            client_id=linea_producto_notify_error,  # id de contexto
+                            error_message=f"Error de respuesta de Kuenta: {resp.get('data')}",  # mensaje
+                            http_code=status_code,  # status simulado
+                            tipo="error"  # tipo log
+                        )
+                        raise HTTPException(status_code=status_code, detail=f"Error de respuesta de Kuenta: {resp.get('data')}")  # corta flujo
+                    product_data = (resp.get("data") or {}).get("product", {})  # data de producto
+                else:  # fallback a httpx directo
+                    resp = await client.get(KUENTA_URL, headers=headers)  # request GET
+                    resp.raise_for_status()  # valida status HTTP
+                    product_data = resp.json().get("data", {}).get("product", {})  # extrae data
             except httpx.RequestError as e:
                 await error_notify(method_name, linea_producto_notify_error, f"Error de conexion con la API de Kuenta: {e}")
                 # insertar log del error en la base de datos
@@ -1885,7 +2215,23 @@ async def obtener_estado(debtor_id:str,request: Request):
         if not creditid or not installmentid or not orderid:
             raise HTTPException(status_code=400, detail="Faltan parametros obligatorios: creditid, installmentid, orderid")
 
-        url = f"https://api.kuenta.co/v1/payables/{creditid}/installments/0/orders/list/{orderid}"
+        ext_client_order = None  # cliente externo opcional para estado de orden
+        try:  # intenta cargar configuracion desde BD
+            ext_client_order = await ExternalClient.from_code("KUENTA_ORDER_STATUS")  # codigo de servicio en BD
+            
+            logger.info(f"Cliente externo KUENTA_ORDER_STATUS cargado desde BD: {ext_client_order.__dict__}\n")
+        except ValueError:  # si no existe en BD
+            ext_client_order = None  # fallback a settings
+            logger.info("Cliente externo KUENTA_ORDER_STATUS no encontrado en BD, usando configuración por defecto.")
+        order_base_url = ext_client_order.url if ext_client_order and ext_client_order.url else GET_PAYABLE_URL  # base desde BD o settings
+        order_base_url = order_base_url or "https://api.kuenta.co/v1/payables"  # fallback por seguridad
+        order_base_url = order_base_url.rstrip("/") + "/"  # asegura slash final
+        order_url_template = f"{order_base_url}{{creditid}}/installments/0/orders/list/{{orderid}}"  # plantilla con placeholders
+        url = order_url_template.format(  # construye URL final
+            creditid=creditid,  # parametro creditid
+            orderid=orderid,  # parametro orderid
+        )  # URL final de consulta
+        
         intentos = 3
         intervalo_segundos = 10
         intento = 0
@@ -1911,9 +2257,22 @@ async def obtener_estado(debtor_id:str,request: Request):
                 intento += 1
                 try:
                     
-                    response = await client.get(url, headers=headers)
-                    response.raise_for_status()
-                    data = response.json()
+                    if ext_client_order:  # usa servicio externo si existe
+                        ext_client_order.set_headers(headers)  # headers para auth
+                        ext_client_order.set_url(url)  # URL final de consulta
+                        response = await ext_client_order.run()  # ejecuta request externa
+                        if not isinstance(response, dict):  # valida tipo de respuesta
+                            raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
+                        status_code = response.get("status", 500)  # status HTTP simulado
+                        data = response.get("data") or {}  # data de respuesta
+                        if not isinstance(data, dict):  # valida data
+                            data = {}  # fallback a dict vacio
+                        if status_code >= 400:  # maneja error HTTP
+                            raise Exception(f"Error HTTP {status_code}")  # fuerza captura en except
+                    else:  # fallback a httpx directo
+                        response = await client.get(url, headers=headers)  # request httpx original
+                        response.raise_for_status()  # valida status HTTP
+                        data = response.json()  # parse JSON
                     status = data.get("status")
                     logger.info(f"Intento {intento}: status del pago = {status}")
                     
@@ -2163,9 +2522,10 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
     2.  Llama al servicio `procesar_webhook` para manejar toda la logica.
     3.  Retorna una respuesta JSON.
     """
+    logger.info(f"Inicio del procesamiento del webhook, payload {payload} \n")
     try:
         
-        logging.debug(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
+        logger.info(f"Payload completo recibido: {payload.model_dump_json(indent=2)} \n")
         
         # logging.info(f"Objetivo extraido: {payload.extracted_variables.objetivo} \n")
         
@@ -2375,6 +2735,23 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                         "cliente": payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"
                     }
                 )
+        else:
+            # Objetivo no reconocido
+            logging.warning(f"Objetivo no reconocido: {objetivo}")
+            await error_notify(
+                method_name="handle_webhook",
+                client_id=objetivo,
+                error_message=f"Objetivo no reconocido en webhook: {objetivo}"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": f"Objetivo no reconocido: {objetivo}",
+                    "objetivos_validos": ["webinar", "renovacion", "renovacion y refinanciacion"],
+                    "cliente": payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"
+                }
+            )
 
     except Exception as e:
         # No devolver 500 para evitar que el proveedor del webhook reintente
@@ -2391,20 +2768,23 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                 tipo="error",
                 traceback_str=error_traceback
             )
-            await error_notify(
-                method_name="handle_webhook",
-                client_id=(payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"),
-                error_message=f"Error en el endpoint /webhook: {str(e)}",
-            )
-        except Exception:
-            logging.exception("Fallo al enviar notificacion de error")
+        except Exception as log_error:
+            logging.error(f"Error al registrar el log: {str(log_error)}")
+        
+        await error_notify(
+            method_name="handle_webhook",
+            client_id=(payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"),
+            error_message=f"Error en el endpoint /webhook: {str(e)}"
+        )
+        
         return JSONResponse(
             status_code=200,
             content={
                 "status": "error",
-                "message": "Error interno (registrado). No se reintentará desde el servidor.",
+                "message": "Error al procesar el webhook",
                 "detail": str(e),
-            },
+                "cliente": (payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown")
+            }
         )
 
 
@@ -2544,6 +2924,137 @@ async def registrar_renovacion(payload: RenovacionPayload):
             }
         )
 
+# endpoints para gestion de servicios externos ###
+
+@app.post("/servicios-externos", tags=["Servicios Externos"], summary="Crear servicio externo")
+async def crear_servicio_externo_endpoint(payload: ServicioExternoCreateRequest):
+    try:
+        service_id = await crear_servicio_externo(payload.model_dump())
+        return JSONResponse(
+            status_code=201,
+            content={
+                "status": "success",
+                "message": "Servicio externo creado",
+                "id": service_id,
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": str(exc),
+            },
+        )
+    except Exception as exc:
+        logger.error("Error creando servicio externo: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno del servidor",
+            },
+        )
+
+
+@app.put("/servicios-externos/{codigo}", tags=["Servicios Externos"], summary="Actualizar servicio externo")
+async def actualizar_servicio_externo_endpoint(codigo: str, payload: ServicioExternoUpdateRequest):
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "No se enviaron campos para actualizar",
+            },
+        )
+
+    try:
+        updated = await actualizar_servicio_externo(codigo, data)
+        if not updated:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": "Servicio no encontrado",
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "Servicio actualizado",
+            },
+        )
+    except Exception as exc:
+        logger.error("Error actualizando servicio externo: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno del servidor",
+            },
+        )
+
+
+@app.patch("/servicios-externos/{codigo}/desactivar", tags=["Servicios Externos"], summary="Desactivar servicio externo")
+async def desactivar_servicio_externo_endpoint(codigo: str):
+    try:
+        updated = await actualizar_servicio_externo(codigo, {"activo": 0})
+        if not updated:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": "Servicio no encontrado",
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "Servicio desactivado",
+            },
+        )
+    except Exception as exc:
+        logger.error("Error desactivando servicio externo: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno del servidor",
+            },
+        )
+
+
+@app.get("/servicios-externos/{codigo}", tags=["Servicios Externos"], summary="Obtener servicio externo por codigo")
+async def obtener_servicio_externo_endpoint(codigo: str):
+    try:
+        servicio = await obtener_servicio_externo_por_codigo(codigo)
+        if not servicio:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": "Servicio no encontrado",
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "data": servicio,
+            },
+        )
+    except Exception as exc:
+        logger.error("Error obteniendo servicio externo: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno del servidor",
+            },
+        )
 
 
 @app.get("/logs")
