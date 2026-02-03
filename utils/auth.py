@@ -58,7 +58,7 @@ async def obtener_token(client: Optional[httpx.AsyncClient] = None) -> str:
     if TOKEN_DATA.get("access_token") and TOKEN_DATA.get("expires_at", 0) > int(time.time()) + 30:
         return TOKEN_DATA["access_token"]
 
-    payload = settings.AUTH_PAYLOAD_PROD or {}
+    payload = settings.AUTH_PAYLOAD_PROD
     auth_url = settings.AUTH_URL
 
     try:
@@ -67,7 +67,7 @@ async def obtener_token(client: Optional[httpx.AsyncClient] = None) -> str:
         
         ext_client = await ExternalClient.from_code("AUTH_TOKEN")
         
-        logger.info(f"Usando servicio externo AUTH_TOKEN para obtener token :{ext_client.__dict__}")
+        logger.info(f"Usando servicio externo AUTH_TOKEN para obtener token")
         # Inyecta la URL de auth si no esta definida en el servicio externo.
         if not ext_client.url:
             if not auth_url:
@@ -84,7 +84,9 @@ async def obtener_token(client: Optional[httpx.AsyncClient] = None) -> str:
         logger.info(f"Respuesta de auth obtenida: {response}")
         if not isinstance(response, dict):
             raise Exception("Respuesta invalida del servicio de auth")
+        
         status = response.get("status")
+        
         if not isinstance(status, int):
             raise Exception("Respuesta de auth sin status valido")
         if status >= 400:

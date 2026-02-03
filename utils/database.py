@@ -1,4 +1,5 @@
 import aiomysql
+import json
 import logging
 from typing import Optional
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
@@ -759,3 +760,58 @@ async def consultar_logs_filtrados(
             "registros": [],
             "error": str(e)
         }
+
+
+async def consultar_servicio_externo(codigo: str) -> Optional[dict]:
+    """
+    Consulta un servicio externo de la BD por su código.
+
+    Args:
+        codigo: Código del servicio (ej: "KUENTA_PAYABLE_CREATE")
+
+    Returns:
+        Dict con datos del servicio o None si no existe
+    """
+    try:
+        connection = await aiomysql.connect(
+            host=settings.DB_HOST,
+            user=settings.DB_USER,
+            password=settings.DB_PASSWORD_RENOVACION,
+            db=settings.DB_NAME_RENOVACION
+        )
+
+        try:
+            async with connection.cursor(aiomysql.DictCursor) as cursor:
+                query = """
+                    SELECT
+                        id, nombre_servicio, codigo, url, metodo, timeout_ms, reintentos, activo, header, body,
+                        creado_en, actualizado_en
+                    FROM servicios_externos
+                    WHERE codigo = %s AND activo = 1
+                    LIMIT 1
+                """
+
+                await cursor.execute(query, (codigo,))
+                resultado = await cursor.fetchone()
+
+                if resultado:
+                    # Parsear JSON si es necesario
+                    if isinstance(resultado['header'], str):
+                        try:
+                            resultado['header'] = json.loads(resultado['header'])
+                        except (json.JSONDecodeError, TypeError):
+                            resultado['header'] = {}
+                    if isinstance(resultado['body'], str):
+                        try:
+                            resultado['body'] = json.loads(resultado['body'])
+                        except (json.JSONDecodeError, TypeError):
+                            resultado['body'] = {}
+
+                return resultado
+
+        finally:
+            connection.close()
+
+    except Exception as e:
+        logger.error(f"Error consultando servicio externo {codigo}: {str(e)}")
+        return None

@@ -1,3 +1,6 @@
+# Modelo Pydantic para el payload sin validaciones estrictas
+from pydantic import BaseModel, field_validator
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -250,9 +253,6 @@ def slugify_nombre(value: str) -> str:
     ascii_str = re.sub(r"\s+", " ", ascii_str).strip().lower()
     return ascii_str.replace(" ", "-")
 
-# Modelo Pydantic para el payload sin validaciones estrictas
-from pydantic import BaseModel, field_validator
-from typing import Optional, Dict, Any
 
 class PayableRequest(BaseModel):
     creditLineId: str 
@@ -408,11 +408,11 @@ async def confirmar_totp(codigo_totp: str, ConfirmarTOTPRequest: ConfirmarTOTPRe
             payload_totp = {"totp": codigo_totp}  # payload para confirmacion TOTP
             ext_client_totp = None  # cliente externo opcional para TOTP
             try:  # intenta cargar configuracion desde BD
-                ext_client_totp = await ExternalClient.from_code("KUENTA_TOTP_APPROVE")  # codigo de servicio en BD
+                ext_client_totp = await ExternalClient.from_code("KUENTA_TOTP_APPROVE", client_id=client_id)  # codigo de servicio en BD
             except ValueError:  # si no existe en BD
                 ext_client_totp = None  # fallback a settings
-            
-            # validacion de la URL de asistencia, SI ext_client_totp tiene URL, usa esa, sino usa ASSISTANCE_URL de settings    
+
+            # validacion de la URL de asistencia, SI ext_client_totp tiene URL, usa esa, sino usa ASSISTANCE_URL de settings
             assistance_base_url = ext_client_totp.url if ext_client_totp and ext_client_totp.url else ASSISTANCE_URL  # base desde BD o settings
             assistance_base_url = assistance_base_url.rstrip("/") + "/"  # asegura slash final
             assistance_url_template = f"{assistance_base_url}{{id_debtor}}/assistances/{{id_asistance}}/approve"  # plantilla con placeholders, se concatena la url base con el path dinamico
@@ -430,17 +430,23 @@ async def confirmar_totp(codigo_totp: str, ConfirmarTOTPRequest: ConfirmarTOTPRe
                     logger.info(f"Intento {attempt}/{MAX_RETRIES} para confirmar TOTP")
 
                     response_data = {}  # contenedor de respuesta
-                    
+
                     if ext_client_totp:  # usa servicio externo si existe
-                        ext_client_totp.set_headers(headers)  # se le asigna los headers para la peticion
-                        ext_client_totp.set_url(assistance_url)  # URL final de TOTP
-                        ext_client_totp.set_body(payload_totp)  # payload de TOTP
-                        
+                        # Inyectar variables dinámicas
+                        ext_client_totp.set_dynamic_values({
+                            "ORG_ID": ORG_ID,
+                            "access_token": access_token,
+                            "codigo_totp": codigo_totp
+                        })
+
+                        # Asignar URL final
+                        ext_client_totp.set_url(assistance_url)
+
                         # imprimir configuracion del cliente externo para debug
                         logger.info(f"Configuración ExternalClient TOTP para ejecutar la peticion: {ext_client_totp.__dict__}")
-                        
+
                         response = await ext_client_totp.run()  # ejecuta peticion externa
-                        
+
                         if not isinstance(response, dict):  # valida tipo de respuesta
                             await error_notify(
                                 method_name,
@@ -448,7 +454,7 @@ async def confirmar_totp(codigo_totp: str, ConfirmarTOTPRequest: ConfirmarTOTPRe
                                 "Respuesta invalida del servicio externo TOTP"
                             )
                             raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
-                        
+
                         status_code = response.get("status", 500)  # status HTTP simulado
 
                         response_data = response.get("data") or {}  # data de respuesta
@@ -807,16 +813,23 @@ async def webhook_product_lines(
             # Servicio externo para listar lineas (configurado en BD)
             ext_client = None
             try:
-                ext_client = await ExternalClient.from_code("KUENTA_LINES_LIST")
+                ext_client = await ExternalClient.from_code("KUENTA_LINES_LIST", client_id=parent_id)
             except ValueError:
                 ext_client = None
 
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     if ext_client:
-                        ext_client.set_headers(headers)
+                        # Inyectar variables dinámicas
+                        ext_client.set_dynamic_values({
+                            "ORG_ID": ORG_ID,
+                            "access_token": access_token
+                        })
+
+                        # Asignar URL si no está definida
                         if not ext_client.url:
                             ext_client.set_url(API_URL)
+
                         response = await ext_client.run()
                         if not isinstance(response, dict):
                             raise Exception("Respuesta invalida del servicio externo")
@@ -1187,7 +1200,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
             ext_client_post = None
             try:
                 # Intentar cargar configuración de servicio externo consultando la base de datos
-                ext_client_post = await ExternalClient.from_code("KUENTA_PAYABLE_CREATE")
+                ext_client_post = await ExternalClient.from_code("KUENTA_PAYABLE_CREATE", client_id=client_id)
             except ValueError:
                 ext_client_post = None
 
@@ -1195,29 +1208,49 @@ async def create_payable(client_id: str, payload: PayableRequest):
             max_retries = 3
             response_credit_id = None
             last_error_response = None
-            
+
             for attempt in range(max_retries):
-                
+
                 try:
                     logger.info(f"Intento {attempt+1}/{max_retries}: POST a {PAYABLE_URL}")
-                    
+
                     response_data = {}
-                    
+
                     # valida las configuraciones del servicio externo que se obtuvieron de la base de datos
                     if ext_client_post:
-                        # asigna los headers ya que las variables sensibles no se guardan en la base de datos
+                        # Inyectar variables dinámicas ANTES de ejecutar
+                        # IMPORTANTE: Estas variables se usarán tanto para headers como para body
+                        dynamic_vars = {
+                            #"ORG_ID": ORG_ID,
+                            #"access_token": token,
+                            "creditLineId": payload.creditLineId,  # Corregido: minúscula
+                            "principal": principal,
+                            "time": payload.time,
+                            "paymentFrequency": payload.paymentFrequency,
+                            "initialFee": initial_fee,
+                            "disbursementMethod": payload.disbursementMethod,
+                            "source": payload.source,
+                            "redirectUrl": payload.redirectUrl,
+                            "callbackUrl": payload.callbackUrl,
+                            "meta": payload.meta,
+                        }
+                        
+                        logger.info(f"Variables dinámicas a inyectar: {dynamic_vars}")
+                        ext_client_post.set_dynamic_values(dynamic_vars)
+                        
+                        #header dinámicos
                         ext_client_post.set_headers(headers)
-                        # asigna la url si no está definida en la configuración del servicio externo
+                        
+
+                        # Asignar URL si no está definida en la configuración
                         if not ext_client_post.url:
                             ext_client_post.set_url(PAYABLE_URL)
-                        # asigna el payload
-                        ext_client_post.set_body(new_payload)
-                        
-                        # ejecuta el servicio externo
+
+                        # Ejecutar el servicio externo
                         response = await ext_client_post.run()
-                        
+
                         logger.info(f"   Response completo del servicio externo: {str(response)}")
-                        
+
                         if not isinstance(response, dict):
                             raise Exception("Respuesta invalida del servicio externo")
                         status_code = response.get("status", 500)
@@ -1439,30 +1472,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         wait_time = 2 ** attempt
                         logger.info(f"Reintentando en {wait_time}s...")
                         await asyncio.sleep(wait_time)
-            
-            # ===== VALIDAR ÉXITO DEL POST =====
-            if response_credit_id is None:
-                logger.error(f"FALLO: No se creó payable tras {max_retries} intentos")
-                await error_notify(method_name, client_id, 
-                    f"No se pudo crear payable tras {max_retries} intentos, error_completo: {last_error_response}")
-                # insertar log del error en la base de datos
-                await insertar_log(
-                    method_name=method_name,
-                    client_id=client_id,
-                    error_message=f"No se pudo crear payable tras {max_retries} intentos, error_completo: {last_error_response}",
-                    http_code=502,
-                    tipo="error"
-                )
-                
-                # Retornar 502 SOLO si fue error de conexión
-                raise HTTPException(
-                    status_code=502,  # ← BAD GATEWAY (error del servidor)
-                    detail={
-                        "error": "ServiceUnavailable",
-                        "message": f"No se pudo crear el payable tras {max_retries} intentos",
-                        "last_error": last_error_response
-                    }
-                )
+
                 
             #realizar consulta inmediata para obtener la simulación del crédito creado
             logger.info(f"Payable creado con ID: {response_credit_id}, procediendo a obtener simulación...") 
@@ -1579,7 +1589,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== PROCESAR RESPUESTA EXITOSA DE SIMULACIÓN =====
             try:
                 # Extraer datos de crédito de la respuesta
-                credits_data = simulacion_data.get("credit")
+                
+                
+                credits_data = simulacion_data.get("data", {}).get("credit")
                 
                 #tipo de dato puede ser lista o diccionario
                 logger.info(f"Tipo de dato de credits en la simulación: {type(credits_data)}")
@@ -1599,7 +1611,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 # Los installments están dentro de cada crédito
                 installments = credit_data.get("installments", [])
                 
-                logger.info(f"Installments obtenidas: {installments} \n")
+                #logger.info(f"Installments obtenidas: {installments} \n")
                 cuota_inicial = credit_data.get("initialFee")
                 ID_credito = credit_data.get("ID")
                 logger.info(f"ID del crédito obtenido: {ID_credito} \n")
@@ -1752,6 +1764,466 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
             }
         )
+
+#confirmar credito calculado y creado en simulacion usando peticion payables
+@app.post("/confirmar-credito/{credit_id}", tags=["Payables"], summary="Confirmar crédito/payable")
+async def confirm_payable(credit_id: str):
+    """
+    Endpoint para confirmar un crédito existente en Kuenta.
+    
+    Realiza una petición PATCH a la API externa:
+    https://api.kuenta.co/v1/payables/{credit_id}/confirm
+    
+    Parámetros:
+    - credit_id: ID del crédito a confirmar (se pasa en la URL)
+    
+    Retorna:
+    - Status 200: {"estado": "success", "mensaje": "Crédito confirmado exitosamente", "data": {...}}
+    - Status 401: {"estado": "error", "mensaje": "Error de autenticación"}
+    - Status 404: {"estado": "error", "mensaje": "Crédito no encontrado"}
+    - Status 500: {"estado": "error", "mensaje": "Error interno"}
+    
+    Ejemplo de uso:
+    PATCH /payables/8c082794-796c-4987-ac28-e4918bea590d/confirm
+    """
+    method_name = "confirm_payable"
+    
+    try:
+        logger.info(f"Iniciando confirmación del payable: {credit_id}")
+        
+        # Validación del ID del crédito
+        if not credit_id or not credit_id.strip():
+            logger.warning("ID de crédito vacío o inválido")
+            await error_notify(method_name, credit_id, "ID de crédito vacío")
+            await insertar_log(
+                method_name=method_name,
+                client_id=credit_id,
+                error_message="ID de crédito vacío o inválido",
+                http_code=400,
+                tipo="error"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "estado": "error",
+                    "mensaje": "El ID del crédito no puede estar vacío",
+                    "detalles": "Por favor proporciona un ID válido de crédito"
+                }
+            )
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            
+            # Obtener token de autenticación
+            access_token = await obtener_token(client)
+            if not access_token:
+                logger.error("No se pudo obtener el token de acceso")
+                await error_notify(method_name, credit_id, "No se pudo obtener token de acceso")
+                await insertar_log(
+                    method_name=method_name,
+                    client_id=credit_id,
+                    error_message="No se pudo obtener token de acceso",
+                    http_code=401,
+                    tipo="error"
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "estado": "error",
+                        "codigo_error": "AuthenticationError",
+                        "mensaje": "No se pudo obtener el token de acceso",
+                        "detalles": "Por favor intenta nuevamente más tarde"
+                    }
+                )
+            
+            # Construir headers
+            headers = {
+                "Config-Organization-ID": ORG_ID,
+                "Organization-ID": ORG_ID,
+                "Authorization": access_token
+            }
+            
+            # Construir URL final
+            confirm_url = f"{PAYABLE_URL.rstrip('/')}/{credit_id}/confirm"
+            logger.info(f"URL de confirmación: {confirm_url}")
+            
+            # Intentar cargar servicio externo desde BD (opcional)
+            ext_client_confirm = None
+            try:
+                ext_client_confirm = await ExternalClient.from_code("KUENTA_PAYABLE_CONFIRM", client_id=credit_id)
+                logger.info(f"Servicio externo KUENTA_PAYABLE_CONFIRM cargado desde BD")
+            except ValueError:
+                ext_client_confirm = None
+                logger.info("Usando configuración por defecto para confirmación")
+
+            # ===== REINTENTOS PARA PATCH CONFIRM =====
+            max_retries = 3
+            last_error_response = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"Intento {attempt}/{max_retries}: PATCH a {confirm_url}")
+
+                    response_data = {}
+                    status_code = 500
+
+                    # Usar servicio externo si existe
+                    if ext_client_confirm:
+                        # Inyectar variables dinámicas
+                        ext_client_confirm.set_dynamic_values({
+                            "ORG_ID": ORG_ID,
+                            "access_token": access_token,
+                            "credit_id": credit_id
+                        })
+
+                        # Asignar URL si no está definida
+                        if not ext_client_confirm.url:
+                            ext_client_confirm.set_url(confirm_url)
+
+                        logger.info(f"Ejecutando servicio externo KUENTA_PAYABLE_CONFIRM")
+                        response = await ext_client_confirm.run()
+
+                        if not isinstance(response, dict):
+                            raise Exception("Respuesta inválida del servicio externo")
+
+                        status_code = response.get("status", 500)
+                        response_data = response.get("data") or {}
+
+                        if not isinstance(response_data, dict):
+                            response_data = {}
+
+                    else:
+                        # Fallback a httpx directo (método PATCH)
+                        logger.info(f"Usando cliente HTTP directo para PATCH")
+                        response = await client.patch(
+                            confirm_url,
+                            headers=headers
+                        )
+                        status_code = response.status_code
+
+                        try:
+                            response_data = response.json()
+                        except Exception as json_err:
+                            logger.warning(f"No se pudo parsear JSON: {json_err}")
+                            response_data = {"raw_response": response.text}
+                    
+                    logger.info(f"Respuesta del servidor (status {status_code}): {response_data}")
+                    
+                    # ===== CASO EXITOSO: HTTP 200 OK =====
+                    if status_code == 200:
+                        logger.info(f"✅ Payable confirmado exitosamente en intento {attempt}")
+                        
+                        # Notificación informativa
+                        info_message = (
+                            f"Crédito confirmado exitosamente en Kuenta\n"
+                            f"ID del crédito: {credit_id}\n"
+                            f"Fecha: {datetime.now(timezone.utc).isoformat()}"
+                        )
+                        await info_notify(method_name, credit_id, info_message, entity_id=credit_id)
+                        
+                        # Log de éxito
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=credit_id,
+                            error_message=f"Crédito confirmado exitosamente",
+                            http_code=200,
+                            tipo="info"
+                        )
+                        
+                        return JSONResponse(
+                            status_code=200,
+                            content={
+                                "estado": "success",
+                                "mensaje": "Crédito confirmado exitosamente",
+                                "credit_id": credit_id,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "data": response_data
+                            }
+                        )
+                    
+                    # ===== CASO 404: CRÉDITO NO ENCONTRADO =====
+                    elif status_code == 404:
+                        logger.error(f"Crédito no encontrado: {credit_id}")
+                        error_traceback = traceback.format_exc()
+                        
+                        await error_notify(
+                            method_name, 
+                            credit_id, 
+                            f"Crédito no encontrado en API: {credit_id}"
+                        )
+                        
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=credit_id,
+                            error_message=f"Crédito no encontrado: {response_data}",
+                            http_code=404,
+                            tipo="error",
+                            traceback_str=error_traceback
+                        )
+                        
+                        return JSONResponse(
+                            status_code=404,
+                            content={
+                                "estado": "error",
+                                "codigo_error": "CreditNotFound",
+                                "mensaje": "El crédito no fue encontrado en el sistema",
+                                "credit_id": credit_id,
+                                "detalles": "Verifica que el ID del crédito sea correcto"
+                            }
+                        )
+                    
+                    # ===== CASO 403: FORBIDDEN (TOKEN INVÁLIDO) =====
+                    elif status_code == 403:
+                        logger.error(f"Error 403: Acceso prohibido o token inválido")
+                        error_traceback = traceback.format_exc()
+                        last_error_response = response_data
+                        
+                        await error_notify(
+                            method_name,
+                            credit_id,
+                            f"Error 403: Token inválido o sin autorización"
+                        )
+                        
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=credit_id,
+                            error_message=f"Error 403: {response_data}",
+                            http_code=403,
+                            tipo="error",
+                            traceback_str=error_traceback
+                        )
+                        
+                        # Intentar renovar token en siguiente intento
+                        if attempt < max_retries:
+                            logger.info(f"Obteniendo nuevo token e intentando nuevamente...")
+                            try:
+                                access_token = await obtener_token(client)
+                                headers["Authorization"] = access_token
+                                logger.info("Token renovado")
+                            except Exception as token_error:
+                                logger.error(f"Error al renovar token: {token_error}")
+                            
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        
+                        return JSONResponse(
+                            status_code=401,
+                            content={
+                                "estado": "error",
+                                "codigo_error": "UnauthorizedToken",
+                                "mensaje": "No autorizado para confirmar este crédito",
+                                "detalles": "Por favor verifica las credenciales de la API"
+                            }
+                        )
+                    
+                    # ===== CASO 400: BAD REQUEST =====
+                    elif status_code == 400:
+                        logger.error(f"Error 400: Solicitud inválida")
+                        error_traceback = traceback.format_exc()
+                        last_error_response = response_data
+                        
+                        await error_notify(
+                            method_name,
+                            credit_id,
+                            f"Error 400 en API: {response_data}"
+                        )
+                        
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=credit_id,
+                            error_message=f"Error 400: {response_data}",
+                            http_code=400,
+                            tipo="error",
+                            traceback_str=error_traceback
+                        )
+                        
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "estado": "error",
+                                "codigo_error": "BadRequest",
+                                "mensaje": "Solicitud inválida",
+                                "credit_id": credit_id,
+                                "detalles": response_data.get("message", "Error en los parámetros")
+                            }
+                        )
+                    
+                    # ===== CASOS 500+: ERRORES DEL SERVIDOR =====
+                    elif status_code >= 500:
+                        logger.warning(f"Intento {attempt}: Error del servidor ({status_code})")
+                        last_error_response = response_data
+                        
+                        await error_notify(
+                            method_name,
+                            credit_id,
+                            f"Error {status_code} en API Kuenta"
+                        )
+                        
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=credit_id,
+                            error_message=f"Error {status_code}: {response_data}",
+                            http_code=status_code,
+                            tipo="error"
+                        )
+                        
+                        if attempt < max_retries:
+                            wait_time = 2 ** attempt
+                            logger.info(f"Reintentando en {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "estado": "error",
+                                "codigo_error": "ServiceUnavailable",
+                                "mensaje": "El servicio no está disponible temporalmente",
+                                "detalles": "Por favor intenta nuevamente en unos minutos"
+                            }
+                        )
+                    
+                    # ===== OTROS ERRORES HTTP =====
+                    else:
+                        logger.warning(f"Intento {attempt}: Error HTTP inesperado ({status_code})")
+                        last_error_response = response_data
+                        
+                        if attempt < max_retries:
+                            wait_time = 2 ** attempt
+                            logger.info(f"Reintentando en {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        
+                        return JSONResponse(
+                            status_code=status_code,
+                            content={
+                                "estado": "error",
+                                "codigo_error": "UnexpectedError",
+                                "mensaje": f"Error inesperado ({status_code})",
+                                "detalles": "Por favor contacta con soporte técnico"
+                            }
+                        )
+                
+                except httpx.TimeoutException:
+                    logger.warning(f"Intento {attempt}: Timeout")
+                    
+                    if attempt < max_retries:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    await error_notify(method_name, credit_id, "Timeout en API Kuenta")
+                    await insertar_log(
+                        method_name=method_name,
+                        client_id=credit_id,
+                        error_message="Timeout en confirmación de payable",
+                        http_code=504,
+                        tipo="error"
+                    )
+                    
+                    return JSONResponse(
+                        status_code=504,
+                        content={
+                            "estado": "error",
+                            "codigo_error": "Timeout",
+                            "mensaje": "La solicitud tardó demasiado en responder",
+                            "detalles": "Por favor intenta nuevamente"
+                        }
+                    )
+                
+                except httpx.RequestError as e:
+                    logger.warning(f"Intento {attempt}: Error de conexión: {e}")
+                    
+                    if attempt < max_retries:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    await error_notify(method_name, credit_id, f"Error de conexión: {str(e)}")
+                    await insertar_log(
+                        method_name=method_name,
+                        client_id=credit_id,
+                        error_message=f"Error de conexión: {str(e)}",
+                        http_code=502,
+                        tipo="error"
+                    )
+                    
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "estado": "error",
+                            "codigo_error": "ConnectionError",
+                            "mensaje": "Error de conexión con el servicio",
+                            "detalles": "Por favor intenta nuevamente"
+                        }
+                    )
+            
+            # ===== SI SE AGOTAN TODOS LOS REINTENTOS =====
+            logger.error(f"Se agotaron todos los reintentos ({max_retries})")
+            await error_notify(
+                method_name,
+                credit_id,
+                f"No se pudo confirmar el payable tras {max_retries} intentos"
+            )
+            
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "estado": "error",
+                    "codigo_error": "MaxRetriesExceeded",
+                    "mensaje": "No se pudo completar la confirmación del crédito",
+                    "detalles": f"Se agotaron los {max_retries} intentos. Por favor contacta con soporte.",
+                    "last_error": last_error_response
+                }
+            )
+    
+    except ValueError as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error de validación: {str(e)}")
+        await insertar_log(
+            method_name=method_name,
+            client_id=credit_id,
+            error_message=f"Error de validación: {str(e)}",
+            http_code=400,
+            tipo="error",
+            traceback_str=error_traceback
+        )
+        
+        return JSONResponse(
+            status_code=400,
+            content={
+                "estado": "error",
+                "codigo_error": "ValidationError",
+                "mensaje": "Error de validación",
+                "detalles": str(e)
+            }
+        )
+    
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error general en confirm_payable: {str(e)}", exc_info=True)
+        await insertar_log(
+            method_name=method_name,
+            client_id=credit_id,
+            error_message=f"Error general: {str(e)}",
+            http_code=500,
+            tipo="error",
+            traceback_str=error_traceback
+        )
+        await error_notify(method_name, credit_id, f"Error general: {str(e)}")
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "estado": "error",
+                "codigo_error": "InternalError",
+                "mensaje": "Error interno del servidor",
+                "detalles": "Nuestro equipo técnico ha sido notificado"
+            }
+        )
+
+
 
 
 #manejar diferentes casos de entrada para el valor "principal" y extraer solo los números
@@ -1956,14 +2428,6 @@ async def calcular_financiamiento(payload: dict):
         valor_cuota_inicial = principal * porcentaje_cuota
         dias_totales = plazo_escogido * payment_frequency
         
-        # --- VALIDAR RANGO DE DIAS (API requiere entre 30 y 150 dias) ---
-        #if dias_totales < 30 or dias_totales > 150:
-            #logger.error(f"Días fuera de rango: {dias_totales}. Debe estar entre 30 y 150.")
-            #await error_notify(method_name, linea_producto_notify_error, f"Días fuera de rango: {dias_totales}")
-            #raise HTTPException(
-                #status_code=400,
-                #detail=f"El plazo debe resultar en un número de días entre 30 y 150. Plazo actual: {dias_totales} días"
-            #)
 
         # --- CONSULTA A API KUENTA ---
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1974,8 +2438,8 @@ async def calcular_financiamiento(payload: dict):
 
             ext_client_product = None  # cliente externo opcional para productos
             try:  # intenta cargar configuracion desde BD
-                ext_client_product = await ExternalClient.from_code("KUENTA_PRODUCT_GET")  # codigo de servicio en BD
-                
+                ext_client_product = await ExternalClient.from_code("KUENTA_PRODUCT_GET", client_id=linea_producto)  # codigo de servicio en BD
+
                 logger.info(f"Cliente externo KUENTA_PRODUCT_GET cargado desde BD: {ext_client_product.__dict__}\n")
             except ValueError:  # si no existe en BD
                 ext_client_product = None  # fallback a settings
@@ -1984,86 +2448,79 @@ async def calcular_financiamiento(payload: dict):
             product_base_url = product_base_url.rstrip("/")  # limpia slash final
             if "{linea_producto}" in product_base_url:  # si ya viene plantilla desde BD
                 product_url_template = product_base_url  # usa plantilla directa
-                
+
             else:  # arma plantilla desde base
                 if product_base_url.endswith("product-lines"):  # si viene API_URL de product-lines
                     product_base_url = product_base_url.rsplit("/", 1)[0]  # elimina el segmento final
                 product_url_template = f"{product_base_url}/products/{{linea_producto}}"  # construye plantilla
-                
+
             KUENTA_URL = product_url_template.format(  # construye URL final con format
                 linea_producto=linea_producto,  # parametro linea_producto
             )  # URL final de consulta
-            
+
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": ORG_ID,
                 "Authorization": token
             }
 
-            try:
-                if ext_client_product:  # usa cliente externo si existe
-                    ext_client_product.set_headers(headers)  # headers para auth
-                    ext_client_product.set_url(KUENTA_URL)  # URL final de producto
-                    resp = await ext_client_product.run()  # ejecuta request externa
-                    if not isinstance(resp, dict):  # valida tipo de respuesta
-                        raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
-                    status_code = resp.get("status", 500)  # status HTTP simulado
-                    if status_code >= 400:  # maneja error HTTP en respuesta
-                        await error_notify(  # notifica error de API
-                            method_name,  # metodo
-                            linea_producto_notify_error,  # id de contexto
-                            f"Error de respuesta de Kuenta: {resp.get('data')}"  # detalle del error
-                        )
-                        await insertar_log(  # registra error en BD
-                            method_name=method_name,  # metodo
-                            client_id=linea_producto_notify_error,  # id de contexto
-                            error_message=f"Error de respuesta de Kuenta: {resp.get('data')}",  # mensaje
-                            http_code=status_code,  # status simulado
-                            tipo="error"  # tipo log
-                        )
-                        raise HTTPException(status_code=status_code, detail=f"Error de respuesta de Kuenta: {resp.get('data')}")  # corta flujo
-                    product_data = (resp.get("data") or {}).get("product", {})  # data de producto
-                else:  # fallback a httpx directo
-                    resp = await client.get(KUENTA_URL, headers=headers)  # request GET
-                    resp.raise_for_status()  # valida status HTTP
-                    product_data = resp.json().get("data", {}).get("product", {})  # extrae data
-            except httpx.RequestError as e:
-                await error_notify(method_name, linea_producto_notify_error, f"Error de conexion con la API de Kuenta: {e}")
-                # insertar log del error en la base de datos
-                await insertar_log(
-                    method_name=method_name,
-                    client_id=linea_producto_notify_error,
-                    error_message=f"Error de conexion con la API de Kuenta: {e}",
-                    http_code=502,
-                    tipo="error"
-                )
-                raise HTTPException(status_code=502, detail=f"Error de conexion con la API de Kuenta: {e}")
-            except httpx.HTTPStatusError as e:
-                await error_notify(method_name, linea_producto_notify_error, f"Error de respuesta de Kuenta: {e.response.text}")
-                # insertar log del error en la base de datos
-                await insertar_log(
-                    method_name=method_name,
-                    client_id=linea_producto_notify_error,
-                    error_message=f"Error de respuesta de Kuenta: {e.response.text}",
-                    http_code=e.response.status_code,
-                    tipo="error"
-                )
-                raise HTTPException(status_code=e.response.status_code, detail=f"Error de respuesta de Kuenta: {e.response.text}")
+            
+            if ext_client_product:  # usa cliente externo si existe
+                    # Inyectar variables dinámicas
+                    ext_client_product.set_dynamic_values({
+                        "ORG_ID": ORG_ID,
+                        "access_token": token,
+                        "linea_producto": linea_producto
+                    })
+                    
+                    #headers dinamicos
+                    ext_client_product.set_headers(headers)
 
-        # --- VALIDAR RESPUESTA ---
-        if product_data.get("ID") != linea_producto:
-            await error_notify(method_name, linea_producto_notify_error, "El ID del producto no coincide")
-            #insertar log del error en la base de datos
-            await insertar_log(
-                method_name=method_name,
-                client_id=linea_producto_notify_error,
-                error_message="El ID del producto no coincide",
-                http_code=404,
-                tipo="error"
-            )
-            raise HTTPException(status_code=404, detail="El ID del producto no coincide")
-        
-        logger.info(f"ID del producto obtenido: {product_data.get('ID')}\n")
+                    # Asignar URL final
+                    ext_client_product.set_url(KUENTA_URL)
+
+                    resp = await ext_client_product.run()  # ejecuta request externa
+                    
+                    # 1. Validar estructura básica del JSON
+                    if not resp.get("data"):
+                        logger.error(f"[VALIDACIÓN] Campo 'data' faltante en respuesta de Kuenta para línea: {linea_producto}")
+                        await error_notify(method_name, linea_producto_notify_error, f"Campo 'data' faltante en respuesta de producto: {linea_producto}")
+                        raise HTTPException(status_code=502, detail="Respuesta de Kuenta incompleta: falta campo 'data'")
+
+                    # data de producto
+                    data = resp.get("data")
+                    
+                    logger.info(f"Respuesta completa de Kuenta data: {data} \n")
+                    
+                    product_data = data.get("product")
+                    
+                    logger.info(f"Datos del producto obtenido: {product_data} \n")
+                    
+                    if not product_data:
+                        logger.error(f"[VALIDACIÓN] Campo 'product' faltante en 'data' para línea: {linea_producto}")
+                        await error_notify(method_name, linea_producto_notify_error, f"Campo 'product' faltante en respuesta de producto: {linea_producto}")
+                        raise HTTPException(status_code=502, detail="Respuesta de Kuenta incompleta: falta campo 'product'")
+                    
+                    if not isinstance(product_data, dict):
+                        logger.error(f"[VALIDACIÓN] 'product' no es un diccionario válido para línea: {linea_producto}")
+                        await error_notify(method_name, linea_producto_notify_error, f"'product' no es diccionario en respuesta: {linea_producto}")
+                        raise HTTPException(status_code=502, detail="'product' debe ser un objeto diccionario")
+                    
+                    # 2. Validar ID del producto (ya existente, pero con log mejorado)
+                    product_id = product_data.get("ID")
+                    if not product_id:
+                        logger.error(f"[VALIDACIÓN] Campo 'ID' faltante en producto para línea: {linea_producto}")
+                        await error_notify(method_name, linea_producto_notify_error, f"Campo 'ID' faltante en producto: {linea_producto}")
+                        raise HTTPException(status_code=502, detail="Producto sin ID válido")
+                    
+                    if product_id != linea_producto:
+                        logger.error(f"[VALIDACIÓN] ID mismatch - Esperado: {linea_producto}, Obtenido: {product_id}")
+                        await error_notify(method_name, linea_producto_notify_error, f"ID de producto no coincide: esperado {linea_producto}, obtenido {product_id}")
+                        raise HTTPException(status_code=404, detail=f"El ID del producto no coincide. Esperado: {linea_producto}, Obtenido: {product_id}")
+                    
+                    logger.info(f"[VALIDACIÓN] ID del producto validado correctamente: {product_id}")
+                
+            
 
         aval_porcentaje = next(
             (float(str(c.get("percentage", 0))) for c in product_data.get("costs", []) if c.get("label") == "Aval"),
@@ -2217,8 +2674,8 @@ async def obtener_estado(debtor_id:str,request: Request):
 
         ext_client_order = None  # cliente externo opcional para estado de orden
         try:  # intenta cargar configuracion desde BD
-            ext_client_order = await ExternalClient.from_code("KUENTA_ORDER_STATUS")  # codigo de servicio en BD
-            
+            ext_client_order = await ExternalClient.from_code("KUENTA_ORDER_STATUS", client_id=debtor_id)  # codigo de servicio en BD
+
             logger.info(f"Cliente externo KUENTA_ORDER_STATUS cargado desde BD: {ext_client_order.__dict__}\n")
         except ValueError:  # si no existe en BD
             ext_client_order = None  # fallback a settings
@@ -2231,7 +2688,7 @@ async def obtener_estado(debtor_id:str,request: Request):
             creditid=creditid,  # parametro creditid
             orderid=orderid,  # parametro orderid
         )  # URL final de consulta
-        
+
         intentos = 3
         intervalo_segundos = 10
         intento = 0
@@ -2252,14 +2709,21 @@ async def obtener_estado(debtor_id:str,request: Request):
                 "Organization-ID": debtor_id,
                 "Authorization": access_token
             }
-            
+
             while intento < intentos:
                 intento += 1
                 try:
-                    
+
                     if ext_client_order:  # usa servicio externo si existe
-                        ext_client_order.set_headers(headers)  # headers para auth
-                        ext_client_order.set_url(url)  # URL final de consulta
+                        # Inyectar variables dinámicas
+                        ext_client_order.set_dynamic_values({
+                            "ORG_ID": ORG_ID,
+                            "access_token": access_token
+                        })
+
+                        # Asignar URL final
+                        ext_client_order.set_url(url)
+
                         response = await ext_client_order.run()  # ejecuta request externa
                         if not isinstance(response, dict):  # valida tipo de respuesta
                             raise Exception("Respuesta invalida del servicio externo")  # error si no es dict
