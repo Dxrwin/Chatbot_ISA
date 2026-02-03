@@ -8,6 +8,8 @@ from utils.email_service import enviar_correo_renovacion, enviar_correo_webinar
 from utils.notify_error import info_notify, error_notify
 from utils.database import insertar_log, consultar_logs_filtrados
 from utils.config import settings
+from utils.whatsapp_service import enviar_whatsapp_renovacion
+from utils.linea_credito_links import obtener_link_por_linea_credito
 
 # Cache liviano en memoria para evitar reintentos inmediatos de envios webinar
 WEBINAR_CACHE_TTL = 300  # segundos
@@ -223,6 +225,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
 
     # 1. DECIDIR DESTINATARIO PRIMERO (antes de validaciones)
     destinatario = None
+    interes_renovar_str = None
     
     if extracted_vars.desicion_correo is True:
         destinatario = input_vars.CORREO
@@ -295,16 +298,16 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
         # No se cumplen las condiciones para enviar correo
         if not destinatario:
             mensaje_error = "No se pudo enviar correo por falta de destinatario."
-            logging.warning(f"❌ {mensaje_error}")
+            logging.warning(f" {mensaje_error}")
         elif ambiguedad_value is False and envio_correo_value is False and intrsrenovarbool_value is False:
             mensaje_error = "El cliente no tiene interés en renovar (ambiguedad=False, envio_correo=False, intrsrenovarbool=False)."
-            logging.info(f"❌ {mensaje_error}")
+            logging.info(f" {mensaje_error}")
         elif ambiguedad_value is True and envio_correo_value is False and intrsrenovarbool_value is False:
             mensaje_error = "Existe ambigüedad pero el cliente no autorizó el envío (envio_correo=False, intrsrenovarbool=False)."
-            logging.info(f"❌ {mensaje_error}")
+            logging.info(f"{mensaje_error}")
         else:
             mensaje_error = "No se cumplen las condiciones para enviar correo."
-            logging.info(f"❌ {mensaje_error}")
+            logging.info(f" {mensaje_error}")
         
         await error_notify(
             method_name="procesar_webhook_renovacion",
@@ -318,7 +321,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
 
     # Verificar que enviar_correo sea True antes de continuar
     if not enviar_correo:
-        logging.warning("⚠️ Variable enviar_correo es False, no se procede con el envío.")
+        logging.warning(" Variable enviar_correo es False, no se procede con el envío.")
         return {
             "status": "error",
             "message": "No se cumplen las condiciones para enviar correo.",
@@ -387,6 +390,76 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             client_id=input_vars.NOMBRE_TITULAR,
             info_message=f"Correo de renovación enviado exitosamente a {destinatario} en intento {confirmacion_response.get('intentos')} para {input_vars.NOMBRE_TITULAR}",
         )
+        
+                # ===========================
+        # NUEVO: envío de WhatsApp
+        # ===========================
+        try:
+            # 1) Obtener link por la LINEA_CREDITO
+            link_renovacion = obtener_link_por_linea_credito(linea_universitaria)
+
+            if not link_renovacion:
+                logging.warning(
+                    "No se envía WhatsApp porque no hay link mapeado para LINEA_CREDITO='%s'",
+                    linea_universitaria,
+                )
+            else:
+                # 2) Número en formato internacional (asegúrate de esto)
+                telefono_cliente = str(numero_telefono_input)
+                # Si en BD viene como '3006803158', probablemente tienes que anteponer '57'
+                if telefono_cliente.startswith("3"):
+                    telefono_cliente = f"57{telefono_cliente}"
+
+                whatsapp_resp = await enviar_whatsapp_renovacion(
+                    telefono=telefono_cliente,
+                    nombre_cliente=primer_name or input_vars.NOMBRE_TITULAR or "Cliente One2credit",
+                    link_redirect=link_renovacion,
+                )
+
+                if whatsapp_resp.get("status") != "success":
+                    logging.error(
+                        "❌ Error enviando WhatsApp de renovación a %s: %s",
+                        telefono_cliente,
+                        whatsapp_resp,
+                    )
+                    await error_notify(
+                        method_name="procesar_webhook_renovacion",
+                        client_id=input_vars.NOMBRE_TITULAR,
+                        error_message=(
+                            f"WhatsApp no enviado para renovación. "
+                            f"Teléfono: {telefono_cliente}. Detalle: {whatsapp_resp}"
+                        ),
+                    )
+                else:
+                    logging.info(
+                        "✅ WhatsApp de renovación enviado a %s: %s",
+                        telefono_cliente,
+                        whatsapp_resp,
+                    )
+                    await info_notify(
+                        method_name="procesar_webhook_renovacion",
+                        client_id=input_vars.NOMBRE_TITULAR,
+                        info_message=(
+                            f"WhatsApp de renovación enviado a {telefono_cliente} "
+                            f"para {input_vars.NOMBRE_TITULAR}"
+                        ),
+                    )
+
+        except Exception as e:
+            logging.error(
+                "Excepción enviando WhatsApp de renovación: %s",
+                e,
+                exc_info=True,
+            )
+            await error_notify(
+                method_name="procesar_webhook_renovacion",
+                client_id=input_vars.NOMBRE_TITULAR,
+                error_message=f"Excepción enviando WhatsApp: {e}",
+            )
+        # ===========================
+        # FIN NUEVO BLOQUE
+        # ===========================
+
 
         flujo_id = None
         #Mejorado manejo de registro en BD

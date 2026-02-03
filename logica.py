@@ -18,6 +18,9 @@ from utils.servicios_externos_service import (
     actualizar_servicio_externo,
     obtener_servicio_externo_por_codigo,
 )
+from utils.whatsapp_service import enviar_whatsapp_renovacion
+from utils.linea_credito_links import obtener_link_por_linea_credito
+
 from models.models import WebhookPayload
 import traceback
 import httpx
@@ -1221,8 +1224,6 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         # Inyectar variables dinámicas ANTES de ejecutar
                         # IMPORTANTE: Estas variables se usarán tanto para headers como para body
                         dynamic_vars = {
-                            #"ORG_ID": ORG_ID,
-                            #"access_token": token,
                             "creditLineId": payload.creditLineId,  # Corregido: minúscula
                             "principal": principal,
                             "time": payload.time,
@@ -1248,8 +1249,6 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                         # Ejecutar el servicio externo
                         response = await ext_client_post.run()
-
-                        logger.info(f"   Response completo del servicio externo: {str(response)}")
 
                         if not isinstance(response, dict):
                             raise Exception("Respuesta invalida del servicio externo")
@@ -1606,7 +1605,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                     logger.error(f"Formato inesperado de credits: {type(credits_data)}")
                     raise ValueError("Unexpected credits format in simulation response")
                 
-                logger.info(f"Datos del crédito obtenidos: {credit_data} \n")
+                #logger.info(f"Datos del crédito obtenidos: {credit_data} \n")
 
                 # Los installments están dentro de cada crédito
                 installments = credit_data.get("installments", [])
@@ -2481,24 +2480,23 @@ async def calcular_financiamiento(payload: dict):
 
                     resp = await ext_client_product.run()  # ejecuta request externa
                     
+                    # data de producto
+                    data = resp.get("data")
+                    logging.info(f"Respuesta de Kuenta data: {data} \n")
+                    
+                    product_data = data.get("data").get("product") if data else None
+                    logging.info(f"Respuesta de Kuenta product_data: {product_data} \n")
+                    
                     # 1. Validar estructura básica del JSON
-                    if not resp.get("data"):
+                    if data is None:
                         logger.error(f"[VALIDACIÓN] Campo 'data' faltante en respuesta de Kuenta para línea: {linea_producto}")
                         await error_notify(method_name, linea_producto_notify_error, f"Campo 'data' faltante en respuesta de producto: {linea_producto}")
                         raise HTTPException(status_code=502, detail="Respuesta de Kuenta incompleta: falta campo 'data'")
-
-                    # data de producto
-                    data = resp.get("data")
                     
-                    logger.info(f"Respuesta completa de Kuenta data: {data} \n")
-                    
-                    product_data = data.get("product")
-                    
-                    logger.info(f"Datos del producto obtenido: {product_data} \n")
-                    
-                    if not product_data:
+                    if  product_data is None:
                         logger.error(f"[VALIDACIÓN] Campo 'product' faltante en 'data' para línea: {linea_producto}")
                         await error_notify(method_name, linea_producto_notify_error, f"Campo 'product' faltante en respuesta de producto: {linea_producto}")
+                        logger.info(f"Respuesta de Kuenta status code: {resp.get('status')} \n  respuesta completa: {resp} \n detail :{resp.get('detail')} \n")
                         raise HTTPException(status_code=502, detail="Respuesta de Kuenta incompleta: falta campo 'product'")
                     
                     if not isinstance(product_data, dict):
@@ -2508,7 +2506,7 @@ async def calcular_financiamiento(payload: dict):
                     
                     # 2. Validar ID del producto (ya existente, pero con log mejorado)
                     product_id = product_data.get("ID")
-                    if not product_id:
+                    if  product_id is None:
                         logger.error(f"[VALIDACIÓN] Campo 'ID' faltante en producto para línea: {linea_producto}")
                         await error_notify(method_name, linea_producto_notify_error, f"Campo 'ID' faltante en producto: {linea_producto}")
                         raise HTTPException(status_code=502, detail="Producto sin ID válido")
@@ -2526,6 +2524,7 @@ async def calcular_financiamiento(payload: dict):
             (float(str(c.get("percentage", 0))) for c in product_data.get("costs", []) if c.get("label") == "Aval"),
             None
         )
+        logging.info(f"Porcentaje de Aval obtenido: {aval_porcentaje} \n")
         if aval_porcentaje is None:
             await error_notify(method_name, linea_producto_notify_error, "No se encontro porcentaje de Aval en el producto")
             raise HTTPException(status_code=404, detail="No se encontro porcentaje de Aval en el producto")
