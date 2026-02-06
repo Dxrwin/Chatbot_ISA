@@ -257,6 +257,69 @@ def slugify_nombre(value: str) -> str:
     return ascii_str.replace(" ", "-")
 
 
+def formatear_fecha_legible(fecha_iso: str) -> str:
+    """
+    Convierte una fecha ISO 8601 a formato legible en español.
+    Ejemplo: 2026-01-12T05:00:00Z -> lunes, enero 12, 2026
+    """
+    try:
+        # Mapeo de días de la semana en español
+        dias_semana = {
+            0: "lunes",
+            1: "martes",
+            2: "miércoles",
+            3: "jueves",
+            4: "viernes",
+            5: "sábado",
+            6: "domingo"
+        }
+        
+        # Mapeo de meses en español
+        meses = {
+            1: "enero",
+            2: "febrero",
+            3: "marzo",
+            4: "abril",
+            5: "mayo",
+            6: "junio",
+            7: "julio",
+            8: "agosto",
+            9: "septiembre",
+            10: "octubre",
+            11: "noviembre",
+            12: "diciembre"
+        }
+        
+        # Parsear la fecha ISO
+        fecha_obj = datetime.fromisoformat(fecha_iso.replace('Z', '+00:00'))
+        
+        # Obtener componentes
+        dia_semana = dias_semana[fecha_obj.weekday()]
+        mes = meses[fecha_obj.month]
+        dia = fecha_obj.day
+        año = fecha_obj.year
+        
+        return f"{dia_semana}, {mes} {dia}, {año}"
+    except Exception as e:
+        logger.error(f"Error al formatear fecha {fecha_iso}: {str(e)}")
+        return fecha_iso
+
+
+def formatear_valor_moneda(valor: float) -> str:
+    """
+    Formatea un número como moneda COP sin decimales.
+    Ejemplo: 12527818.528192377 -> $12.527.819
+    """
+    try:
+        # Redondear a entero
+        valor_redondeado = round(valor)
+        # Formatear con separadores de miles
+        return f"${valor_redondeado:,}".replace(",", ".")
+    except Exception as e:
+        logger.error(f"Error al formatear valor {valor}: {str(e)}")
+        return str(valor)
+
+
 class PayableRequest(BaseModel):
     creditLineId: str 
     principal: float 
@@ -3386,6 +3449,270 @@ async def registrar_renovacion(payload: RenovacionPayload):
                 "detail": str(e)
             }
         )
+
+#enpoints cobranzas
+
+@app.get("/obtener-pagos-mora/{id_credito}", tags=["Cobranzas"], summary="Obtener información de pagos en mora")
+async def obtener_pagos_mora(id_credito: str):
+    """
+    Endpoint para obtener información de pagos en mora de un crédito.
+    
+    Realiza una petición GET a la API externa:
+    https://api.kuenta.co/v1/receivable/{id_credito}
+    
+    Parámetros:
+    - id_credito: ID del crédito a consultar (se pasa en la URL)
+    
+    Retorna:
+    - Status 200: {"estado": "success", "data": {...}}
+    - Status 400: {"estado": "error", "mensaje": "Error de validación"}
+    - Status 401: {"estado": "error", "mensaje": "Error de autenticación"}
+    - Status 404: {"estado": "error", "mensaje": "Crédito no encontrado"}
+    - Status 500: {"estado": "error", "mensaje": "Error interno"}
+    
+    Ejemplo de uso:
+    GET /obtener-pagos-mora/8c082794-796c-4987-ac28-e4918bea590d
+    """
+    method_name = "obtener_pagos_mora"
+    client_id = id_credito
+    
+    try:
+        logger.info(f"Iniciando consulta de pagos en mora para crédito: {id_credito}")
+        
+        # Validación del ID del crédito
+        if not id_credito or not id_credito.strip():
+            raise ValueError("El ID del crédito no puede estar vacío")
+        
+        # Obtener token de autenticación
+        try:
+            token = await obtener_token()
+        except Exception as token_error:
+            logger.error(f"Error al obtener token: {str(token_error)}")
+            raise
+        
+        # Configuración de headers
+        headers = {
+                "Config-Organization-ID": ORG_ID,
+                "Organization-ID": ORG_ID,
+                "Authorization": token
+            }
+        
+        # Cargar servicio externo desde BD o usar configuración fallback
+        ext_client = None
+        try:
+            ext_client = await ExternalClient.from_code("KUENTA_RECEIVABLE_GET", client_id=client_id)
+            logger.info("Configuración de servicio externo para obtener pagos en mora cargada desde BD")
+            
+            # Configurar el path con el ID del crédito
+            ext_client.set_path(f"/{id_credito}")
+            ext_client.set_headers(headers)
+            
+            if not ext_client.url:
+                logger.error("La configuración del servicio externo no tiene URL definida")
+                raise ValueError("URL no definida en configuración")
+            
+            # Ejecutar request con servicio externo
+            response = await ext_client.run()
+            
+        except (ValueError, Exception) as e:
+            # Si falla el servicio externo, usar cliente HTTP directo
+            logger.warning(f"Usando cliente HTTP directo para obtener pagos en mora: {str(e)}")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                http_response = await client.get(
+                    f"https://api.kuenta.co/v1/receivable/{id_credito}",
+                    headers=headers
+                )
+                response = {
+                    "status": http_response.status_code,
+                    "data": http_response.json() if http_response.status_code < 400 else {"error": http_response.text}
+                }
+        
+        status_code = response.get("status", 500)
+        response_data = response.get("data", {})
+        
+        # Manejo de diferentes status
+        if status_code == 200:
+            logger.info(f"Consulta de pagos en mora exitosa para crédito: {id_credito}")
+            
+            # Procesar installments si existen en la respuesta
+            processed_data = response_data.get("data", {}).get("credit", {})
+            #acceder a las cuotas
+            installments = processed_data.get("installments", [])
+            logger.info(f"Installments obtenidos: {len(installments)} para crédito: {id_credito}\n \n")
+            logger.info (f"installments data: {installments} \n")
+            
+            #acceder al resumen
+            resumen = processed_data.get("summary", {})
+            logger.info (f"resumen data: {resumen}")
+            
+            
+            # Procesar lista de installments
+            first_pending_installment = None
+            count_pending = 0  # estado 3 = DueInstallment
+            count_expired = 0  # estado 4 = ExpiredInstallment
+            
+            if installments and isinstance(installments, list):
+                for installment in installments:
+                    logger.debug(f"Procesando installment: {installment.get('number')} con estado {installment.get('status')} para crédito: {id_credito}")
+                    status_installment = installment.get("status")
+                    
+                    # Contar installments pendientes (estado 3)
+                    if status_installment == 3:
+                        count_pending += 1
+                        # Capturar el primer installment pendiente
+                        if first_pending_installment is None:
+                            fecha_pago = installment.get("date")
+                            valor_pagar = installment.get("payment")
+                            
+                            first_pending_installment = {
+                                "id": installment.get("id"),
+                                "numero_de_cuota": installment.get("number"),
+                                "fecha_pago": fecha_pago,
+                                "fecha_pago_legible": formatear_fecha_legible(fecha_pago) if fecha_pago else "N/A",
+                                "valor_total_pagar": valor_pagar,
+                                "valor_total_legible": formatear_valor_moneda(valor_pagar) if valor_pagar else "N/A",
+                                "dias_de_mora_cuota": installment.get("debtInterestDays")
+                            }
+                    
+                    # Contar installments vencidos (estado 4)
+                    elif status_installment == 4:
+                        count_expired += 1
+                
+                # Agregar resumen de installments al JSON procesado
+                return_data = {
+                    "total_cuotas": len(installments),
+                    "dias_de_atraso": resumen.get("debtDays", 0),
+                    "pendientes_estado_3": count_pending,
+                    "vencidos_estado_4": count_expired,
+                    "pago_pendiente": first_pending_installment
+                }
+                logger.info(f"resumen de las cuotas pendientes : {return_data}")
+                
+                logger.info(f"Resumen de installments para crédito {id_credito}: {count_pending} pendientes, {count_expired} vencidos")
+            
+            await info_notify(
+                method_name=method_name,
+                client_id=client_id,
+                info_message=f"Información de pagos en mora obtenida exitosamente para crédito: {id_credito}"
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "estado": "success",
+                    "mensaje": "Información de pagos en mora obtenida correctamente",
+                    "data": return_data
+                }
+            )
+        
+        elif status_code == 401:
+            error_msg = "Error de autenticación: token inválido o expirado"
+            logger.error(error_msg)
+            await error_notify(method_name, client_id, error_msg)
+            await insertar_log(
+                method_name=method_name,
+                client_id=client_id,
+                error_message=error_msg,
+                http_code=401,
+                tipo="error"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "estado": "error",
+                    "codigo_error": "AuthenticationError",
+                    "mensaje": "Error de autenticación",
+                    "detalles": error_msg
+                }
+            )
+        
+        elif status_code == 404:
+            error_msg = f"Crédito no encontrado: {id_credito}"
+            logger.error(error_msg)
+            await insertar_log(
+                method_name=method_name,
+                client_id=client_id,
+                error_message=error_msg,
+                http_code=404,
+                tipo="error"
+            )
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "estado": "error",
+                    "codigo_error": "NotFoundError",
+                    "mensaje": "Crédito no encontrado",
+                    "detalles": error_msg
+                }
+            )
+        
+        elif status_code == 503:
+            # service unavailable, puede ser temporal, no notificar como error crítico
+            error_msg = f"Servicio no disponible temporalmente: {response_data} \n"
+            logger.warning(error_msg)
+            error_msg = f"Error en la consulta: {response_data}"
+            await error_notify(method_name, client_id, error_msg)
+            await insertar_log(
+                method_name=method_name,
+                client_id=client_id,
+                error_message=error_msg,
+                http_code=status_code,
+                tipo="error"
+            )
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "estado": "service_unavailable",
+                    "codigo_error": f"HttpError{status_code}",
+                    "mensaje": f"Servicio no disponible temporalmente",
+                    "detalles": error_msg
+                }
+            )
+    
+    except ValueError as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error de validación: {str(e)}")
+        await insertar_log(
+            method_name=method_name,
+            client_id=client_id,
+            error_message=f"Error de validación: {str(e)}",
+            http_code=400,
+            tipo="error",
+            traceback_str=error_traceback
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "estado": "error",
+                "codigo_error": "ValidationError",
+                "mensaje": "Error de validación",
+                "detalles": str(e)
+            }
+        )
+    
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error general en obtener_pagos_mora: {str(e)}", exc_info=True)
+        await insertar_log(
+            method_name=method_name,
+            client_id=client_id,
+            error_message=f"Error general: {str(e)}",
+            http_code=500,
+            tipo="error",
+            traceback_str=error_traceback
+        )
+        await error_notify(method_name, client_id, f"Error general: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "estado": "error",
+                "codigo_error": "InternalError",
+                "mensaje": "Error interno del servidor",
+                "detalles": "Nuestro equipo técnico ha sido notificado"
+            }
+        )
+
+
+
 
 # endpoints para gestion de servicios externos ###
 
