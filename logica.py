@@ -3715,7 +3715,6 @@ async def obtener_pagos_mora(id_credito: str):
 
 
 # endpoints para gestion de servicios externos ###
-
 @app.post("/servicios-externos", tags=["Servicios Externos"], summary="Crear servicio externo")
 async def crear_servicio_externo_endpoint(payload: ServicioExternoCreateRequest):
     try:
@@ -4065,6 +4064,147 @@ async def consultar_logs(filtros: ConsultaLogsRequest):
             content={
                 "status": "error",
                 "message": "Error interno del servidor",
+                "detail": str(e)
+            }
+        )
+
+
+# ===== ENDPOINT PARA PROCESAR Y FORMATEAR VALORES (GET) =====
+
+@app.get("/formatear", tags=["Utilidades"], summary="Procesar y formatear valores con parámetros GET")
+async def formatear_valores(
+    valor: Optional[str] = None,
+    fecha: Optional[str] = None
+):
+    """
+    Endpoint para procesar y formatear valores mediante parámetros GET.
+    
+    **Parámetros de query:**
+    - **valor** (opcional): Valor numérico en diferentes formatos
+      - Ejemplos: "2.300.650", "2,435,600", "$2.500.000"
+      - Se devuelve como número: 2300650
+    
+    - **fecha** (opcional): Fecha a formatear
+      - Usar "now" para obtener la fecha/hora actual en formato ISO
+      - Respuesta: 2026-02-10T12:06:39-05:00
+    ```
+    """
+    method_name = "formatear_valores"
+    
+    try:
+        result = {
+            "status": "success",
+            "procesados": 0
+        }
+        
+        # Procesar parámetro 'valor'
+        if valor:
+            try:
+                valor_lower = str(valor).strip().lower()
+                
+                if valor_lower == "now":
+                    # Si envían "now" en valor, procesarlo como fecha
+                    ahora = datetime.now(timezone.utc).astimezone()
+                    valor_procesado = ahora.isoformat()
+                    tipo_valor = "fecha"
+                    result["valor"] = {
+                        "original": valor,
+                        "tipo": tipo_valor,
+                        "valor_procesado": valor_procesado
+                    }
+                else:
+                    # Procesar como valor numérico
+                    valor_numerico = await limpiar_valor_principal(valor)
+                    tipo_valor = "numerico"
+                    result["valor"] = {
+                        "original": valor,
+                        "tipo": tipo_valor,
+                        "valor_procesado": valor_numerico
+                    }
+                
+                result["procesados"] += 1
+                logger.info(f"Valor procesado: {valor} → {result['valor']['valor_procesado']}")
+                
+            except ValueError as e:
+                logger.warning(f"Error al procesar valor: {str(e)}")
+                result["valor"] = {
+                    "original": valor,
+                    "error": str(e),
+                    "tipo": "error"
+                }
+        
+        # Procesar parámetro 'fecha'
+        if fecha:
+            try:
+                fecha_lower = str(fecha).strip().lower()
+                
+                if fecha_lower == "now":
+                    # Obtener fecha/hora actual con zona horaria
+                    ahora = datetime.now(timezone.utc).astimezone()
+                    valor_procesado = ahora.isoformat()
+                    tipo_valor = "fecha"
+                    result["fecha"] = {
+                        "original": fecha,
+                        "tipo": tipo_valor,
+                        "valor_procesado": valor_procesado
+                    }
+                else:
+                    # Intentar procesar como valor numérico si no es "now"
+                    valor_numerico = await limpiar_valor_principal(fecha)
+                    tipo_valor = "numerico"
+                    result["fecha"] = {
+                        "original": fecha,
+                        "tipo": tipo_valor,
+                        "valor_procesado": valor_numerico
+                    }
+                
+                result["procesados"] += 1
+                logger.info(f"Fecha procesada: {fecha} → {result['fecha']['valor_procesado']}")
+                
+            except ValueError as e:
+                logger.warning(f"Error al procesar fecha: {str(e)}")
+                result["fecha"] = {
+                    "original": fecha,
+                    "error": str(e),
+                    "tipo": "error"
+                }
+        
+        # Validar que se procesó al menos un parámetro
+        if result["procesados"] == 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Debe proporcionar al menos un parámetro (valor o fecha)",
+                    "parametros_recibidos": {"valor": valor, "fecha": fecha},
+                    "procesados": 0
+                }
+            )
+        
+        logger.info(f"Procesamiento completado: {result['procesados']} parámetro(s) procesado(s)")
+        
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+    
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error en formatear_valores: {str(e)}", exc_info=True)
+        await insertar_log(
+            method_name=method_name,
+            client_id="N/A",
+            error_message=f"Error en formatear_valores: {str(e)}",
+            http_code=500,
+            tipo="error",
+            traceback_str=error_traceback
+        )
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Error interno al procesar valores",
                 "detail": str(e)
             }
         )

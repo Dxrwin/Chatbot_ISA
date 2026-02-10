@@ -1,13 +1,3 @@
 .env
 __pycache__/
-logica.cpython-313.pyct
-notify_error.cpython-313.pyc
 *.pyc
-venv/
-.venv
-deploy.sh
-.deploy.sh
-.dockerignore
-Dockerfile
-.Dockerfile
-main.py
