@@ -3,6 +3,7 @@ import logging
 import traceback
 import re
 from typing import Optional, Any, Dict
+from utils.database import consultar_servicio_externo  # Importar función de BD
 
 import httpx
 
@@ -59,9 +60,10 @@ class ExternalClient:
         Raises:
             ValueError: Si el servicio no existe en la BD
         """
-        from utils.database import consultar_servicio_externo  # Importar función de BD
 
         servicio = await consultar_servicio_externo(codigo)
+        
+        logger.info(f"Servicio externo obtenido de BD para código '{codigo}': {servicio} \n")
         if not servicio:
             raise ValueError(f"Servicio externo '{codigo}' no encontrado en BD")
 
@@ -216,6 +218,7 @@ class ExternalClient:
                 # Parsear respuesta
                 try:
                     data = response.json()
+                    logger.info(f" respuesta de la peticion para obtener el servicio: [{self.codigo}] Respuesta JSON: {data} \n")
                 except Exception:
                     data = {"raw_text": response.text}
 

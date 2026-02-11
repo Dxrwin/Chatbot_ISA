@@ -125,73 +125,11 @@ async def insertar_registro_completo(data_cliente: dict, data_credito: dict):
             await connection.begin()
             
             try:
-                # --- VERIFICACIÓN DE DUPLICADOS ---
                 # Verificar si ya existe un registro con el mismo numero_telefono, ID_credito_simulacion y referencia_simulacion
                 numero_telefono_check = str(data_cliente.get('numero_telefono', ''))[:15]
                 id_credito_check = str(data_credito.get('ID_Credito_simulacion', ''))[:50]
                 referencia_check = str(data_credito.get('referencia_simulacion', ''))[:50]
                 
-                query_check = """
-                    SELECT c.estado_credito_post_confirmado, c.estado_credito 
-                    FROM renovaciones_clientes rc
-                    INNER JOIN credito c ON rc.id_credito_simulacion = c.ID_Credito_simulacion
-                    WHERE rc.numero_telefono = %s 
-                    AND c.ID_Credito_simulacion = %s 
-                    AND c.referencia_simulacion = %s
-                """
-                
-                await cursor.execute(query_check, (numero_telefono_check, id_credito_check, referencia_check))
-                existing_record = await cursor.fetchone()
-                
-                if existing_record:
-                    # Ya existe un registro con esta combinación
-                    estado_actual = existing_record[0]  # estado_credito_post_confirmado
-                    estado_texto_actual = existing_record[1]  # estado_credito
-                    
-                    if estado_actual == estado_id:
-                        # Estado igual, es duplicado
-                        logger.warning(f"Registro duplicado detectado: numero_telefono={numero_telefono_check}, ID_credito={id_credito_check}, referencia={referencia_check}, estado={estado_id}")
-                        await error_notify(
-                            "insertar_registro_completo_en_db", 
-                            numero_telefono_check, 
-                            f"Intento de registro duplicado rechazado para número de teléfono {numero_telefono_check}, ID de crédito {id_credito_check}, referencia {referencia_check} y estado {estado_id}"
-                        )
-                        await connection.rollback()
-                        return {
-                            "status": "error",
-                            "message": "Ya existe un registro con el mismo número de teléfono, ID de crédito, referencia de simulación y estado. No se puede registrar la renovación duplicada.",
-                            "error_type": "DUPLICATE_RECORD",
-                            "details": {
-                                "numero_telefono": numero_telefono_check,
-                                "ID_credito_simulacion": id_credito_check,
-                                "referencia_simulacion": referencia_check,
-                                "estado_actual": estado_actual,
-                                "estado_nuevo": estado_id
-                            }
-                        }
-                    else:
-                        # Estado diferente, actualizar el registro existente
-                        logger.info(f"Actualizando estado del registro existente: {estado_actual} -> {estado_id}")
-                        
-                        update_query = """
-                            UPDATE credito 
-                            SET estado_credito_post_confirmado = %s, estado_credito = %s
-                            WHERE ID_Credito_simulacion = %s
-                        """
-                        await cursor.execute(update_query, (estado_id, estado_texto, id_credito_check))
-                        await connection.commit()
-                        await info_notify(
-                            "insertar_registro_completo_en_db", 
-                            numero_telefono_check, 
-                            f"Registro existente actualizado para número de teléfono {numero_telefono_check}, ID de crédito {id_credito_check}, referencia {referencia_check} de estado {estado_actual} a {estado_id}"
-                        )
-                        return {
-                            "status": "updated",
-                            "message": f"Registro actualizado exitosamente. Estado cambiado de {estado_actual} ({estado_texto_actual}) a {estado_id} ({estado_texto})",
-                            "id_credito": id_credito_check,
-                            "estado_anterior": estado_actual,
-                            "estado_nuevo": estado_id
-                        }
                 
                 # --- Conversión de Tipos y Validaciones ---
                 # Convertir cuota_inicial_simulacion a DECIMAL(15,2) - Redondear a 2 decimales

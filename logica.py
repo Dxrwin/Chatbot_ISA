@@ -852,7 +852,7 @@ async def webhook_product_lines(
     """
     MAX_RETRIES = 3  # numero maximo de intentos
     RETRY_DELAY = 5  # segundos entre intentos (base)
-    TIMEOUT = 15     # timeout en segundos por solicitud
+    TIMEOUT = 0     # timeout en segundos por solicitud
 
     method_name = "product-lines"
     parent_id_notify_error = f"parent_id para la busqueda del la linea={parent_id}"
@@ -889,6 +889,7 @@ async def webhook_product_lines(
                         # Inyectar variables dinámicas
                         ext_client.set_dynamic_values({
                             "ORG_ID": ORG_ID,
+                            "Config-Organization-ID": ORG_ID,
                             "access_token": access_token
                         })
 
@@ -897,38 +898,56 @@ async def webhook_product_lines(
                             ext_client.set_url(API_URL)
 
                         response = await ext_client.run()
+                        
+                        logger.info(f"Respuesta recibida de API externa en intento {attempt}: {response} \n")
+                        
                         if not isinstance(response, dict):
                             raise Exception("Respuesta invalida del servicio externo")
-                        status_code = response.get("status", 500)
+                        status_code = response.get("status")
+                        
                         if not isinstance(status_code, int):
                             raise Exception("Respuesta de servicio sin status valido")
-                        if status_code >= 400:
-                            error_traceback = traceback.format_exc()
-                            error_detail = response.get("data")
-                            logger.error(f"Error HTTP {status_code} en API externa: {error_detail}")
-                            await error_notify(
-                                method_name,
-                                parent_id_notify_error,
-                                f"Error en API externa: {error_detail} error capturado: {status_code}"
-                            )
-                            await insertar_log(
-                                method_name=method_name,
-                                client_id=parent_id_notify_error,
-                                error_message=f"Error en API externa: {error_detail} error capturado: {status_code}",
-                                http_code=status_code,
-                                tipo="error",
-                                traceback_str=error_traceback
-                            )
-                            if 500 <= status_code < 600 and attempt < MAX_RETRIES:
+                        
+                        
+                        if status_code == 401:
+                            
+                            if status_code == 401 and attempt < MAX_RETRIES:
+                                logger.warning(f"Intento {attempt}: respuesta de API externa: {response}.")
                                 await asyncio.sleep(RETRY_DELAY * attempt)
                                 continue
-                            return {
-                                "estado": "error",
-                                "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                                "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
-                            }
+                            
+                            else:
+                            
+                                error_traceback = traceback.format_exc()
+                                error_detail = response.get("data")
+                                logger.error(f"Error HTTP {status_code} en API externa: {error_detail}")
+                                await error_notify(
+                                    method_name,
+                                    parent_id_notify_error,
+                                    f"Error en API externa: {error_detail} error capturado: {status_code}"
+                                )
+                                await insertar_log(
+                                    method_name=method_name,
+                                    client_id=parent_id_notify_error,
+                                    error_message=f"Error en API externa: {error_detail} error capturado: {status_code}",
+                                    http_code=status_code,
+                                    tipo="error",
+                                    traceback_str=error_traceback
+                                )
+                                return {
+                                    "estado": "error",
+                                    "mensaje": MENSAJES_CLIENTE["error_servicio"],
+                                    "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
+                                }
+                        elif status_code == 504 and attempt < MAX_RETRIES:
+                            logger.warning(f"Intento {attempt}: Timeout en API externa: {response}. \n")
+                            await asyncio.sleep(RETRY_DELAY * attempt)
+                            continue
 
                         data = response.get("data") or {}
+                        
+                        #logger.info(f"Respuesta 'data' de API externa: {data} \n")
+                        
                         if not isinstance(data, dict):
                             data = {}
                     else:
@@ -4070,7 +4089,6 @@ async def consultar_logs(filtros: ConsultaLogsRequest):
 
 
 # ===== ENDPOINT PARA PROCESAR Y FORMATEAR VALORES (GET) =====
-
 @app.get("/formatear", tags=["Utilidades"], summary="Procesar y formatear valores con parámetros GET")
 async def formatear_valores(
     valor: Optional[str] = None,
