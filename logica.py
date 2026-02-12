@@ -3474,7 +3474,7 @@ async def registrar_renovacion(payload: RenovacionPayload):
         )
 
 #enpoints cobranzas
-
+# Endpoint para obtener información de pagos en mora de un crédito
 @app.post("/pagos-mora", tags=["Cobranzas"], summary="Obtener información de pagos en mora")
 async def obtener_pagos_mora(payload: MoraData):
     """
