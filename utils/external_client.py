@@ -4,9 +4,8 @@ import traceback
 import re
 from typing import Optional, Any, Dict
 from utils.database import consultar_servicio_externo  # Importar función de BD
-
+from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
 import httpx
-
 from utils.database import insertar_log
 from utils.servicios_externos_service import obtener_servicio_externo_por_codigo
 
@@ -192,9 +191,15 @@ class ExternalClient:
             final_body = self._process_dict(self.body) if self.body else {}
 
             # Logs de depuración
-            logger.info(f"[{self.codigo}] URL final: {final_url}")
-            logger.info(f"[{self.codigo}] Headers: {final_headers}")
-            logger.info(f"[{self.codigo}] Body final: {final_body}")
+            logger.info(f"[{self.codigo}] URL final: {final_url} \n")
+            logger.info(f"[{self.codigo}] Headers: {final_headers}\n")
+            logger.info(f"[{self.codigo}] Body final: {final_body}\n")
+            
+            await info_notify(
+                method_name=f"external_client:{self.codigo}",
+                client_id=self.client_id or "N/A",
+                info_message=f"Ejecutando petición HTTP {self.metodo} al servicio externo '{self.nombre_servicio}'url final: {final_url} \n"
+            )
 
             # Crear cliente HTTP
             async with httpx.AsyncClient(timeout=self.timeout_s) as client:
@@ -219,6 +224,11 @@ class ExternalClient:
                 try:
                     data = response.json()
                     logger.info(f" respuesta de la peticion para obtener el servicio: [{self.codigo}] Respuesta JSON: {data} \n")
+                    await info_notify(
+                        method_name=f"external_client:{self.codigo}",
+                        client_id=self.client_id or "N/A",
+                        info_message=f"Respuesta JSON recibida del servicio externo '{self.nombre_servicio}' para código '{self.codigo}', respuesta: {data} \n"
+                    )
                 except Exception:
                     data = {"raw_text": response.text}
 

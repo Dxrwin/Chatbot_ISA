@@ -59,6 +59,10 @@ class RenovacionPayload(BaseModel):
     estado_final_renovacion: str
     estado_pago_payvalida: str
     nombre_cliente: str
+    
+# id credito mora
+class MoraData(BaseModel):
+    id_credito: str
 
 class CreditoData(BaseModel):
     ID_Credito_simulacion: str
@@ -3471,8 +3475,8 @@ async def registrar_renovacion(payload: RenovacionPayload):
 
 #enpoints cobranzas
 
-@app.get("/obtener-pagos-mora/{id_credito}", tags=["Cobranzas"], summary="Obtener información de pagos en mora")
-async def obtener_pagos_mora(id_credito: str):
+@app.post("/pagos-mora", tags=["Cobranzas"], summary="Obtener información de pagos en mora")
+async def obtener_pagos_mora(payload: MoraData):
     """
     Endpoint para obtener información de pagos en mora de un crédito.
     
@@ -3493,6 +3497,7 @@ async def obtener_pagos_mora(id_credito: str):
     GET /obtener-pagos-mora/8c082794-796c-4987-ac28-e4918bea590d
     """
     method_name = "obtener_pagos_mora"
+    id_credito = payload.id_credito
     client_id = id_credito
     
     try:
@@ -3530,12 +3535,36 @@ async def obtener_pagos_mora(id_credito: str):
                 logger.error("La configuración del servicio externo no tiene URL definida")
                 raise ValueError("URL no definida en configuración")
             
+            #url completa del servicio externo
+            logger.info(f"URL del servicio externo para pagos en mora: {ext_client.url}")
+            
+            await info_notify(
+                method_name=method_name,
+                client_id=f"id del crédito: {id_credito}",
+                info_message=f"Configuración del servicio externo para obtener pagos en mora cargada. URL: {ext_client.url}"
+            )
             # Ejecutar request con servicio externo
             response = await ext_client.run()
+            # informar que se realizo la peticion para la consulta de pagos en mora
+            
+            logger.info(f"Petición realizada a servicio externo para obtener pagos en mora del crédito: {id_credito} \n")
+            
+            logger.info(f"Respuesta del servicio externo: {response} \n")
+            
+            await info_notify(
+                method_name=method_name,
+                client_id=client_id,
+                info_message=f"Petición realizada a servicio externo para obtener pagos en mora del crédito: {id_credito}"
+            )
             
         except (ValueError, Exception) as e:
             # Si falla el servicio externo, usar cliente HTTP directo
             logger.warning(f"Usando cliente HTTP directo para obtener pagos en mora: {str(e)}")
+            await error_notify(
+                method_name=method_name,
+                client_id=client_id,
+                error_message=f"Fallo en servicio externo, usando cliente HTTP directo: {str(e)}"
+            )
             async with httpx.AsyncClient(timeout=15.0) as client:
                 http_response = await client.get(
                     f"https://api.kuenta.co/v1/receivable/{id_credito}",
@@ -3545,6 +3574,11 @@ async def obtener_pagos_mora(id_credito: str):
                     "status": http_response.status_code,
                     "data": http_response.json() if http_response.status_code < 400 else {"error": http_response.text}
                 }
+                await info_notify(
+                    method_name=method_name,
+                    client_id=client_id,
+                    info_message=f"Petición realizada con cliente HTTP directo para obtener pagos en mora del crédito: {id_credito}. Status: {http_response.status_code}"
+                )
         
         status_code = response.get("status", 500)
         response_data = response.get("data", {})
@@ -3557,6 +3591,13 @@ async def obtener_pagos_mora(id_credito: str):
             processed_data = response_data.get("data", {}).get("credit", {})
             #acceder a las cuotas
             installments = processed_data.get("installments", [])
+            # cuotas del credito
+            await info_notify(
+                method_name=method_name,
+                client_id=client_id,
+                info_message=f"Cuotas obtenidas para crédito: {id_credito}, cuotas: {len(installments)}, detalle de cuotas : {installments}"
+            )
+            
             logger.info(f"Installments obtenidos: {len(installments)} para crédito: {id_credito}\n \n")
             logger.info (f"installments data: {installments} \n")
             
@@ -3592,6 +3633,14 @@ async def obtener_pagos_mora(id_credito: str):
                                 "valor_total_legible": formatear_valor_moneda(valor_pagar) if valor_pagar else "N/A",
                                 "dias_de_mora_cuota": installment.get("debtInterestDays")
                             }
+                            #notificar cuota encontrada
+                            await info_notify(
+                                method_name=method_name,
+                                client_id=client_id,
+                                info_message=f"Primer installment pendiente encontrado para crédito {id_credito}: {first_pending_installment}"
+                            )
+                            
+                            logger.info(f"Primer installment pendiente encontrado para crédito {id_credito}: {first_pending_installment}")
                     
                     # Contar installments vencidos (estado 4)
                     elif status_installment == 4:
