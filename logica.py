@@ -141,7 +141,7 @@ class ServicioExternoUpdateRequest(BaseModel):
     body: Optional[Dict[str, Any]] = None
 
 
-
+print("🔥 BOOT VERSION 8693665")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
