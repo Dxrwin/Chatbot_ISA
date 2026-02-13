@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 # Verificar que se haya proporcionado un nombre de imagen
 if [ -z "$1" ]; then
@@ -7,29 +6,22 @@ if [ -z "$1" ]; then
   exit 1
 fi
 
+# Variables
 IMAGE_NAME=$1
 DOCKERHUB_USER="jeffercda"
+TAG="latest"
+FULL_IMAGE_NAME="$DOCKERHUB_USER/$IMAGE_NAME:$TAG"
 
-# Tag por commit (si no hay git, cae a timestamp)
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  TAG=$(git rev-parse --short HEAD)
-else
-  TAG=$(date +%Y%m%d%H%M%S)
-fi
+# Paso 1: Construir la imagen
+echo "Construyendo la imagen Docker: $IMAGE_NAME"
+sudo docker build -t $IMAGE_NAME .
 
-FULL_IMAGE_SHA="$DOCKERHUB_USER/$IMAGE_NAME:$TAG"
-FULL_IMAGE_LATEST="$DOCKERHUB_USER/$IMAGE_NAME:latest"
+# Paso 2: Etiquetar la imagen
+echo "Etiquetando la imagen como $FULL_IMAGE_NAME"
+sudo docker tag $IMAGE_NAME $FULL_IMAGE_NAME
 
-echo "🔧 Construyendo imagen: $FULL_IMAGE_SHA"
-sudo docker build --pull --no-cache -t "$FULL_IMAGE_SHA" .
+# Paso 3: Subir la imagen a Docker Hub
+echo "Subiendo la imagen a Docker Hub: $FULL_IMAGE_NAME"
+sudo docker push $FULL_IMAGE_NAME
 
-echo "📤 Subiendo imagen: $FULL_IMAGE_SHA"
-sudo docker push "$FULL_IMAGE_SHA"
-
-# Opcional: también actualiza latest (útil si lo quieres conservar)
-echo "🏷️ Actualizando tag latest -> $FULL_IMAGE_LATEST"
-sudo docker tag "$FULL_IMAGE_SHA" "$FULL_IMAGE_LATEST"
-sudo docker push "$FULL_IMAGE_LATEST"
-
-echo "✅ Listo."
-echo "👉 En CapRover despliega ESTA imagen (recomendado): $FULL_IMAGE_SHA"
+echo "✅ Imagen $FULL_IMAGE_NAME generada y subida correctamente."
