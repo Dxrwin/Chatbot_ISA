@@ -8,6 +8,7 @@ from utils.email_service import enviar_correo_renovacion, enviar_correo_webinar
 from utils.notify_error import info_notify, error_notify
 from utils.database import insertar_log, consultar_logs_filtrados
 from utils.config import settings
+from utils.registrar_bitrix import registrar_en_bitrix
 from utils.whatsapp_service import enviar_whatsapp_renovacion
 from utils.linea_credito_links import obtener_link_por_linea_credito
 
@@ -1216,3 +1217,202 @@ async def procesar_llamada_renovacion_Y_refinanciamiento(payload: WebhookPayload
             "cliente": nombre_cliente
         }
     
+async def procesar_webhook_cobranzas(payload: WebhookPayload) -> Dict[str, Any]:
+    logging.info("Iniciando procesamiento de webhook de cobranzas")
+    """
+    Servicio de Cobranzas:
+    Evalúa si el cliente está interesado para mandarlo a Bitrix, 
+    de lo contrario, le dispara un correo de seguimiento.
+    """
+    var_in = payload.input_variables
+    var_ex = payload.extracted_variables
+    nombre_cliente = var_in.Nombre or "Cliente No Identificado"
+    
+    # [LOG] Trazamos el estado general para saber con qué estamos lidiando
+    logging.info(f"[COBRANZAS] Iniciando análisis para {nombre_cliente}. Objetivo: {var_ex.objetivo}")
+
+    # =======================================================
+    # PASO 1: EXTRACCIÓN Y LIMPIEZA DE VARIABLES CLAVE
+    # =======================================================
+    # Nota del Senior: La IA a veces manda 'Sí', 'Si', 'si', o None. Hay que normalizar eso.
+    
+    # Extraemos la variable "interes" (Asumimos que viene en 'interessolicitud' o 'tipo_interes')
+    interes_raw = str(var_ex.interessolicitud or var_ex.tipo_interes or "").strip().lower()
+    # Lo convertimos a un booleano confiable
+    interes_positivo = interes_raw in ["sí", "si", "yes", "true"]
+    
+    confirm_interes = var_ex.confirmacion_interes is True
+    estado_llamada = var_ex.estado is True
+    objetivo_llamada = str(var_ex.objetivo or "").strip().lower()
+    
+    # Variables secundarias (por si nos sirven para los logs o Bitrix)
+    mas_info = var_ex.mas_informacion is True
+    autori_contacto = var_ex.autorizacion_contacto is True
+
+    logging.info(f"[COBRANZAS] Variables limpias -> interes_positivo: {interes_positivo}, "
+                f"confirm_interes: {confirm_interes}, estado_llamada: {estado_llamada}, "
+                f"mas_info: {mas_info}, autori_contacto: {autori_contacto}")
+
+    # =======================================================
+    # PASO 2: RESOLVER EL DESTINATARIO (Igual que antes, blindado)
+    # =======================================================
+    destinatario = None
+    if var_ex.desicion_correo is True:
+        destinatario = var_in.EMAIL
+    elif var_ex.desicion_correo is False:
+        correo_cliente = getattr(var_ex, "correo_cliente", None)
+        destinatario = correo_cliente if correo_cliente and str(correo_cliente).strip() else var_in.EMAIL
+    else:
+        correo_cliente = getattr(var_ex, "correo_cliente", None)
+        destinatario = correo_cliente if correo_cliente and str(correo_cliente).strip() else var_in.EMAIL
+
+    if not destinatario:
+        logging.error(f"[COBRANZAS] Sin destinatario para {nombre_cliente}. Abortando.")
+        return {"status": "warning", "message": "Falta de destinatario."}
+
+    # =======================================================
+    # PASO 3: CONTROL DE SPAM / IDEMPOTENCIA
+    # =======================================================
+    # dedup_key = f"{destinatario.lower()}|{nombre_cliente.lower()}"
+    # if _marcar_y_verificar_reenvio_cobranzas(dedup_key):
+    #     logging.warning(f"[COBRANZAS] Cliente {nombre_cliente} ya procesado hoy. Ignorando.")
+    #     return {"status": "success", "message": "Solicitud ya procesada.", "correo_enviado": False}
+
+    # =======================================================
+    # PASO 4: EL CEREBRO DE LA OPERACIÓN (Bitrix vs Correo)
+    # =======================================================
+    
+    # [CONDICIÓN 1]: INTERÉS POSITIVO -> SE VA A BITRIX
+    # Regla: interes == "Sí", confirm_interes == True, objetivo == "Cobranza", estado == True
+    if interes_positivo and confirm_interes and objetivo_llamada in ["cobranza", "cobranzas"] and estado_llamada:
+        logging.info(f"[COBRANZAS] ¡JACKPOT! El cliente {nombre_cliente} mostró interés sólido. Enviando a Bitrix...")
+        
+        # Preparamos el payload que le mandaremos al CRM
+        datos_bitrix = {
+            "nombre": nombre_cliente,
+            "correo": destinatario,
+            "telefono": var_in.Contacto,
+            "tipo_interes": var_ex.tipo_interes,
+            "objetivo": var_ex.objetivo,
+            "razon": var_ex.razon_cliente,
+            "autoriza_contacto": autori_contacto
+        }
+        logging.info(f"[COBRANZAS] Payload para Bitrix: {datos_bitrix}")
+        
+        try:
+            # Invocamos el servicio de Bitrix
+            bitrix_response = await registrar_en_bitrix(datos_bitrix["telefono"], datos_bitrix["objetivo"])
+            
+            logging.info(f"[COBRANZAS] Respuesta de Bitrix: {bitrix_response}")
+            
+            if bitrix_response.get("status") == "success":
+                logging.info(f"[COBRANZAS] Cliente registrado en Bitrix con éxito. ID: {bitrix_response.get('lead_id')}")
+                return {
+                    "status": "success",
+                    "message": "Cliente interesado, registrado en Bitrix.",
+                    "accion": "registro_bitrix",
+                    "data": bitrix_response
+                }
+            else:
+                # Si Bitrix se cae, lo logueamos, pero no detenemos el mundo
+                logging.error(f"[COBRANZAS] Falló el registro en Bitrix: {bitrix_response}")
+                return {"status": "error", "message": "Falló Bitrix", "accion": "registro_bitrix"}
+                
+        except Exception as e:
+            logging.error(f"[COBRANZAS] Excepción al contactar Bitrix: {e}", exc_info=True)
+            return {"status": "error", "message": f"Error Bitrix: {e}"}
+
+
+    # [CONDICIÓN 2]: INTERÉS NEGATIVO O VACÍO -> SE VA POR CORREO
+    # Si llegó hasta aquí, significa que alguna de las variables falló (ej. no confirmó, o pidió más info sin confirmar).
+    else:
+        motivo_correo = "Falta de interés explícito o variables incompletas"
+        if not interes_positivo: motivo_correo = "Cliente indicó No interés"
+        elif not confirm_interes: motivo_correo = "No hubo confirmación de interés"
+        elif not estado_llamada: motivo_correo = "La llamada no finalizó en estado positivo"
+        
+        logging.info(f"[COBRANZAS] El cliente no cumple criterios para Bitrix ({motivo_correo}). Disparando correo de retención/información a {destinatario}...")
+        
+        primer_name = var_ex.primer_name or nombre_cliente
+
+        try:
+            # Enviamos el correo
+            if destinatario:
+                primer_name = var_ex.primer_name or "Cliente One2credit"
+                link_whatsapp = "https://wa.me/573182856386"
+                
+                try:
+                    respuesta_correo = await enviar_correo_renovacion(
+                        destinatario=destinatario,
+                        nombre=primer_name,
+                        semestre=getattr(var_in, "SEMESTRE", ""),
+                        link_asesor=link_whatsapp
+                    )
+                    
+                    if respuesta_correo.get("status") == "success":
+                        logging.info(f"✅ Correo enviado a {destinatario}")
+                        await info_notify(
+                            method_name="procesar_llamada_renovacionYrefinanciamiento",
+                            client_id=nombre_cliente,
+                            info_message=f"Correo informativo enviado a {destinatario}"
+                        )
+                        
+                        return {
+                            "status": "success",
+                            "message": "Correo informativo enviado exitosamente."
+                        }
+                        
+                    else:
+                        error_msg = f"No se envió correo: {respuesta_correo.get('message')}"
+                        logging.error(f"❌ {error_msg}")
+                        await error_notify(
+                            method_name="procesar_llamada_renovacionYrefinanciamiento",
+                            client_id=nombre_cliente,
+                            error_message=error_msg
+                        )
+                        
+                        return {
+                            "status": "error",
+                            "message": error_msg,
+                        }
+                        
+                except Exception as e:
+                    error_msg = f"Error al enviar correo: {e}"
+                    logging.error(f"❌ {error_msg}", exc_info=True)
+                    await error_notify(
+                        method_name="procesar_llamada_renovacionYrefinanciamiento",
+                        client_id=nombre_cliente,
+                        error_message=error_msg
+                    )
+            
+            if respuesta_correo.get("status") != "success":
+                logging.error(f"[COBRANZAS] Fallo al enviar correo: {respuesta_correo}")
+                return {"status": "error", "message": "Fallo en proveedor de correos"}
+                
+            logging.info(f"[COBRANZAS] Correo enviado exitosamente a {destinatario}.")
+            
+            # Guardamos en nuestra BD interna el registro del flujo
+            numero_telefono_input = getattr(var_in, "Contacto", None)
+            if numero_telefono_input:
+                try:
+                    flujo_id = await insertar_flujo_correo_post_agente(
+                        nombre_cliente=nombre_cliente,
+                        correo_enviado=destinatario,
+                        numero_telefono=numero_telefono_input,
+                        linea_universitaria=var_ex.objetivo or "COBRANZAS",
+                    )
+                    logging.info(f"[COBRANZAS] Registro en BD exitoso. Flujo ID: {flujo_id}")
+                except Exception as bd_err:
+                    logging.error(f"[COBRANZAS] Correo enviado, pero BD falló: {bd_err}")
+            
+            return {
+                "status": "success",
+                "message": f"Correo enviado. Razón: {motivo_correo}",
+                "accion": "envio_correo",
+                "correo_enviado": True,
+                "destinatario": destinatario
+            }
+            
+        except Exception as e:
+            logging.error(f"[COBRANZAS] Excepción al enviar correo: {e}", exc_info=True)
+            return {"status": "error", "message": f"Fallo interno al enviar correo: {e}"}

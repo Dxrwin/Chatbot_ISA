@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from utils.notify_error import error_notify, get_cached_logs,send_log_email, send_log_telegram,info_notify
-from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar, procesar_llamada_renovacion_Y_refinanciamiento
+from utils.enviar_correo_IA import procesar_webhook_renovacion, procesar_webhook_webinar, procesar_llamada_renovacion_Y_refinanciamiento, procesar_webhook_cobranzas
 from utils.auth import obtener_token
 from utils.external_client import ExternalClient
 from fastapi.encoders import jsonable_encoder
@@ -213,12 +213,13 @@ async def check_server_restart(request: Request, call_next):
 
 # Mensajes amigables para el cliente
 MENSAJES_CLIENTE = {
-    "error_conexion": "Lo sentimos, en este momento no podemos procesar tu solicitud. Por favor intenta nuevamente en unos minutos.",
-    "error_datos": "Los valores ingresados no son válidos. Por favor verifica que el monto y la cuota inicial sean números válidos.",
-    "error_servicio": "En este momento nuestro servicio no está disponible. Por favor intenta más tarde.",
-    "error_simulacion": "No pudimos completar la simulación de tu crédito. Por favor verifica los datos e intenta nuevamente.",
-    "cuotas_no_encontradas": "No se pudo obtener el detalle de las cuotas para tu crédito. Por favor intenta nuevamente.",
-    "error_general": "Hubo un problema al procesar tu solicitud. Por favor intenta nuevamente más tarde."
+    "error_conexion": "En este momento tenemos intermitencias con nuestro proveedor. Por favor, dale unos minutos y vuelve a intentarlo.",
+    "error_servicio": "Nuestro sistema está en mantenimiento o temporalmente fuera de servicio. No eres tú, somos nosotros. Intenta más tarde.",
+    "error_datos": "Parece que hay un error en los montos ingresados. Verifica que el valor del crédito y la cuota inicial sean números válidos.",
+    "perfil_incompleto": "Para poder crear tu crédito, necesitamos que completes tu perfil. Faltan datos obligatorios.",
+    "error_simulacion": "Logramos registrar tu solicitud, pero tuvimos un hipo al generar tu plan de pagos. Por favor, actualiza la página o intenta nuevamente.",
+    "cuotas_no_encontradas": "El crédito se generó, pero el proveedor no nos devolvió tu tabla de cuotas. Nuestro equipo de soporte ya fue notificado.",
+    "error_general": "Ocurrió un error inesperado al procesar tu crédito. Por favor, contacta a soporte si el problema persiste."
 }
 
 MENSAJES_USUARIO = {
@@ -856,28 +857,34 @@ async def webhook_product_lines(
     """
     MAX_RETRIES = 3  # numero maximo de intentos
     RETRY_DELAY = 5  # segundos entre intentos (base)
-    TIMEOUT = 0     # timeout en segundos por solicitud
+    TIMEOUT = 15.0     # timeout en segundos por solicitud
 
     method_name = "product-lines"
     parent_id_notify_error = f"parent_id para la busqueda del la linea={parent_id}"
     target_slug = slugify_nombre(name) if name else ""
+    
+    
+    
+    
 
     try:
+        
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             access_token = await obtener_token(client)
             if not access_token:
-                msg = "No se pudo obtener el token de acceso"
-                await error_notify(method_name, parent_id_notify_error, msg)
-                return {
-                    "estado": "error",
-                    "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                    "detalles_usuario": "No se pudo obtener el token de acceso. Por favor intenta nuevamente mas tarde."
-                }
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "estado": "error",
+                        "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                        "detalles_usuario": "No se pudo obtener el token de acceso interno."
+                    }
+                )
 
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": ORG_ID,
-                "Authorization": f"{access_token}"
+                "Authorization": access_token
             }
 
             # Servicio externo para listar lineas (configurado en BD)
@@ -886,7 +893,10 @@ async def webhook_product_lines(
                 ext_client = await ExternalClient.from_code("KUENTA_LINES_LIST", client_id=parent_id)
             except ValueError:
                 ext_client = None
-
+                
+            lines_data = []
+            fetch_exitoso = False
+            
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     if ext_client:
@@ -896,226 +906,230 @@ async def webhook_product_lines(
                             "Config-Organization-ID": ORG_ID,
                             "access_token": access_token
                         })
-
                         # Asignar URL si no está definida
                         if not ext_client.url:
                             ext_client.set_url(API_URL)
-
+                            
                         response = await ext_client.run()
                         
-                        logger.info(f"Respuesta recibida de API externa en intento {attempt}: {response} \n")
-                        
                         if not isinstance(response, dict):
-                            raise Exception("Respuesta invalida del servicio externo")
-                        status_code = response.get("status")
-                        
-                        if not isinstance(status_code, int):
-                            raise Exception("Respuesta de servicio sin status valido")
-                        
-                        
-                        if status_code == 401:
+                            raise Exception("Respuesta inválida del ExternalClient")
                             
-                            if status_code == 401 and attempt < MAX_RETRIES:
-                                logger.warning(f"Intento {attempt}: respuesta de API externa: {response}.")
-                                await asyncio.sleep(RETRY_DELAY * attempt)
-                                continue
-                            
-                            else:
-                            
-                                error_traceback = traceback.format_exc()
-                                error_detail = response.get("data")
-                                logger.error(f"Error HTTP {status_code} en API externa: {error_detail}")
-                                await error_notify(
-                                    method_name,
-                                    parent_id_notify_error,
-                                    f"Error en API externa: {error_detail} error capturado: {status_code}"
-                                )
-                                await insertar_log(
-                                    method_name=method_name,
-                                    client_id=parent_id_notify_error,
-                                    error_message=f"Error en API externa: {error_detail} error capturado: {status_code}",
-                                    http_code=status_code,
-                                    tipo="error",
-                                    traceback_str=error_traceback
-                                )
-                                return {
-                                    "estado": "error",
-                                    "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                                    "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
-                                }
-                        elif status_code == 504 and attempt < MAX_RETRIES:
-                            logger.warning(f"Intento {attempt}: Timeout en API externa: {response}. \n")
-                            await asyncio.sleep(RETRY_DELAY * attempt)
-                            continue
-
-                        data = response.get("data") or {}
-                        
-                        #logger.info(f"Respuesta 'data' de API externa: {data} \n")
-                        
-                        if not isinstance(data, dict):
-                            data = {}
+                        status_code = response.get("status", 500)
+                        data = response.get("data", {})
                     else:
                         response = await client.get(API_URL, headers=headers)
-                        response.raise_for_status()
-                        data = response.json()
-                    #logger.info(f"Respuesta recibida de API para buscar la linea: {data}")
-                    lines = data.get("data", {}).get("lines", [])
-
-                    candidates = []
-                    for line in lines:
-                        if line.get("archived"):
-                            continue
-                        if entity_id and line.get("entityID") != entity_id:
-                            continue
-                        if product_type is not None and line.get("productType") != product_type:
-                            continue
-                        if tipo is not None and line.get("type") != tipo:
-                            continue
-
-                        parent_match = line.get("parentId") == parent_id
-                        slug_name = slugify_nombre(line.get("name", ""))
-                        slug_title = slugify_nombre(line.get("title", ""))
-                        slug_match = bool(target_slug) and (slug_name == target_slug or slug_title == target_slug)
-
-                        if not (parent_match or slug_match):
-                            continue
-
-                        candidates.append({
-                            "line": line,
-                            "matched_by": "parentId" if parent_match else "slug"
-                        })
-
-                    # Coincidencias parciales para rescate (si nada exacto)
-                    if not candidates and target_slug:
-                        for line in lines:
-                            if line.get("archived"):
-                                continue
-                            if entity_id and line.get("entityID") != entity_id:
-                                continue
-                            slug_name = slugify_nombre(line.get("name", ""))
-                            slug_title = slugify_nombre(line.get("title", ""))
-                            if target_slug in slug_name or target_slug in slug_title:
-                                candidates.append({"line": line, "matched_by": "partial-slug"})
-
-                    if not candidates:
-                        msg = f"No se encontro la linea con parentId {parent_id} ni slug {target_slug}"
-                        await error_notify(method_name, parent_id_notify_error, msg)
-                        sugerencias = [slugify_nombre(l.get("name", "")) for l in lines][:10]
-                        #insertar log del error en la base de datos
+                        status_code = response.status_code
+                        data = response.json() if response.text else {}
+                        
+                    
+                    if status_code in (200, 201):
+                        fetch_exitoso = True
+                        lines_data = data.get("data", {}).get("lines", []) if ext_client else data.get("lines", [])
+                        break  
+                    
+                    # CASO TIMEOUT O ERROR DE SERVIDOR
+                    elif status_code in (504, 503, 502, 500):
+                        #notificaciones
+                        await error_notify(method_name, parent_id_notify_error, f"Error del servidor (HTTP {status_code}) en intento {attempt}")
                         await insertar_log(
                             method_name=method_name,
                             client_id=parent_id_notify_error,
-                            error_message=msg,
-                            http_code=404,
+                            error_message=f"Error del servidor (HTTP {status_code}) en intento {attempt}",
+                            http_code=status_code,
                             tipo="error"
                         )
                         
-                        return {
-                            "estado": "error",
-                            "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                            "detalles_usuario": "No se encontro la linea de producto solicitada. Verifica el nombre o intenta mas tarde.",
-                            "sugerencias": sugerencias
-                        }
+                        logger.warning(f"Intento {attempt}: Kuenta no responde (HTTP {status_code}).")
+                        if attempt < MAX_RETRIES:
+                            await asyncio.sleep(RETRY_DELAY * attempt)
+                            continue
+                        
+                    # ERROR 401/403 (AUTH) O 400 (CLIENTE)
+                    else:
+                        #notificaciones
+                        await error_notify(method_name, parent_id_notify_error, f"Error HTTP {status_code} en API externa: {data}")
+                        
+                        await insertar_log(
+                            method_name=method_name,
+                            client_id=parent_id_notify_error,
+                            error_message=f"Error HTTP {status_code} en API externa: {data}",
+                            http_code=status_code,
+                            tipo="error"
+                        )
+                        
+                        
+                        logger.error(f"Error HTTP {status_code} en API externa: {data}")
+                        if attempt < MAX_RETRIES and status_code == 401:
+                            # Podrías renovar el token aquí si quisieras
+                            await asyncio.sleep(RETRY_DELAY)
+                            continue
+                        raise HTTPException(
+                            status_code=502, # Es un 502 Bad Gateway porque el proveedor falló
+                            detail={"estado": "error", "mensaje": MENSAJES_CLIENTE["error_servicio"]}
+                        )
 
-                    def parse_updated(val: str):
-                        try:
-                            return datetime.fromisoformat(val.replace("Z", "+00:00"))
-                        except Exception:
-                            return datetime.min
-
-                    candidates.sort(
-                        key=lambda item: (
-                            parse_updated(item["line"].get("updatedAt")),
-                            item["line"].get("version", 0)
-                        ),
-                        reverse=True
-                    )
-
-                    selected = candidates[0]
-                    line = selected["line"]
-
-                    logger.info(f"Linea encontrada via {selected['matched_by']}: {line}")
-                    return {
-                        "id": line.get("id"),
-                        "name": line.get("name"),
-                        "title": line.get("title"),
-                        "parentId": line.get("parentId"),
-                        "version": line.get("version"),
-                        "matched_by": selected["matched_by"],
-                        "principalMin": line.get("principalMin"),
-                        "principalMax": line.get("principalMax"),
-                        "timeMin": line.get("timeMin"),
-                        "timeMax": line.get("timeMax"),
-                        "timeDefault": line.get("timeDefault"),
-                        "paymentFrequency": line.get("paymentFrequency"),
-                    }
-
-                except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
-                    logger.warning(f"Intento {attempt}/{MAX_RETRIES} fallido por timeout o conexion: {e}")
-                    await error_notify(method_name, parent_id_notify_error, f"Intento {attempt} error capturado: {e}")
-                    #insertar log del error en la base de datos
+                except (httpx.TimeoutException, httpx.RequestError, Exception) as e:
+                    #notifiaciones
+                    await error_notify(method_name, parent_id_notify_error, f"Error de red en intento {attempt}: {str(e)}")
                     await insertar_log(
                         method_name=method_name,
                         client_id=parent_id_notify_error,
-                        error_message=f"Intento {attempt} error capturado: {e}",
-                        http_code=0,
-                        tipo="error"
-                    )
-                    if attempt == MAX_RETRIES:
-                        return {
-                            "estado": "error",
-                            "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                            "detalles_usuario": "No se pudo conectar con el servicio externo. Por favor intenta nuevamente mas tarde."
-                        }
-                    await asyncio.sleep(RETRY_DELAY * attempt)
-
-                except httpx.HTTPStatusError as e:
-                    error_traceback = traceback.format_exc()
-                    logger.error(f"Error HTTP {e.response.status_code} en API externa: {e.response.text}")
-                    await error_notify(method_name, parent_id_notify_error, f"Error en API externa: {e.response.text} error capturado: {e}")
-                    #insertar log del error en la base de datos
-                    await insertar_log(
-                        method_name=method_name,
-                        client_id=parent_id_notify_error,
-                        error_message=f"Error en API externa: {e.response.text} error capturado: {e}",
-                        http_code=e.response.status_code,
+                        error_message=f"Error de red en intento {attempt}: {str(e)}",
+                        http_code=500,
                         tipo="error",
-                        traceback_str=error_traceback
+                        traceback_str=traceback.format_exc()
                     )
-                    if 500 <= e.response.status_code < 600 and attempt < MAX_RETRIES:
+                    
+                    logger.warning(f"Intento {attempt} fallido por error de red: {e}")
+                    if attempt < MAX_RETRIES:
                         await asyncio.sleep(RETRY_DELAY * attempt)
                         continue
-                    return {
+                    
+            if not fetch_exitoso:
+                msg = f"Timeout persistente o caída al consultar API externa tras {MAX_RETRIES} intentos."
+                logger.error(msg)
+                await error_notify(method_name, parent_id, msg)
+                
+                
+                raise HTTPException(
+                    status_code=504, # Gateway Timeout
+                    detail={
                         "estado": "error",
-                        "mensaje": MENSAJES_CLIENTE["error_servicio"],
-                        "detalles_usuario": "El servicio externo no esta disponible. Por favor intenta mas tarde."
+                        "mensaje": MENSAJES_CLIENTE["error_conexion"],
+                        "detalles_usuario": "El servicio tardó demasiado en responder. Intenta más tarde."
                     }
+                )
 
-            msg = "Error persistente al consultar API externa"
-            await error_notify(method_name, parent_id_notify_error, msg)
+            
+            # LÓGICA DE FILTRADO Y BÚSQUEDA
+
+            candidates = []
+            for line in lines_data:
+                if line.get("archived"):
+                    continue
+                if entity_id and line.get("entityID") != entity_id:
+                    continue
+                if product_type is not None and line.get("productType") != product_type:
+                    continue
+                if tipo is not None and line.get("type") != tipo:
+                    continue
+
+                parent_match = line.get("parentId") == parent_id
+                slug_name = slugify_nombre(line.get("name", ""))
+                slug_title = slugify_nombre(line.get("title", ""))
+                slug_match = bool(target_slug) and (slug_name == target_slug or slug_title == target_slug)
+
+                if parent_match or slug_match:
+                    candidates.append({
+                        "line": line,
+                        "matched_by": "parentId" if parent_match else "slug"
+                    })
+
+            #  Rescate por coincidencia parcial si no hay exactos
+            if not candidates and target_slug:
+                for line in lines_data:
+                    if line.get("archived") or (entity_id and line.get("entityID") != entity_id):
+                        continue
+                    slug_name = slugify_nombre(line.get("name", ""))
+                    slug_title = slugify_nombre(line.get("title", ""))
+                    
+                    if target_slug in slug_name or target_slug in slug_title:
+                        candidates.append({"line": line, "matched_by": "partial-slug"})
+
+            #  No encontramos la línea
+            if not candidates:
+                sugerencias = [slugify_nombre(l.get("name", "")) for l in lines_data][:10]
+                #notificaciones
+                await error_notify(method_name, parent_id_notify_error, f"Línea de producto no encontrada para parent_id={parent_id} con name='{name}' y entity_id='{entity_id}'. Sugerencias: {sugerencias}")
+                await insertar_log(
+                    method_name=method_name,
+                    client_id=parent_id_notify_error,
+                    error_message=f"Línea de producto no encontrada para parent_id={parent_id} con name='{name}' y entity_id='{entity_id}'. Sugerencias: {sugerencias}",
+                    http_code=404,
+                    tipo="error"
+                )
+                # Lanzamos un 404 (Not Found) real
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "estado": "error",
+                        "mensaje": "Línea de producto no encontrada.",
+                        "detalles_usuario": "Verifica el nombre o ID ingresado.",
+                        "sugerencias": sugerencias
+                    }
+                )
+
+            
+            #ORDENAR Y RETORNAR EL MEJOR CANDIDATO
+           
+            def parse_updated(val: str):
+                try:
+                    return datetime.fromisoformat(val.replace("Z", "+00:00"))
+                except Exception:
+                    return datetime.min
+
+            candidates.sort(
+                key=lambda item: (
+                    parse_updated(item["line"].get("updatedAt", "")),
+                    item["line"].get("version", 0)
+                ),
+                reverse=True
+            )
+
+            selected = candidates[0]
+            line = selected["line"]
+
+            logger.info(f"Línea encontrada vía {selected['matched_by']}: {line.get('id')}")
+            
+            # Este SÍ es un 200 OK legítimo
             return {
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "No se pudo obtener respuesta del servicio externo. Por favor intenta mas tarde."
+                "id": line.get("id"),
+                "name": line.get("name"),
+                "title": line.get("title"),
+                "parentId": line.get("parentId"),
+                "version": line.get("version"),
+                "matched_by": selected["matched_by"],
+                "principalMin": line.get("principalMin"),
+                "principalMax": line.get("principalMax"),
+                "timeMin": line.get("timeMin"),
+                "timeMax": line.get("timeMax"),
+                "timeDefault": line.get("timeDefault"),
+                "paymentFrequency": line.get("paymentFrequency"),
             }
 
-    except Exception as e:
-        error_traceback = traceback.format_exc()
-        logger.error(f"Error general en webhook_product_lines: {e}")
-        await error_notify(method_name, parent_id_notify_error, f"Error general: {e}")
+   
+    # MANEJO GLOBAL DE ERRORES PARA EL ENDPOINT
+    
+    except HTTPException as http_exc:
+        # Pasa de largo las excepciones controladas para que FastAPI ponga el código HTTP correcto
+        #notificaciones
+        await error_notify(method_name, parent_id_notify_error, f"HTTPException lanzada: {http_exc.detail}")
         await insertar_log(
             method_name=method_name,
             client_id=parent_id_notify_error,
-            error_message=f"Error general: {e}",
-            http_code=500,
-            tipo="error",
-            traceback_str=error_traceback
+            error_message=f"HTTPException lanzada: {http_exc.detail}",
+            http_code=http_exc.status_code,
+            tipo="error"
         )
-        return {
-            "estado": "error",
-            "mensaje": MENSAJES_CLIENTE["error_general"],
-            "detalles_usuario": "Ocurrio un error inesperado. Por favor intenta nuevamente mas tarde."
-        }
+        raise http_exc
+
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Error general en webhook_product_lines: {e}", exc_info=True)
+        await error_notify(method_name, parent_id, f"Error general: {e}")
+        await insertar_log(
+            method_name=method_name, client_id=parent_id, 
+            error_message=str(e), http_code=500, tipo="error", traceback_str=error_traceback
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "estado": "error",
+                "mensaje": MENSAJES_CLIENTE["error_general"],
+                "detalles_usuario": "Ocurrió un error inesperado buscando las líneas. Intenta más tarde."
+            }
+        )
 
 
 def format_currency(value: float) -> str:
@@ -1232,6 +1246,32 @@ def extract_missing_fields_info(missing_fields: list) -> dict:
         "optional_labels": optional_labels,
         "by_category": by_category
     }
+    
+def extraer_campos_faltantes(kuenta_response: dict) -> dict:
+    """
+    Parsea la respuesta 400 de Kuenta y extrae los campos faltantes 
+    para armar un mensaje dinámico y masticable para el frontend.
+    """
+    data = kuenta_response.get("data", {})
+    missing_fields_raw = data.get("missingFields", [])
+    
+    campos_faltantes = []
+    
+    for item in missing_fields_raw:
+        if item.get("required") is True:
+            field_info = item.get("field", {})
+            nombre_tecnico = field_info.get("name", "desconocido")
+            nombre_amigable = field_info.get("label", item.get("label", nombre_tecnico))
+            campos_faltantes.append(nombre_amigable)
+            
+    mensaje_directo = kuenta_response.get("message", "Error de validación")
+    mensaje_front = f"Faltan completar estos datos: {', '.join(campos_faltantes)}." if campos_faltantes else "Faltan datos en tu perfil."
+    
+    return {
+        "mensaje_crudo": mensaje_directo,
+        "nombres_amigables": campos_faltantes,
+        "mensaje_frontend": mensaje_front
+    }
 
 
 @app.post("/payables/{client_id}")
@@ -1296,13 +1336,11 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
-            last_error_response = None
+            #last_error_response = None
 
             for attempt in range(max_retries):
-
                 try:
                     logger.info(f"Intento {attempt+1}/{max_retries}: POST a {PAYABLE_URL}")
-
                     response_data = {}
 
                     # valida las configuraciones del servicio externo que se obtuvieron de la base de datos
@@ -1353,158 +1391,112 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                     #logger.info(f"   Response Data: {str(response_data)}")
                     
-                    # ===== CASO 1: ÉXITO (201) =====
-                    if status_code == 201 or status_code == 200:
-                        #logger.info("Payable creado exitosamente (HTTP 201)")
+                    # ===== CASO 1: ÉXITO (200 o 201) =====
+                    if status_code in (200, 201):
                         credit = response_data.get("data", {}).get("credit", {})
-                        
-                        #logger.info(f"Respuesta completa de Kuenta: {str(credit)}")
                         response_credit_id = credit.get("ID")
-                        #logger.info(f"ID Crédito: {response_credit_id}")
-                        logger.info(f"Response: HTTP {status_code}, \n ID del credito: {response_data.get('data', {}).get('credit', {}).get('ID', 'no se pudo obtener ID')}")
-                        break  # Salir del loop de reintentos
+                        logger.info(f"Response: HTTP {status_code}, \n ID del credito: {response_credit_id}")
+                        break  # ¡Salió bien! Rompemos el ciclo.
                     
-                    # ===== CASO 2: ERROR 400 =====
-                    elif status_code == 400:
-                        error_traceback = traceback.format_exc()
-                        error_response = response_data
-                        last_error_response = error_response
+                    # ===== CASO 2: ERROR DEL CLIENTE O REGLA DE NEGOCIO (400, 409, 422) =====
+                    elif status_code in (400, 409, 422):
+                        error_code = response_data.get("data", {}).get("code", "Unknown")
+                        error_message = response_data.get("data", {}).get("message", "Unknown")
                         
-                        error_code = error_response.get("data", {}).get("code")
-                        error_message = error_response.get("data", {}).get("message", "Unknown")
-                        missing_fields = error_response.get("data", {}).get("missingFields", [])
+                        logger.error(f"HTTP {status_code} - Code: {error_code}, Msg: {error_message}")
                         
-                        logger.error(f"HTTP 400 Error: code={error_code}")
-                        logger.error(f"   Mensaje: {error_message}")
-                        await error_notify(method_name, client_id, f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message}")
-                        #insertar log del error en la base de datos
-                        await insertar_log(
-                            method_name=method_name,
-                            client_id=client_id,
-                            error_message=f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message}",
-                            http_code=400,
-                            tipo="error",
-                            traceback_str=error_traceback
-                        )
-                        # ===== SUB-CASO: PERFIL INCOMPLETO =====
+                        #Lógica de traducción para el Frontend
+                        mensaje_amigable = MENSAJES_CLIENTE["error_datos"]
+                        detalles_usuario = error_message
+                        
+                        # Si es IncompleteProfile, usamos nuestra navaja suiza utilitaria
                         if error_code == "IncompleteProfile":
-                            logger.error(f"PERFIL INCOMPLETO DETECTADO")
+                            mensaje_amigable = MENSAJES_CLIENTE["perfil_incompleto"]
+                            analisis = extraer_campos_faltantes(response_data)
+                            detalles_usuario = analisis["mensaje_frontend"]
+
+
+                            logger.error(f"HTTP {status_code} Error: code={error_code}. Mensaje: {error_message}")
                             
-                            # Extraer información legible
-                            missing_info = extract_missing_fields_info(missing_fields)
+                            await error_notify(method_name, client_id, f"Error {status_code}: {error_message}, el cliente tiene el perfil incompleto, id del cliente: {client_id}")
                             
-                            logger.error(f"   Total campos faltantes: {missing_info['total']}")
-                            logger.error(f"   Obligatorios: {missing_info['required_count']}")
-                            logger.error(f"   Opcionales: {missing_info['optional_count']}")
-                            logger.error(f"   Campos: {', '.join(missing_info['required_labels'])}")
-                            
-                            # Notificar
-                            error_msg = f"Perfil incompleto. Faltan {missing_info['required_count']} campos obligatorios: {', '.join(missing_info['required_labels'])} error_completo: {error_response}"
-                            await error_notify(method_name, client_id, error_msg)
-                            #insertar log del error en la base de datos
                             await insertar_log(
                                 method_name=method_name,
                                 client_id=client_id,
-                                error_message=f"Perfil incompleto en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message}",
-                                http_code=400,
-                                tipo="error"
+                                error_message=f"Error HTTP {status_code}: {error_message}",
+                                http_code=status_code,
+                                tipo="error",
+                                traceback_str=None
                             )
-
-                            # NO reintentar - es un problema del cliente
-                            raise HTTPException(
-                                status_code=409,
-                                detail={
-                                    "error": "IncompleteProfile",
-                                    "message": "El perfil del cliente está incompleto en Kuenta",
-                                    "required_fields_count": missing_info['required_count'],
-                                    "required_fields": missing_info['required_labels'],
-                                    "optional_fields": missing_info['optional_labels'],
-                                    "by_category": missing_info['by_category'],
-                                    "instruction": "Complete los datos faltantes en la plataforma Kuenta"
+                            
+                            return JSONResponse(
+                                status_code=200, #Le decimos 200 OK para que el nodo pase feliz
+                                content={
+                                    "estado": "error", # Pero aquí le decimos la cruda verdad
+                                    "http_real": status_code, # El código real del error para que el frontend pueda reaccionar
+                                    "codigo_tecnico": error_code,
+                                    "mensaje": mensaje_amigable,
+                                    "detalles_usuario": detalles_usuario
                                 }
                             )
                         
-                        # ===== SUB-CASO: OTRO ERROR 400 =====
-                    elif status_code == 400:
-                        error_response = response_data
-                        last_error_response = error_response
+                        # # FAIL FAST: NO TIENE SENTIDO REINTENTAR ESTO. 
+                        # # Lanzamos la excepción de una vez para que el usuario corrija los datos.
+                        # raise HTTPException(
+                        #     status_code=400, 
+                        #     detail={
+                        #         "estado": "error",
+                        #         "codigo_tecnico": error_code,
+                        #         "mensaje": mensaje_amigable,
+                        #         "detalles_usuario": detalles_usuario
+                        #     }
+                        # )
                         
-                        error_code = error_response.get("data", {}).get("code")
-                        error_message = error_response.get("data", {}).get("message", "Unknown")
-                        missing_fields = error_response.get("data", {}).get("missingFields", [])
-                        # Notificar si es estatus 400 no manejado
-                        await error_notify(method_name, client_id, 
-                            f"Error 400 en API Kuenta, error completo: {error_response}, code={error_code}, message={error_message} error completo: {last_error_response}")
-                    
-                    # ===== CASO 2B: ERROR 403 (FORBIDDEN - TOKEN INVÁLIDO) =====
-                    elif status_code == 403:
-                        error_traceback = traceback.format_exc()
-                        error_response = response_data
-                        last_error_response = error_response
                         
-                        logger.error(f"HTTP 403 Forbidden: Token inválido o expirado")
-                        logger.error(f"   Respuesta: {error_response}")
-                        await error_notify(method_name, client_id, 
-                            f"Error 403 en API Kuenta: Token inválido o sin autorización. Error completo: {error_response}")
-                        
-                        # Insertar log del error en la base de datos
+                    # ===== CASO 3: ERROR DE AUTENTICACIÓN (401) =====
+                    elif status_code in (401, 403):
+                        logger.warning("Error de autorización. Intentando renovar token...")
                         await insertar_log(
                             method_name=method_name,
                             client_id=client_id,
-                            error_message=f"Error 403 en API Kuenta: Token inválido o sin autorización. Respuesta: {error_response}",
-                            http_code=403,
+                            error_message="Error de autorización",
+                            http_code=status_code,
                             tipo="error",
-                            traceback_str=error_traceback
+                            traceback_str=None
                         )
                         
-                        # Intentar obtener un nuevo token en el siguiente intento
                         if attempt < max_retries - 1:
-                            logger.info(f"Obteniendo nuevo token e intentando nuevamente...")
-                            try:
-                                token = await obtener_token(client)
-                                headers["Authorization"] = token
-                                logger.info("Token renovado exitosamente")
-                            except Exception as token_error:
-                                logger.error(f"Error al renovar token: {str(token_error)}")
-                                await error_notify(method_name, client_id, 
-                                    f"Error al renovar token de autorización: {str(token_error)}")
-                            
-                            wait_time = 2 ** attempt
-                            logger.info(f"Reintentando en {wait_time}s con nuevo token...")
-                            await asyncio.sleep(wait_time)
+                            token = await obtener_token(client)
+                            headers["Authorization"] = token
+                            if ext_client_post:
+                                ext_client_post.set_headers(headers)
+                            await asyncio.sleep(2 ** attempt)
+                            continue # Reintentamos con el nuevo token
                         else:
-                            # Si falló en el último intento, retornar error de autorización
-                            logger.error(f"Fallo de autorización tras {max_retries} intentos")
-                            raise HTTPException(
-                                status_code=401,  # Unauthorized - para que el cliente sepa que hay problema de credenciales
-                                detail={
-                                    "error": "UnauthorizedToken",
-                                    "message": "No se pudo obtener autorización para acceder a la API",
-                                    "instruction": "Por favor contacta con soporte técnico para verificar las credenciales de la API",
-                                    "last_error": error_response
-                                }
-                            )
-                        continue
-                    
-                    # ===== CASO 3: OTROS ERRORES (500, 503, etc) =====
+                            await error_notify(method_name, client_id, "Fallo de autorización tras 3 intentos")
+                            raise HTTPException(status_code=401, detail="Fallo de autorización tras 3 intentos")
+                        
+                        
+                    # ===== CASO 4: ERRORES DE SERVIDOR O DESCONOCIDOS (5XX) =====
                     else:
-                        logger.error(f"HTTP {status_code}")
-                        error_text = str(response_data) if ext_client_post else response.text
-                        logger.error(f"   Respuesta: {error_text[:200]}")
-                        
-                        await error_notify(method_name, client_id, 
-                            f"Error HTTP {status_code} en API Kuenta, error completo: {error_text[:500]},error completo: {last_error_response}")
-                        
-                        # Reintentar
+                        logger.error(f"Error del servidor Kuenta HTTP {status_code}: {response_data}")
+                        await error_notify(method_name, client_id, f"Error del servidor Kuenta HTTP {status_code}: {response_data}")
                         if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            logger.info(f"Reintentando en {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                        continue
+                            await asyncio.sleep(2 ** attempt)
+                            continue
                 
                 except httpx.TimeoutException as e:
+                    
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.info(f"Reintentando en {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    # Errores puros de red. Los registramos y reintentamos.
                     error_traceback = traceback.format_exc()
-                    logger.error(f"Intento {attempt+1}:TIMEOUT ({str(e)})")
+                    logger.error(f"Error de red en intento {attempt+1}: {str(e)}")
                     await error_notify(method_name, client_id, "Timeout en API Kuenta, excepción: " + str(e))
                     # insertar log del error en la base de datos
                     await insertar_log(
@@ -1515,157 +1507,85 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         tipo="error",
                         traceback_str=error_traceback
                     )
-                    
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Reintentando en {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        
-                except httpx.HTTPStatusError as e:
-                    error_traceback = traceback.format_exc()
-                    logger.error(f"Intento {attempt+1}: Error HTTP {e.response.status_code}")
-                    logger.error(f"   {e.response.text[:200]}")
-                    await error_notify(method_name, client_id,f"intento {attempt+1}: Error HTTP en API Kuenta: " + e.response.text[:200]+"excepción: " + str(e))
-                    # insertar log del error en la base de datos
-                    await insertar_log(
-                        method_name=method_name,
-                        client_id=client_id,
-                        error_message=f"Error HTTP {e.response.status_code} en API Kuenta, excepción: {str(e)}",
-                        http_code=e.response.status_code,
-                        tipo="error",
-                        traceback_str=error_traceback
-                    )
-                    
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Reintentando en {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        
-                except httpx.RequestError as e:
-                    logger.error(f"Intento {attempt+1}: 🔌 Error de conexión ({str(e)})")
-                    await error_notify(method_name, client_id, "Error de conexión en API Kuenta, excepción: " + str(e))
-                    # insertar log del error en la base de datos
-                    await insertar_log(
-                        method_name=method_name,
-                        client_id=client_id,
-                        error_message=f"Error de conexión en API Kuenta, excepción: {str(e)}",
-                        http_code=503,
-                        tipo="error"
-                    )
-                    
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        logger.info(f"Reintentando en {wait_time}s...")
-                        await asyncio.sleep(wait_time)
+                        await asyncio.sleep(2 ** attempt)
+                        continue
 
-                
+            
+            #Si el ciclo for terminó y no obtuvimos un ID, significa que se agotaron los reintentos
+            # y todo falló. Matamos el proceso aquí para no hacer un GET a `/payables/None`.
+            if not response_credit_id:
+                raise HTTPException(
+                    status_code=status_code or 500,
+                    detail={
+                        "estado": "error",
+                        "codigo": error_code,
+                        "detalles_usuario": error_message
+                    }
+                )
+            
             #realizar consulta inmediata para obtener la simulación del crédito creado
             logger.info(f"Payable creado con ID: {response_credit_id}, procediendo a obtener simulación...") 
             
             # ===== LOOP DE REINTENTOS PARA GET SIMULACIÓN (MÁXIMO 2 INTENTOS) =====
             max_retries_simulacion = 2
-            response_get_simulacion = None
             simulacion_data = {}
             status_code_simulacion = None
-            last_error_simulacion = None
-            ext_client_get = None
             
+            # Tratamos de armar el cliente externo para el GET
+            ext_client_get = None
+            try:
+                ext_client_get = await ExternalClient.from_code("KUENTA_PAYABLE_GET", client_id=client_id)
+            except ValueError:
+                pass
+
             for attempt_get in range(max_retries_simulacion):
                 try:
-                    # Intentar cargar configuración del servicio externo
-                    try:
-                        ext_client_get = await ExternalClient.from_code("KUENTA_PAYABLE_GET")
-                        logger.info(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Configuración de servicio externo para GET simulación cargada desde BD")
-                        
-                        # Agregar el ID del crédito al path
+                    if ext_client_get:
+                        # Armamos la ruta correcta inyectando el ID del crédito
                         ext_client_get.set_path(f"/{response_credit_id}")
                         ext_client_get.set_headers(headers)
-                        
                         if not ext_client_get.url:
-                            logger.error("La configuración del servicio externo para GET simulación no tiene URL definida")
-                            raise ValueError("URL no definida en configuración")
+                            ext_client_get.set_url(f"{PAYABLE_URL}") # Asegurar URL base
+                            
+                        res_simulacion = await ext_client_get.run()
                         
-                        # Ejecutar request con servicio externo
-                        response_get_simulacion = await ext_client_get.run()
+                        if not isinstance(res_simulacion, dict):
+                            raise Exception("Respuesta inválida en simulación externa")
                         
-                        if not isinstance(response_get_simulacion, dict):
-                            raise Exception("Respuesta invalida del servicio externo")
-                        
-                        status_code_simulacion = response_get_simulacion.get("status")
-                        simulacion_data = response_get_simulacion.get("data") or "no se encontro la data de la peticion"
-                        
-                    except (ValueError, Exception) as e:
-                        # Si falla el servicio externo, usar cliente HTTP directo
-                        logger.warning(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Usando cliente HTTP directo para GET simulación")
-                        response_get_simulacion = await client.get(
-                            f"https://api.kuenta.co/v1/payables/{response_credit_id}", 
-                            headers=headers
-                        )
-                        status_code_simulacion = response_get_simulacion.status_code
-                        simulacion_data = response_get_simulacion.json()
-                    
-                    logger.info(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Status code de la simulación obtenido: {status_code_simulacion}")
-                    
-                    # Si el status es exitoso, salir del loop
-                    if status_code_simulacion in [200, 201]:
+                        status_code_simulacion = res_simulacion.get("status", 500)
+                        simulacion_data = res_simulacion.get("data", {})
+                    else:
+                        res_simulacion = await client.get(f"{PAYABLE_URL}/{response_credit_id}", headers=headers)
+                        status_code_simulacion = res_simulacion.status_code
+                        simulacion_data = res_simulacion.json() if res_simulacion.text else {}
+
+                    # Éxito en la simulación
+                    if status_code_simulacion in (200, 201):
                         logger.info(f"GET simulación exitoso en intento {attempt_get + 1}")
                         break
+                    
+                    # Error en la simulación, dormimos 5s y reintentamos (tal vez Kuenta no la generó tan rápido)
                     else:
-                        # Si no es exitoso, guardar el error para reintentar
-                        last_error_simulacion = simulacion_data
-                        logger.warning(f"GET simulación falló con status {status_code_simulacion}, reintentando...")
-                        
-                        # Esperar 5 segundos antes de reintentar (solo si no es el último intento)
+                        logger.warning(f"GET simulación status {status_code_simulacion}. Reintentando...")
                         if attempt_get < max_retries_simulacion - 1:
-                            logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
                             await asyncio.sleep(5)
+                            continue
+                        
+                except (httpx.TimeoutException, httpx.RequestError, Exception) as e:
+                    logger.error(f"Fallo de conexión en GET simulación: {str(e)}")
+                    if attempt_get < max_retries_simulacion - 1:
+                        await asyncio.sleep(5)
                         continue
-                
-                except httpx.HTTPStatusError as e:
-                    last_error_simulacion = str(e.response.text)
-                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error HTTP {e.response.status_code} en GET simulación")
-                    
-                    if attempt_get < max_retries_simulacion - 1:
-                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
-                        await asyncio.sleep(5)
-                    continue
-                
-                except httpx.RequestError as e:
-                    last_error_simulacion = str(e)
-                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error de conexión en GET simulación: {str(e)}")
-                    
-                    if attempt_get < max_retries_simulacion - 1:
-                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
-                        await asyncio.sleep(5)
-                    continue
-                
-                except Exception as e:
-                    last_error_simulacion = str(e)
-                    logger.error(f"Intento {attempt_get + 1}/{max_retries_simulacion}: Error general en GET simulación: {str(e)}")
-                    
-                    if attempt_get < max_retries_simulacion - 1:
-                        logger.info(f"Esperando 5 segundos antes de reintentar GET simulación...")
-                        await asyncio.sleep(5)
-                    continue
-            
-            # Validar si la consulta GET fue exitosa
-            if status_code_simulacion not in [200, 201] or not simulacion_data:
-                logger.error(f"FALLO: No se obtuvo la simulación tras {max_retries_simulacion} intentos")
-                await error_notify(method_name, client_id, 
-                    f"Error al consultar simulación tras {max_retries_simulacion} intentos: {last_error_simulacion}")
-                await insertar_log(
-                    method_name=method_name,
-                    client_id=client_id,
-                    error_message=f"Error al consultar simulación tras {max_retries_simulacion} intentos: {last_error_simulacion}",
-                    http_code=status_code_simulacion or 502,
-                    tipo="error"
-                )
+                        
+            if status_code_simulacion not in (200, 201) or not simulacion_data:
+                await error_notify(method_name, client_id, "Falló obtención de simulación")
                 raise HTTPException(
-                    status_code=status_code_simulacion or 502,
+                    status_code=502,
                     detail={
-                        "error": "SimulationRetrievalFailed",
-                        "message": f"No se pudo obtener la simulación del crédito tras {max_retries_simulacion} intentos",
-                        "last_error": last_error_simulacion
+                        "estado": "error",
+                        "mensaje": MENSAJES_CLIENTE["error_simulacion"],
+                        "detalles_usuario": "No pudimos descargar tu tabla de pagos."
                     }
                 )
             
@@ -1674,13 +1594,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== PROCESAR RESPUESTA EXITOSA DE SIMULACIÓN =====
             try:
                 # Extraer datos de crédito de la respuesta
-                
-                
                 credits_data = simulacion_data.get("data", {}).get("credit")
-                
                 #tipo de dato puede ser lista o diccionario
                 logger.info(f"Tipo de dato de credits en la simulación: {type(credits_data)}")
-                
                 if isinstance(credits_data, list):
                     if not credits_data:
                         raise ValueError("Empty credits list in simulation response")
@@ -1771,7 +1687,10 @@ async def create_payable(client_id: str, payload: PayableRequest):
             
                 return response_data
             
-            except (KeyError, AttributeError, ValueError, IndexError) as e:
+            except Exception as e:
+                # Este bloque catch atrapa si la data de Kuenta cambió y nos rompe la extracción
+                logger.error(f"Error procesando JSON de simulación: {str(e)}")
+                
                 logger.error(f"Error extrayendo datos de simulación: {str(e)}")
                 await error_notify(method_name, client_id, 
                     f"Error procesando respuesta de simulación: {str(e)}")
@@ -1782,71 +1701,52 @@ async def create_payable(client_id: str, payload: PayableRequest):
                     http_code=500,
                     tipo="error"
                 )
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error procesando datos de simulación: {str(e)}"
-                )
+                raise HTTPException(status_code=500, detail=f"Error mapeando datos de simulación: {str(e)}")
     
-    except ValueError as e:
-        error_traceback = traceback.format_exc()
-        logger.error(f"Error de conversión de datos: {str(e)}")
+    # ==========================================================
+    # MANEJADORES GLOBALES DE EXCEPCIONES
+    # ==========================================================
+    #  MUY IMPORTANTE: Si ya lanzamos un HTTPException arriba (ej. el del error 400), 
+    # debemos dejar que pase de largo, si no, caerá en el 'except Exception' y se volverá un 500
+    except HTTPException as http_exc:
+        #notificaciones
+        await error_notify(method_name, client_id, f"HTTPException lanzada: {http_exc.detail}")
         await insertar_log(
             method_name=method_name,
             client_id=client_id,
-            error_message=f"Error de conversión de datos: {str(e)}",
-            http_code=400,
-            tipo="error",
-            traceback_str=error_traceback
+            error_message=f"HTTPException lanzada: {http_exc.detail}",
+            http_code=http_exc.status_code,
+            tipo="error"
         )
+        return JSONResponse(status_code=http_exc.status_code, content=http_exc.detail)
+
+    except ValueError as e:
+        logger.error(f"Error de conversión: {str(e)}")
         await error_notify(method_name, client_id, f"Error de conversión: {str(e)}")
+        await insertar_log(method_name=method_name, client_id=client_id, error_message=str(e), http_code=400, tipo="error")
         return JSONResponse(
             status_code=400,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_datos"],
-                "detalles_usuario": "Recuerda ingresar solo números en los campos de monto y cuota inicial."
+                "detalles_usuario": "Se detectó un valor numérico incorrecto en el proceso."
             }
         )
-        
-    except httpx.RequestError as e:
-        error_traceback = traceback.format_exc()
-        logger.error(f"Error de conexión: {str(e)}")
-        await insertar_log(
-            method_name=method_name,
-            client_id=client_id,
-            error_message=f"Error de conexión: {str(e)}",
-            http_code=502,
-            tipo="error",
-            traceback_str=error_traceback
-        )
-        await error_notify(method_name, client_id, f"Error de conexión: {str(e)}")
-        return JSONResponse(
-            status_code=502,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_conexion"],
-                "detalles_usuario": "Nuestro servicio está experimentando problemas de conexión temporales."
-            }
-        )
-        
     except Exception as e:
+        # El catch-all final por si se nos cuela un IndexError, AttributeError, etc no previsto.
         error_traceback = traceback.format_exc()
-        logger.error(f"Error interno: {str(e)}", exc_info=True)
+        logger.error(f"Catástrofe interna: {str(e)}", exc_info=True)
+        await error_notify(method_name, client_id, f"Error inesperado: {str(e)}")
         await insertar_log(
-            method_name=method_name,
-            client_id=client_id,
-            error_message=f"Error interno: {str(e)}",
-            http_code=500,
-            tipo="error",
-            traceback_str=error_traceback
+            method_name=method_name, client_id=client_id, 
+            error_message=str(e), http_code=500, tipo="error", traceback_str=error_traceback
         )
-        await error_notify(method_name, client_id, f"Error interno: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={
                 "estado": "error",
                 "mensaje": MENSAJES_CLIENTE["error_general"],
-                "detalles_usuario": "Nuestro equipo técnico ha sido notificado y está trabajando en solucionarlo."
+                "detalles_usuario": "El equipo técnico ya fue notificado. Disculpa las molestias."
             }
         )
 
@@ -3284,6 +3184,62 @@ async def handle_webhook(payload: WebhookPayload) -> Dict[str, Any]:
                         "cliente": payload.input_variables.NOMBRE_TITULAR if payload and payload.input_variables else "unknown"
                     }
                 )
+        
+        elif objetivo == "cobranzas":
+            # [LOG] Trazamos que entramos correctamente al nuevo flujo
+            logging.info("El objetivo detectado es 'cobranzas'. Invocando procesar_webhook_cobranzas.")
+            
+            # [LÓGICA] Disparamos el servicio asíncrono pasándole el DTO entero
+            resultado = await procesar_webhook_cobranzas(payload)
+            
+            # [LOG] Avisamos que el servicio ya nos devolvió una respuesta
+            logging.info(f"Retorno del servicio cobranzas para: {payload.input_variables.NOMBRE_TITULAR}")
+            
+            # [VALIDACIÓN] Si el servicio reportó un fallo duro (status: error)
+            if resultado.get("status") == "error":
+                logging.error(f"Fallo detectado en webhook cobranzas: {resultado.get('message')}")
+                
+                # [NOTIFICACIÓN] Alertamos al equipo de soporte/dev
+                await error_notify(
+                    method_name="handle_webhook_cobranzas",
+                    client_id=payload.input_variables.NOMBRE_TITULAR or "Desconocido",
+                    error_message=f"Fallo en flujo cobranzas: {resultado.get('message')}"
+                )
+                # [HTTP] Devolvemos 500 para mantener la convención que usas en webinar/renovación
+                return JSONResponse(status_code=500, content={
+                    "status": "error",
+                    "message": resultado.get("message", "Error desconocido en cobranzas"),
+                    "correo_enviado": resultado.get("correo_enviado", False),
+                    "intentos": resultado.get("intentos_correo", 0),
+                    "data": resultado
+                })
+            
+            # [VALIDACIÓN] Si el servicio fue un éxito rotundo (correo enviado y todo OK)
+            elif resultado.get("status") == "success":
+                logging.info(f"Webhook cobranzas EXITOSO. Correo marcado como enviado.")
+                
+                # [NOTIFICACIÓN] Guardamos registro de éxito para métricas
+                await info_notify(
+                    method_name="webhook_cobranzas",
+                    client_id=payload.input_variables.NOMBRE_TITULAR or "Desconocido",
+                    info_message=f"Proceso cobranzas exitoso para {payload.input_variables.NOMBRE_TITULAR}"
+                )
+                return JSONResponse(status_code=200, content={
+                    "status": "success",
+                    "message": "Webhook de cobranzas procesado sin errores",
+                    "correo_enviado": resultado.get("correo_enviado", False),
+                    "data": resultado
+                })
+            
+            # [VALIDACIÓN] Casos de 'warning' o 'partial' (Ej. cliente no interesado, no contestó)
+            else:
+                logging.warning(f"Webhook cobranzas retornó estado advertencia/parcial: {resultado}")
+                return {
+                    "status": resultado.get("status", "partial"),
+                    "message": resultado.get("message", "Proceso de cobranzas con advertencias"),
+                    "correo_enviado": resultado.get("correo_enviado", False),
+                    "data": resultado
+                }
         else:
             # Objetivo no reconocido
             logging.warning(f"Objetivo no reconocido: {objetivo}")
@@ -3504,8 +3460,8 @@ async def obtener_pagos_mora(payload: MoraData):
         logger.info(f"Iniciando consulta de pagos en mora para crédito: {id_credito}")
         
         # Validación del ID del crédito
-        if not id_credito or not id_credito.strip():
-            raise ValueError("El ID del crédito no puede estar vacío")
+        # if not id_credito or not id_credito.strip():
+        #     raise ValueError("El ID del crédito no puede estar vacío")
         
         # Obtener token de autenticación
         try:
@@ -3520,7 +3476,7 @@ async def obtener_pagos_mora(payload: MoraData):
                 "Organization-ID": ORG_ID,
                 "Authorization": token
             }
-        
+
         # Cargar servicio externo desde BD o usar configuración fallback
         ext_client = None
         try:
@@ -3537,6 +3493,8 @@ async def obtener_pagos_mora(payload: MoraData):
             
             #url completa del servicio externo
             logger.info(f"URL del servicio externo para pagos en mora: {ext_client.url}")
+            # headers del servicio externo
+            logger.info(f"Headers del servicio externo para pagos en mora: {ext_client.header}")
             
             await info_notify(
                 method_name=method_name,

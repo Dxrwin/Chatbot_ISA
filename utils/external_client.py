@@ -224,6 +224,10 @@ class ExternalClient:
                 try:
                     data = response.json()
                     logger.info(f" respuesta de la peticion para obtener el servicio: [{self.codigo}] Respuesta JSON: {data} \n")
+                    
+                    status_code = response.status_code
+                    logger.info(f" respuesta de la peticion para obtener el servicio: [{self.codigo}] Status code: {status_code} \n")
+                    
                     await info_notify(
                         method_name=f"external_client:{self.codigo}",
                         client_id=self.client_id or "N/A",

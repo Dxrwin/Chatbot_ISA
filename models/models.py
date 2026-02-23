@@ -67,6 +67,16 @@ class ExtractedVariables(BaseModel):
     fecha_asst_assor: Optional[str] = Field(None, alias="fechaAsstAssor")
     interessolicitud: Optional[str] = Field(None, alias="interesSolicitud")
     intrsrenovarbool: Optional[bool] = Field(None, alias="intrsRenovarBool")
+    
+    # Nuevas variables de salida para el flujo de cobranzas
+    confirmacion_interes: Optional[bool] = Field(None, alias="confirmacionInteres")
+    tipo_interes: Optional[str] = Field(None, alias="tipoInteres")
+    autorizacion_contacto: Optional[bool] = Field(None, alias="autorizacionContacto")
+    mas_informacion: Optional[bool] = Field(None, alias="masInformacion")
+    razon_cliente: Optional[str] = Field(None, alias="razonCliente")
+    interes_futuro: Optional[str] = Field(None, alias="interesFuturo")
+    estado_negativo: Optional[str] = Field(None, alias="estadoNegativo")
+    motivo_negativa: Optional[str] = Field(None, alias="motivoNegativa")
 
     # Permite campos adicionales y acepta alias/camelCase
     model_config = ConfigDict(extra="allow", populate_by_name=True)
