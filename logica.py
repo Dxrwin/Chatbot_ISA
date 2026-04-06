@@ -29,6 +29,7 @@ import asyncio
 from fastapi import Request
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from utils.config import settings
 import re
 import unicodedata
@@ -139,6 +140,112 @@ class ServicioExternoUpdateRequest(BaseModel):
     activo: Optional[int] = None
     header: Optional[Dict[str, Any]] = None
     body: Optional[Dict[str, Any]] = None
+class PayableRequest(BaseModel):
+    creditLineId: str 
+    principal: float 
+    time: int 
+    paymentFrequency: int
+    initialFee: float 
+    disbursementMethod: Optional[str] = None 
+    source: Optional[str] = None             
+    redirectUrl: Optional[str] = None         
+    callbackUrl: Optional[str] = None        
+    meta: Optional[Dict[str, Any]] = None     
+
+    @field_validator('principal', 'initialFee', mode='before')
+    @classmethod
+    def validate_floats(cls, v):
+        """Convierte strings a float si es necesario"""
+        if isinstance(v, str):
+            if v.strip() == "":
+                raise ValueError("El campo no puede estar vacío")
+            try:
+                return float(v.replace(',', '.').strip())
+            except ValueError:
+                raise ValueError(f"No se puede convertir '{v}' a número decimal")
+        return v
+
+    @field_validator('time', 'paymentFrequency', mode='before')
+    @classmethod
+    def validate_ints(cls, v):
+        """Convierte strings a int si es necesario"""
+        if isinstance(v, str):
+            if v.strip() == "":
+                raise ValueError("El campo no puede estar vacío")
+            try:
+                return int(v.strip())
+            except ValueError:
+                raise ValueError(f"No se puede convertir '{v}' a número entero")
+        return v
+
+    @field_validator('disbursementMethod', mode='before')
+    @classmethod
+    def validate_disbursement(cls, v):
+        """Valida disbursementMethod, rechaza strings vacíos"""
+        if v == "" or v is None:
+            return None
+        if isinstance(v, str):
+            return v.strip() if v.strip() else None
+        return v
+
+    @field_validator('creditLineId', mode='before')
+    @classmethod
+    def validate_creditlineId(cls, v):
+        """Valida creditLineId, no puede estar vacío"""
+        if not v or (isinstance(v, str) and v.strip() == ""):
+            raise ValueError("creditLineId no puede estar vacío")
+        return str(v).strip()
+
+class InstallmentOrderCreateRequest(BaseModel):
+    amount: int | float
+    provider: str
+    collectionCosts: int | float = 0
+
+
+# Modelos para las solicitudes
+class ClienteRequest(BaseModel):
+    id_cliente: str
+# Modelo para la solicitud de detalle de cuota
+class DetalleCuotaRequest(BaseModel):
+    id_cliente: str
+    numero_cuota: int
+    
+# Modelo para probar notificaciones
+class TestNotifyRequest(BaseModel):
+    method_name: str = "test_method"
+    client_id: str = "test_client"
+    message: str = "Mensaje de prueba para notificación"
+
+
+class ConfirmarTOTPRequest(BaseModel):
+    codigo_totp: str
+    id_debtor: str
+    id_asistance: str
+
+
+# ===== MAPEO DE ERRORES TOTP =====
+ERRORES_TOTP = {
+    "InvalidRequest": {
+        "mensaje": "El código TOTP es inválido o ha expirado.",
+        "detalles": "Por favor verifica el código y vuelve a intentar."
+    },
+    "ExpiredCode": {
+        "mensaje": "El código TOTP ha expirado.",
+        "detalles": "Solicita un nuevo código e intenta nuevamente."
+    },
+    "MaxAttemptsExceeded": {
+        "mensaje": "Has excedido el número máximo de intentos.",
+        "detalles": "Por seguridad, tu sesión ha sido bloqueada temporalmente. Intenta más tarde."
+    },
+    "UserNotFound": {
+        "mensaje": "No se encontró el usuario.",
+        "detalles": "Por favor verifica los datos e intenta nuevamente."
+    },
+    "UnauthorizedRequest": {
+        "mensaje": "No tienes permiso para realizar esta acción.",
+        "detalles": "Por favor contacta con soporte técnico."
+    }
+}
 
 
 print("🔥 BOOT VERSION 8693665")
@@ -310,6 +417,11 @@ def formatear_fecha_legible(fecha_iso: str) -> str:
         return fecha_iso
 
 
+def obtener_fecha_iso_bogota() -> str:
+    """Retorna la fecha/hora actual en zona America/Bogota sin microsegundos."""
+    return datetime.now(ZoneInfo("America/Bogota")).isoformat(timespec="seconds")
+
+
 def formatear_valor_moneda(valor: float) -> str:
     """
     Formatea un número como moneda COP sin decimales.
@@ -325,106 +437,6 @@ def formatear_valor_moneda(valor: float) -> str:
         return str(valor)
 
 
-class PayableRequest(BaseModel):
-    creditLineId: str 
-    principal: float 
-    time: int 
-    paymentFrequency: int
-    initialFee: float 
-    disbursementMethod: Optional[str] = None 
-    source: Optional[str] = None             
-    redirectUrl: Optional[str] = None         
-    callbackUrl: Optional[str] = None        
-    meta: Optional[Dict[str, Any]] = None     
-
-    @field_validator('principal', 'initialFee', mode='before')
-    @classmethod
-    def validate_floats(cls, v):
-        """Convierte strings a float si es necesario"""
-        if isinstance(v, str):
-            if v.strip() == "":
-                raise ValueError("El campo no puede estar vacío")
-            try:
-                return float(v.replace(',', '.').strip())
-            except ValueError:
-                raise ValueError(f"No se puede convertir '{v}' a número decimal")
-        return v
-
-    @field_validator('time', 'paymentFrequency', mode='before')
-    @classmethod
-    def validate_ints(cls, v):
-        """Convierte strings a int si es necesario"""
-        if isinstance(v, str):
-            if v.strip() == "":
-                raise ValueError("El campo no puede estar vacío")
-            try:
-                return int(v.strip())
-            except ValueError:
-                raise ValueError(f"No se puede convertir '{v}' a número entero")
-        return v
-
-    @field_validator('disbursementMethod', mode='before')
-    @classmethod
-    def validate_disbursement(cls, v):
-        """Valida disbursementMethod, rechaza strings vacíos"""
-        if v == "" or v is None:
-            return None
-        if isinstance(v, str):
-            return v.strip() if v.strip() else None
-        return v
-
-    @field_validator('creditLineId', mode='before')
-    @classmethod
-    def validate_creditlineId(cls, v):
-        """Valida creditLineId, no puede estar vacío"""
-        if not v or (isinstance(v, str) and v.strip() == ""):
-            raise ValueError("creditLineId no puede estar vacío")
-        return str(v).strip()
-
-# Modelos para las solicitudes
-class ClienteRequest(BaseModel):
-    id_cliente: str
-# Modelo para la solicitud de detalle de cuota
-class DetalleCuotaRequest(BaseModel):
-    id_cliente: str
-    numero_cuota: int
-    
-# Modelo para probar notificaciones
-class TestNotifyRequest(BaseModel):
-    method_name: str = "test_method"
-    client_id: str = "test_client"
-    message: str = "Mensaje de prueba para notificación"
-
-
-class ConfirmarTOTPRequest(BaseModel):
-    codigo_totp: str
-    id_debtor: str
-    id_asistance: str
-
-
-# ===== MAPEO DE ERRORES TOTP =====
-ERRORES_TOTP = {
-    "InvalidRequest": {
-        "mensaje": "El código TOTP es inválido o ha expirado.",
-        "detalles": "Por favor verifica el código y vuelve a intentar."
-    },
-    "ExpiredCode": {
-        "mensaje": "El código TOTP ha expirado.",
-        "detalles": "Solicita un nuevo código e intenta nuevamente."
-    },
-    "MaxAttemptsExceeded": {
-        "mensaje": "Has excedido el número máximo de intentos.",
-        "detalles": "Por seguridad, tu sesión ha sido bloqueada temporalmente. Intenta más tarde."
-    },
-    "UserNotFound": {
-        "mensaje": "No se encontró el usuario.",
-        "detalles": "Por favor verifica los datos e intenta nuevamente."
-    },
-    "UnauthorizedRequest": {
-        "mensaje": "No tienes permiso para realizar esta acción.",
-        "detalles": "Por favor contacta con soporte técnico."
-    }
-}
 
 #confirmar codigo totp realizando un bucle para confirmar en cada intento
 #recibe el codigo, id_debtor, id_asistance
@@ -1749,6 +1761,157 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "detalles_usuario": "El equipo técnico ya fue notificado. Disculpa las molestias."
             }
         )
+
+@app.post(
+    "/payables/{id_credito_mora}/installments/{id_cuota_pendiente}/orders",
+    tags=["Payables"],
+    summary="Crear orden de pago de una cuota"
+)
+async def create_installment_order(
+    id_credito_mora: str,
+    id_cuota_pendiente: str,
+    payload: InstallmentOrderCreateRequest
+):
+    method_name = "create_installment_order"
+    client_id = id_credito_mora
+
+    payables_base_url = (
+        PAYABLE_URL.rstrip("/")
+        if PAYABLE_URL and "payables" in PAYABLE_URL.lower()
+        else "https://api.kuenta.co/v1/payables"
+    )
+    external_url = (
+        f"{payables_base_url}/{id_credito_mora}/installments/{id_cuota_pendiente}/orders"
+    )
+    outbound_payload = {
+        "amount": payload.amount,
+        "provider": payload.provider,
+        "date": obtener_fecha_iso_bogota(),
+        "collectionCosts": payload.collectionCosts,
+    }
+
+    logger.info(
+        f"Creando orden de cuota. credit_id={id_credito_mora}, "
+        f"installment_id={id_cuota_pendiente}, url={external_url}, "
+        f"payload={outbound_payload}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                token = await obtener_token(client)
+            except httpx.HTTPStatusError as e:
+                auth_status = e.response.status_code if e.response else 500
+                error_message = f"Error HTTP obteniendo token: {str(e)}"
+                logger.error(error_message)
+                await insertar_log(
+                    method_name=method_name,
+                    client_id=client_id,
+                    error_message=error_message,
+                    http_code=auth_status,
+                    tipo="error"
+                )
+                return JSONResponse(
+                    status_code=401 if auth_status in (401, 403) else 500,
+                    content={"error": "No se pudo obtener el token de autenticacion"}
+                )
+            except Exception as e:
+                error_message = f"Error obteniendo token: {str(e)}"
+                logger.error(error_message)
+                await insertar_log(
+                    method_name=method_name,
+                    client_id=client_id,
+                    error_message=error_message,
+                    http_code=500,
+                    tipo="error"
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "No se pudo obtener el token de autenticacion"}
+                )
+
+            headers = {
+                "Config-Organization-ID": ORG_ID,
+                "Organization-ID": ORG_ID,
+                "Authorization": token
+            }
+
+            response = await client.post(
+                external_url,
+                json=outbound_payload,
+                headers=headers
+            )
+
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {"raw_response": response.text}
+
+            log_type = "info" if response.status_code < 400 else "error"
+            log_message = (
+                f"Respuesta Kuenta crear orden cuota. "
+                f"status={response.status_code}, url={external_url}"
+            )
+            await insertar_log(
+                method_name=method_name,
+                client_id=client_id,
+                error_message=log_message,
+                http_code=response.status_code,
+                tipo=log_type,
+                payload_enviado=str(outbound_payload),
+                respuesta_api=str(response_data)
+            )
+
+            return JSONResponse(
+                status_code=response.status_code,
+                content=jsonable_encoder(response_data)
+            )
+    except httpx.TimeoutException as e:
+        error_message = f"Timeout al crear orden de cuota: {str(e)}"
+        logger.error(error_message)
+        await insertar_log(
+            method_name=method_name,
+            client_id=client_id,
+            error_message=error_message,
+            http_code=504,
+            tipo="error",
+            traceback_str=traceback.format_exc()
+        )
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Timeout al consumir la API de Kuenta"}
+        )
+    except httpx.RequestError as e:
+        error_message = f"Error de conexion al crear orden de cuota: {str(e)}"
+        logger.error(error_message)
+        await insertar_log(
+            method_name=method_name,
+            client_id=client_id,
+            error_message=error_message,
+            http_code=502,
+            tipo="error",
+            traceback_str=traceback.format_exc()
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Error de conexion con la API de Kuenta"}
+        )
+    except Exception as e:
+        error_message = f"Error inesperado al crear orden de cuota: {str(e)}"
+        logger.error(error_message, exc_info=True)
+        await insertar_log(
+            method_name=method_name,
+            client_id=client_id,
+            error_message=error_message,
+            http_code=500,
+            tipo="error",
+            traceback_str=traceback.format_exc()
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Error interno al crear la orden de cuota"}
+        )
+
 
 #confirmar credito calculado y creado en simulacion usando peticion payables
 @app.post("/confirmar-credito/{credit_id}", tags=["Payables"], summary="Confirmar crédito/payable")
