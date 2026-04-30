@@ -3655,9 +3655,9 @@ async def obtener_pagos_mora(payload: MoraData):
                 raise ValueError("URL no definida en configuración")
             
             #url completa del servicio externo
-            logger.info(f"URL del servicio externo para pagos en mora: {ext_client.url}")
+            #logger.info(f"URL del servicio externo para pagos en mora: {ext_client.url}")
             # headers del servicio externo
-            logger.info(f"Headers del servicio externo para pagos en mora: {ext_client.header}")
+            #logger.info(f"Headers del servicio externo para pagos en mora: {ext_client.header}")
             
             await info_notify(
                 method_name=method_name,
@@ -3668,9 +3668,9 @@ async def obtener_pagos_mora(payload: MoraData):
             response = await ext_client.run()
             # informar que se realizo la peticion para la consulta de pagos en mora
             
-            logger.info(f"Petición realizada a servicio externo para obtener pagos en mora del crédito: {id_credito} \n")
+            #logger.info(f"Petición realizada a servicio externo para obtener pagos en mora del crédito: {id_credito} \n")
             
-            logger.info(f"Respuesta del servicio externo: {response} \n")
+            #logger.info(f"Respuesta del servicio externo: {response} \n")
             
             await info_notify(
                 method_name=method_name,
@@ -3706,7 +3706,7 @@ async def obtener_pagos_mora(payload: MoraData):
         
         # Manejo de diferentes status
         if status_code == 200:
-            logger.info(f"Consulta de pagos en mora exitosa para crédito: {id_credito}")
+            #logger.info(f"Consulta de pagos en mora exitosa para crédito: {id_credito}")
             
             # Procesar installments si existen en la respuesta
             processed_data = response_data.get("data", {}).get("credit", {})
@@ -3719,32 +3719,38 @@ async def obtener_pagos_mora(payload: MoraData):
                 info_message=f"Cuotas obtenidas para crédito: {id_credito}, cuotas: {len(installments)}, detalle de cuotas : {installments}"
             )
             
-            logger.info(f"Installments obtenidos: {len(installments)} para crédito: {id_credito}\n \n")
-            logger.info (f"installments data: {installments} \n")
+            #logger.info(f"Installments obtenidos: {len(installments)} para crédito: {id_credito}\n \n")
+            #logger.info (f"installments data: {installments} \n")
             
             #acceder al resumen
             resumen = processed_data.get("summary", {})
-            logger.info (f"resumen data: {resumen}")
+            #logger.info (f"resumen data: {resumen}")
             
             
             # Procesar lista de installments
             first_pending_installment = None
-            count_pending = 0  # estado 3 = DueInstallment
-            count_expired = 0  # estado 4 = ExpiredInstallment
-            
+            count_pending = 0  # estado 3 = pendiente (pagable)
+            count_expired = 0  # estado 4 = vencida (no pagable directamente)
+            count_paid = 0     # estado 1 = pagada
+
             if installments and isinstance(installments, list):
                 for installment in installments:
                     logger.debug(f"Procesando installment: {installment.get('number')} con estado {installment.get('status')} para crédito: {id_credito}")
                     status_installment = installment.get("status")
-                    
-                    # Contar installments pendientes (estado 3)
-                    if status_installment == 3:
+
+                    if status_installment == 1:
+                        count_paid += 1
+
+                    # Vencidas (estado 4) — no se pueden pagar directamente
+                    elif status_installment == 4:
+                        count_expired += 1
+
+                    # Pendientes (estado 3) — capturar solo la primera encontrada
+                    elif status_installment == 3:
                         count_pending += 1
-                        # Capturar el primer installment pendiente
                         if first_pending_installment is None:
                             fecha_pago = installment.get("date")
                             valor_pagar = installment.get("payment")
-                            
                             first_pending_installment = {
                                 "id": installment.get("id"),
                                 "numero_de_cuota": installment.get("number"),
@@ -3752,32 +3758,45 @@ async def obtener_pagos_mora(payload: MoraData):
                                 "fecha_pago_legible": formatear_fecha_legible(fecha_pago) if fecha_pago else "N/A",
                                 "valor_total_pagar": valor_pagar,
                                 "valor_total_legible": formatear_valor_moneda(valor_pagar) if valor_pagar else "N/A",
-                                "dias_de_mora_cuota": installment.get("debtInterestDays")
+                                "dias_de_mora_cuota": installment.get("debtInterestDays"),
+                                "estado_cuota": "pendiente"
                             }
-                            #notificar cuota encontrada
-                            await info_notify(
-                                method_name=method_name,
-                                client_id=client_id,
-                                info_message=f"Primer installment pendiente encontrado para crédito {id_credito}: {first_pending_installment}"
-                            )
-                            
-                            logger.info(f"Primer installment pendiente encontrado para crédito {id_credito}: {first_pending_installment}")
-                    
-                    # Contar installments vencidos (estado 4)
-                    elif status_installment == 4:
-                        count_expired += 1
-                
+                            logger.info(f"Primera cuota pendiente capturada para crédito {id_credito}: cuota {installment.get('number')}")
+
+                # Determinar si la fecha de la cuota a pagar está en un año anterior al actual
+                if first_pending_installment:
+                    fecha_str = first_pending_installment.get("fecha_pago", "")
+                    retrasado = False
+                    label_fecha = "PRÓXIMA FECHA DE PAGO"
+                    if fecha_str:
+                        try:
+                            anio_cuota = datetime.fromisoformat(fecha_str.replace("Z", "+00:00")).year
+                            if anio_cuota < datetime.now().year:
+                                retrasado = True
+                                label_fecha = "FECHA VENCIDA"
+                        except Exception:
+                            pass
+                    first_pending_installment["retrasado"] = retrasado
+                    first_pending_installment["label_fecha"] = label_fecha
+                    await info_notify(
+                        method_name=method_name,
+                        client_id=client_id,
+                        info_message=f"Cuota a pagar para crédito {id_credito}: {first_pending_installment}"
+                    )
+
                 # Agregar resumen de installments al JSON procesado
                 return_data = {
                     "total_cuotas": len(installments),
+                    "cuotas_pagadas": count_paid,
+                    "cuotas_pendientes_total": count_pending + count_expired,
                     "dias_de_atraso": resumen.get("debtDays", 0),
                     "pendientes_estado_3": count_pending,
                     "vencidos_estado_4": count_expired,
                     "pago_pendiente": first_pending_installment
                 }
                 logger.info(f"resumen de las cuotas pendientes : {return_data}")
-                
-                logger.info(f"Resumen de installments para crédito {id_credito}: {count_pending} pendientes, {count_expired} vencidos")
+
+                logger.info(f"Resumen de installments para crédito {id_credito}: {count_paid} pagadas, {count_pending} pendientes, {count_expired} vencidas")
             
             await info_notify(
                 method_name=method_name,
