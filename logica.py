@@ -3771,8 +3771,10 @@ async def obtener_pagos_mora(payload: MoraData):
                     label_fecha = "PRÓXIMA FECHA DE PAGO"
                     if fecha_str:
                         try:
-                            anio_cuota = datetime.fromisoformat(fecha_str.replace("Z", "+00:00")).year
-                            if anio_cuota < datetime.now().year:
+                            # Comparar la fecha completa (no solo el año) para detectar
+                            # cuotas vencidas dentro del mismo año calendario
+                            fecha_cuota = datetime.fromisoformat(fecha_str.replace("Z", "+00:00")).date()
+                            if fecha_cuota < datetime.now().date():
                                 retrasado = True
                                 label_fecha = "FECHA VENCIDA"
                         except Exception:
