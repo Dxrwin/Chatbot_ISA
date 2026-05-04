@@ -3602,16 +3602,6 @@ async def obtener_pagos_mora(payload: MoraData):
     Realiza una petición GET a la API externa:
     https://api.kuenta.co/v1/receivable/{id_credito}
     
-    Parámetros:
-    - id_credito: ID del crédito a consultar (se pasa en la URL)
-    
-    Retorna:
-    - Status 200: {"estado": "success", "data": {...}}
-    - Status 400: {"estado": "error", "mensaje": "Error de validación"}
-    - Status 401: {"estado": "error", "mensaje": "Error de autenticación"}
-    - Status 404: {"estado": "error", "mensaje": "Crédito no encontrado"}
-    - Status 500: {"estado": "error", "mensaje": "Error interno"}
-    
     Ejemplo de uso:
     GET /obtener-pagos-mora/8c082794-796c-4987-ac28-e4918bea590d
     """
@@ -3727,25 +3717,31 @@ async def obtener_pagos_mora(payload: MoraData):
             #logger.info (f"resumen data: {resumen}")
             
             
-            # Procesar lista de installments
-            first_pending_installment = None
-            count_pending = 0  # estado 3 = pendiente (pagable)
-            count_expired = 0  # estado 4 = vencida (no pagable directamente)
-            count_paid = 0     # estado 1 = pagada
+            # Procesar la lista de cuotas (installments) retornada por la API de Kuenta.
+            # Se recorre en orden para clasificar cada cuota según su estado y construir
+            # el resumen que se enviará al frontend.
+            first_pending_installment = None  # cuota pagable que se mostrará al cliente
+            count_pending = 0  # estado 3 = pendiente (pagable, acumula el valor de las vencidas)
+            count_expired = 0  # estado 4 = vencida (no se puede pagar directamente en Kuenta)
+            count_paid = 0     # estado 1 = ya pagada
 
             if installments and isinstance(installments, list):
                 for installment in installments:
                     logger.debug(f"Procesando installment: {installment.get('number')} con estado {installment.get('status')} para crédito: {id_credito}")
                     status_installment = installment.get("status")
 
+                    # Cuota ya pagada — solo se contabiliza, no se muestra al cliente
                     if status_installment == 1:
                         count_paid += 1
 
-                    # Vencidas (estado 4) — no se pueden pagar directamente
+                    # Cuota vencida — Kuenta no permite pagarla directamente; su valor
+                    # queda acumulado en la última cuota pendiente (estado 3)
                     elif status_installment == 4:
                         count_expired += 1
 
-                    # Pendientes (estado 3) — capturar solo la primera encontrada
+                    # Cuota pendiente — es la que el cliente puede pagar.
+                    # Se captura únicamente la primera que aparezca en la lista (orden
+                    # cronológico) para mostrarla como "próxima cuota a pagar".
                     elif status_installment == 3:
                         count_pending += 1
                         if first_pending_installment is None:
@@ -3755,15 +3751,20 @@ async def obtener_pagos_mora(payload: MoraData):
                                 "id": installment.get("id"),
                                 "numero_de_cuota": installment.get("number"),
                                 "fecha_pago": fecha_pago,
+                                # Fecha formateada en español para mostrar en pantalla
                                 "fecha_pago_legible": formatear_fecha_legible(fecha_pago) if fecha_pago else "N/A",
                                 "valor_total_pagar": valor_pagar,
+                                # Valor formateado como moneda colombiana ($1.234.567)
                                 "valor_total_legible": formatear_valor_moneda(valor_pagar) if valor_pagar else "N/A",
                                 "dias_de_mora_cuota": installment.get("debtInterestDays"),
                                 "estado_cuota": "pendiente"
                             }
                             logger.info(f"Primera cuota pendiente capturada para crédito {id_credito}: cuota {installment.get('number')}")
 
-                # Determinar si la fecha de la cuota a pagar está en un año anterior al actual
+                # Validar si la fecha de la cuota a pagar corresponde a un año anterior al
+                # actual. Cuando esto ocurre el frontend debe mostrar "FECHA VENCIDA" en
+                # lugar de "PRÓXIMA FECHA DE PAGO" para que el cliente entienda que está
+                # atrasado. El campo `retrasado` actúa como bandera para ese cambio de etiqueta.
                 if first_pending_installment:
                     fecha_str = first_pending_installment.get("fecha_pago", "")
                     retrasado = False
@@ -3776,6 +3777,7 @@ async def obtener_pagos_mora(payload: MoraData):
                                 label_fecha = "FECHA VENCIDA"
                         except Exception:
                             pass
+                    # Se agregan los campos de señalización al objeto de cuota pendiente
                     first_pending_installment["retrasado"] = retrasado
                     first_pending_installment["label_fecha"] = label_fecha
                     await info_notify(
@@ -3784,7 +3786,11 @@ async def obtener_pagos_mora(payload: MoraData):
                         info_message=f"Cuota a pagar para crédito {id_credito}: {first_pending_installment}"
                     )
 
-                # Agregar resumen de installments al JSON procesado
+                # Construir el resumen final que se retorna al frontend.
+                # - cuotas_pagadas: cuotas ya saldadas (estado 1)
+                # - cuotas_pendientes_total: suma de pendientes (3) + vencidas (4), es decir
+                #   todas las que aún no han sido pagadas
+                # - pago_pendiente: detalle de la primera cuota que el cliente debe pagar
                 return_data = {
                     "total_cuotas": len(installments),
                     "cuotas_pagadas": count_paid,
