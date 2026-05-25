@@ -1,8 +1,8 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from typing import Optional, Dict, Any
-import os
-from pathlib import Path
+#import os
+#from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 
 # Buscar y cargar el archivo .env
@@ -54,7 +54,17 @@ class Settings(BaseSettings):
     # --- Configuración Telegram ---
     TELEGRAM_BOT_TOKEN: Optional[str] = Field(None, env="TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID: Optional[str] = Field(None, env="TELEGRAM_CHAT_ID")
-    
+
+    # --- Configuración Bitrix24 (cobranzas / llamadas automatizadas) ---
+    BITRIX_BASE_URL: Optional[str] = Field(None, env="BITRIX_BASE_URL")
+    BITRIX_CONTACT_CEDULA_FIELD: str = Field(
+        "UF_CRM_1697774324",
+        env="BITRIX_CONTACT_CEDULA_FIELD",
+    )
+    BITRIX_DEAL_CATEGORY_ID: int = Field(0, env="BITRIX_DEAL_CATEGORY_ID")
+    BITRIX_DEAL_STAGE_ID: str = Field("NEW", env="BITRIX_DEAL_STAGE_ID")
+    BITRIX_ASSIGNED_BY_ID: Optional[str] = Field(None, env="BITRIX_ASSIGNED_BY_ID")
+    CREATE_DEAL_ON_VALID_PAYMENT: str = Field("false", env="CREATE_DEAL_ON_VALID_PAYMENT")
 
     class Config:
         # Nombre del archivo del cual cargar las variables
