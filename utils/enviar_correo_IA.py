@@ -6,12 +6,35 @@ from models.models import WebhookPayload
 from utils.database import insertar_flujo_correo_post_agente
 from utils.email_service import enviar_correo_renovacion, enviar_correo_webinar
 from utils.notify_error import info_notify, error_notify
-from utils.database import insertar_log, consultar_logs_filtrados
-from utils.config import settings
+from utils.database import insertar_log
+#from utils.config import settings
 from utils.registrar_bitrix import registrar_en_bitrix
 from utils.whatsapp_service import enviar_whatsapp_renovacion
 from utils.linea_credito_links import obtener_link_por_linea_credito
+import os
 
+def obtener_base_url_bitrix_correo() -> str:
+    """
+    Obtiene la URL base de Bitrix desde variables de entorno.
+
+    No debe existir ningún webhook hardcodeado en el código.
+    """
+
+    base_url = (
+        os.getenv("BITRIX_CORREO_BASE_URL")
+        or os.getenv("BITRIX_BASE_URL")
+        or ""
+    ).rstrip("/")
+
+    if not base_url:
+        raise RuntimeError(
+            "No está configurada BITRIX_CORREO_BASE_URL ni BITRIX_BASE_URL."
+        )
+
+    return base_url
+
+
+base_url_bitrix = obtener_base_url_bitrix_correo()
 # Cache liviano en memoria para evitar reintentos inmediatos de envios webinar
 WEBINAR_CACHE_TTL = 300  # segundos
 webinar_request_cache: Dict[str, float] = {}
@@ -62,7 +85,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
         logging.info(f"Buscando cliente en Bitrix24 con teléfono: {telefono}")
         
         # ========== PETICIÓN 1: Buscar contacto por teléfono ==========
-        url_contact = "https://horizontesas-fontumi.bitrix24.es/rest/6/untkqcnft2vadt5d/crm.contact.list"
+        url_contact = f"{base_url_bitrix}/crm.contact.list.json"
         
         payload_contact = {
             "filter": {
@@ -84,7 +107,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             logging.info(f"Respuesta de búsqueda - Status: {response.status_code}")
             
             if response.status_code != 200:
-                logging.error(f"❌ Error al obtener el contacto")
+                logging.error(f"Error al obtener el contacto")
                 logging.error(f"Status: {response.status_code}")
                 logging.error(f"Response: {response.text}")
                 await error_notify(
@@ -125,7 +148,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             stage_id = stage_id_map.get(tipo_proceso.lower(), "C24:NEW")
             logging.info(f"Tipo de proceso: {tipo_proceso} -> STAGE_ID: {stage_id}")
             
-            url_deal = "https://horizontesas-fontumi.bitrix24.es/rest/6/untkqcnft2vadt5d/crm.deal.add"
+            url_deal = f"{base_url_bitrix}/crm.deal.add.json"
             
             payload_deal = {
                 "fields": {
@@ -148,7 +171,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             logging.info(f"Respuesta de creación de deal - Status: {response_deal.status_code}")
             
             if response_deal.status_code != 200:
-                logging.error(f"❌ Error al crear el deal")
+                logging.error(f"Error al crear el deal")
                 logging.error(f"Status: {response_deal.status_code}")
                 logging.error(f"Response: {response_deal.text}")
                 await error_notify(
@@ -165,7 +188,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             respuesta_deal = response_deal.json()
             id_deal = respuesta_deal.get("result")
             
-            logging.info(f"✅ Deal creado correctamente - ID: {id_deal}")
+            logging.info(f"Deal creado correctamente - ID: {id_deal}")
             await info_notify(
                 method_name="integracion_bitrix",
                 client_id=id_contacto,
@@ -180,7 +203,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             }
             
     except httpx.ConnectError as e:
-        logging.error(f"❌ Error de conexión a Bitrix24: {e}")
+        logging.error(f"Error de conexión a Bitrix24: {e}")
         await error_notify(
             method_name="integracion_bitrix",
             client_id=celular,
@@ -202,7 +225,7 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
             "message": f"Timeout en conexión a Bitrix24: {e}"
         }
     except Exception as e:
-        logging.error(f"❌ Error inesperado en integracion_bitrix: {e}", exc_info=True)
+        logging.error(f"Error inesperado en integracion_bitrix: {e}", exc_info=True)
         await error_notify(
             method_name="integracion_bitrix",
             client_id=celular,
@@ -285,15 +308,15 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
     
     if ambiguedad_value is True and (envio_correo_value is True or intrsrenovarbool_value is True):
         enviar_correo = True
-        logging.info(f"✅ Enviando correo: ambiguedad=True y (envio_correo=True O intrsrenovarbool=True)")
+        logging.info(f"Enviando correo: ambiguedad=True y (envio_correo=True O intrsrenovarbool=True)")
     
     elif envio_correo_value is True:
         enviar_correo = True
-        logging.info(f"✅ Enviando correo: envio_correo=True")
+        logging.info(f"Enviando correo: envio_correo=True")
     
     elif intrsrenovarbool_value is True:
         enviar_correo = True
-        logging.info(f"✅ Enviando correo: intrsrenovarbool=True")
+        logging.info(f"Enviando correo: intrsrenovarbool=True")
     
     else:
         # No se cumplen las condiciones para enviar correo
@@ -365,7 +388,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
         
         # Si el correo NO se envió exitosamente
         if confirmacion_response.get("status") != "success":
-            logging.error(f"❌ Error en envio de correo de renovacion a {destinatario}: {confirmacion_response.get('message')}")
+            logging.error(f"Error en envio de correo de renovacion a {destinatario}: {confirmacion_response.get('message')}")
             logging.warning(f"El correo no fue enviado: {confirmacion_response.get('message')} Detalles: {confirmacion_response}")
             
             # Notificar el error pero no reintentemos
@@ -384,7 +407,7 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
             }
         
         #Si el correo se envió exitosamente, proceder con BD
-        logging.info(f"✅ Correo enviado exitosamente a: {destinatario} en intento {confirmacion_response.get('intentos')}")
+        logging.info(f"Correo enviado exitosamente a: {destinatario} en intento {confirmacion_response.get('intentos')}")
         
         await info_notify(
             method_name="procesar_webhook_renovacion",

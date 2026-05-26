@@ -1,8 +1,6 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from typing import Optional, Dict, Any
-#import os
-#from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 
 # Buscar y cargar el archivo .env
@@ -11,27 +9,27 @@ if env_file:
     load_dotenv(env_file, override=True)
 else:
     # Si no encuentra .env con find_dotenv, intenta con la ruta relativa
-    load_dotenv('.env', override=True)
+    load_dotenv(".env", override=True)
+
 
 class Settings(BaseSettings):
     """
-    Configuraciones de la aplicación, cargadas desde variables de entorno (.env)
+    Configuraciones de la aplicación, cargadas desde variables de entorno (.env).
     Pydantic maneja automáticamente la carga de .env, la validación de tipos
     e incluso el parseo de JSON strings a diccionarios.
     """
-    
-    # --- Configuración de Correo (de mi versión anterior) ---
+
+    # --- Configuración de Correo ---
     SMTP_SERVER: str = Field(..., env="SMTP_SERVER")
     SMTP_PORT: int = Field(465, env="SMTP_PORT")
     SMTP_USER: str = Field(..., env="SMTP_USER")
     SMTP_PASS: str = Field(..., env="SMTP_PASS")
-    
-    # --- Configuración de Base de Datos para renovaciones---
+
+    # --- Configuración de Base de Datos para renovaciones ---
     DB_HOST: str = Field("localhost", env="DB_HOST")
     DB_USER: str = Field("root", env="DB_USER")
     DB_PASSWORD_RENOVACION: str = Field(..., env="DB_PASSWORD_RENOVACION")
     DB_NAME_RENOVACION: str = Field(..., env="DB_NAME_RENOVACION")
-        
 
     # --- Variables de Autenticación y API ---
     # DEBEN VENIR DE LA BASE DE DATOS, ESTO ES SOLO UN RESPALDO
@@ -70,8 +68,14 @@ class Settings(BaseSettings):
         # Nombre del archivo del cual cargar las variables
         env_file = ".env"
         env_file_encoding = "utf-8"
-        # Permite lectura de variables del ambiente del sistema operativo
+
+        # Permite lectura de variables sin distinguir mayúsculas/minúsculas
         case_sensitive = False
+
+        # Ignora variables extra del .env.
+        # Necesario porque el módulo de pagos usa variables propias.
+        extra = "ignore"
+
 
 # --- Instancia Única de Configuración ---
 settings = Settings()
@@ -80,5 +84,5 @@ settings = Settings()
 TOKEN_DATA = {
     "access_token": None,
     "refresh_token": None,
-    "expires_at": 0
+    "expires_at": 0,
 }

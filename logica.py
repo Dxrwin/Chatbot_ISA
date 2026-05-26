@@ -15,6 +15,9 @@ from utils.enviar_correo_IA import (
     procesar_llamada_renovacion_Y_refinanciamiento,
     procesar_webhook_cobranzas,
 )
+    # --- Registro del módulo de pagos ---
+from pagos.inicializador import registrar_modulo_pagos
+
 from utils.auth import obtener_token
 from utils.external_client import ExternalClient
 from fastapi.encoders import jsonable_encoder
@@ -26,12 +29,12 @@ from utils.servicios_externos_service import (
     actualizar_servicio_externo,
     obtener_servicio_externo_por_codigo,
 )
-from utils.whatsapp_service import enviar_whatsapp_renovacion
-from utils.linea_credito_links import obtener_link_por_linea_credito
+#from utils.whatsapp_service import enviar_whatsapp_renovacion
+#from utils.linea_credito_links import obtener_link_por_linea_credito
 from models.bitrix_call_models import (
     BitrixCallCompletedRequest,
-    BitrixCallCompletedResponse,
-    BitrixDebugSearchClientRequest,
+    BitrixCallCompletedResponse
+    #BitrixDebugSearchClientRequest,
 )
 from dataclasses import dataclass
 import json
@@ -55,6 +58,8 @@ db_host = settings.DB_HOST
 db_user = settings.DB_USER
 db_pass = settings.DB_PASSWORD_RENOVACION
 db_name = settings.DB_NAME_RENOVACION
+
+
 
 
 class ExtractedVariables(BaseModel):
@@ -314,6 +319,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+#inicalizacion del modlo de pagos
+registrar_modulo_pagos(app)
 
 # El middleware para detectar reinicios
 @app.middleware("http")
@@ -4965,29 +4973,48 @@ async def consultar_logs(filtros: ConsultaLogsRequest):
         )
 
 
-# ============================================================
-# Bitrix24 - Procesamiento de llamadas automatizadas de cartera
-# ============================================================
 
+# ============================================================
+# Bitrix24 - Llamadas automatizadas de cartera
+# ============================================================
 
 @dataclass
-class BitrixLookupCriteria:
+class CriteriosBusquedaBitrix:
     """
-    Criterios usados para buscar el contacto del cliente en Bitrix24.
+    Criterios calculados para buscar el contacto del cliente en Bitrix.
 
     Solo se usan datos que pertenecen al cliente:
     - CEDULA
     - TELEFONO
     - CORREO
 
-    No se usa WHATSAPP_DISPONIBLE porque corresponde a otra entidad/canal.
+    WHATSAPP_DISPONIBLE no se usa porque pertenece a otra entidad/canal.
     """
 
     cedula: Optional[str]
-    telefono_variants: List[str]
+    variantes_telefono: List[str]
     correo: Optional[str]
     nombre: Optional[str]
     id_libranza: Optional[str]
+    
+
+class ErrorBitrixAPI(Exception):
+    """
+    Excepción controlada para errores de comunicación o respuesta de Bitrix24.
+    """
+
+    def __init__(
+        self,
+        mensaje: str,
+        metodo: Optional[str] = None,
+        codigo_estado: Optional[int] = None,
+        respuesta: Any = None,
+    ):
+        self.mensaje = mensaje
+        self.metodo = metodo
+        self.codigo_estado = codigo_estado
+        self.respuesta = respuesta
+        super().__init__(mensaje)
 
 
 # ============================================================
@@ -5191,80 +5218,96 @@ class BitrixAPIError(Exception):
         super().__init__(message)
 
 
-def normalize_key(value: Any) -> str:
+# ============================================================
+# Normalización de textos, llaves y valores
+# ============================================================
+
+def normalizar_clave(valor: Any) -> str:
     """
-    Normaliza nombres de variables para soportar tildes, espacios y mayúsculas.
+    Normaliza nombres de variables.
 
     Ejemplos:
     - "contestó" -> "contesto"
     - "Interés Pagar" -> "interes_pagar"
+    - "FECHA ACUERDO PAGO" -> "fecha_acuerdo_pago"
     """
-    if value is None:
+
+    if valor is None:
         return ""
 
-    text = str(value).strip().lower()
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(char for char in text if not unicodedata.combining(char))
-    text = re.sub(r"[^a-z0-9_]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text
+    texto = str(valor).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
+    texto = re.sub(r"[^a-z0-9_]+", "_", texto)
+    texto = re.sub(r"_+", "_", texto).strip("_")
+
+    return texto
 
 
-def normalize_text(value: Any) -> str:
+def normalizar_texto(valor: Any) -> str:
     """
-    Normaliza valores de texto para reglas de validación.
+    Normaliza valores para comparar reglas.
 
     Ejemplos:
     - "Sí" -> "si"
     - "acuerdo con fecha" -> "acuerdo_con_fecha"
     - True -> "true"
     """
-    if value is None:
+
+    if valor is None:
         return ""
 
-    if isinstance(value, bool):
-        return "true" if value else "false"
+    if isinstance(valor, bool):
+        return "true" if valor else "false"
 
-    text = str(value).strip().lower()
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(char for char in text if not unicodedata.combining(char))
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text
+    texto = str(valor).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
+    texto = re.sub(r"[^a-z0-9]+", "_", texto)
+    texto = re.sub(r"_+", "_", texto).strip("_")
+
+    return texto
 
 
-def clean_str(value: Any) -> Optional[str]:
+def limpiar_texto(valor: Any) -> Optional[str]:
     """
     Convierte cualquier valor a string limpio.
 
     Retorna None si viene vacío o nulo.
     """
-    if value is None:
+
+    if valor is None:
         return None
 
-    text = str(value).strip()
-    return text or None
+    texto = str(valor).strip()
+    return texto or None
 
 
-def get_input(input_variables: Dict[str, Any], name: str, default: Any = None) -> Any:
+def obtener_variable_entrada(
+    variables_entrada: Dict[str, Any],
+    nombre: str,
+    defecto: Any = None,
+) -> Any:
     """
     Obtiene una variable desde input_variables ignorando tildes,
     mayúsculas, minúsculas y separadores.
     """
-    target = normalize_key(name)
 
-    for key, value in input_variables.items():
-        if normalize_key(key) == target:
-            return value
+    objetivo = normalizar_clave(nombre)
 
-    return default
+    for clave, valor in variables_entrada.items():
+        if normalizar_clave(clave) == objetivo:
+            return valor
+
+    return defecto
 
 
-def is_yes(value: Any) -> bool:
+def es_si(valor: Any) -> bool:
     """
     Retorna True si el valor representa afirmación.
     """
-    return normalize_text(value) in {
+
+    return normalizar_texto(valor) in {
         "si",
         "s",
         "yes",
@@ -5275,14 +5318,15 @@ def is_yes(value: Any) -> bool:
     }
 
 
-def is_true(value: Any) -> bool:
+def es_verdadero(valor: Any) -> bool:
     """
     Retorna True si el valor representa booleano verdadero.
     """
-    if isinstance(value, bool):
-        return value
 
-    return normalize_text(value) in {
+    if isinstance(valor, bool):
+        return valor
+
+    return normalizar_texto(valor) in {
         "true",
         "si",
         "s",
@@ -5292,91 +5336,99 @@ def is_true(value: Any) -> bool:
     }
 
 
-def build_output_map(extracted_variables: Any) -> Dict[str, Any]:
+def construir_mapa_variables_salida(variables_extraidas: Any) -> Dict[str, Any]:
     """
-    Convierte extracted_variables en diccionario normalizado.
+    Convierte extracted_variables en un diccionario normalizado.
 
-    Soporta dos formatos:
-    1. Lista:
-       [{"name": "interes_pagar", "value": "Si"}]
+    Entrada:
+    [
+        {"name": "interes_pagar", "value": "si"},
+        {"name": "contestó", "value": true}
+    ]
 
-    2. Diccionario:
-       {"interes_pagar": "Si"}
+    Salida:
+    {
+        "interes_pagar": "si",
+        "contesto": true
+    }
     """
-    output: Dict[str, Any] = {}
 
-    if isinstance(extracted_variables, list):
-        for item in extracted_variables:
-            if not isinstance(item, dict):
+    salida: Dict[str, Any] = {}
+
+    if isinstance(variables_extraidas, list):
+        for elemento in variables_extraidas:
+            if not isinstance(elemento, dict):
                 continue
 
-            name = item.get("name")
-            value = item.get("value")
+            nombre = elemento.get("name")
+            valor = elemento.get("value")
 
-            if name:
-                output[normalize_key(name)] = value
+            if nombre:
+                salida[normalizar_clave(nombre)] = valor
 
-        return output
+        return salida
 
-    if isinstance(extracted_variables, dict):
-        for key, value in extracted_variables.items():
-            output[normalize_key(key)] = value
+    if isinstance(variables_extraidas, dict):
+        for clave, valor in variables_extraidas.items():
+            salida[normalizar_clave(clave)] = valor
 
-        return output
+        return salida
 
-    return output
+    return salida
 
 
-def normalize_phone_variants(value: Any) -> List[str]:
+def normalizar_variantes_telefono(valor: Any) -> List[str]:
     """
-    Genera variantes del teléfono del cliente para búsqueda en Bitrix.
+    Genera variantes del teléfono del cliente.
 
-    Prioridad:
-    1. Formato con indicativo Colombia sin '+': 573002613153
-    2. Número nacional: 3002613153
-    3. Formato internacional con '+': +573002613153
+    Para 3002613153 produce:
+    1. 573002613153
+    2. 3002613153
+    3. +573002613153
 
-    No usar WHATSAPP_DISPONIBLE aquí.
+    Se conserva este orden porque el formato 573002613153 fue el que
+    funcionó correctamente en la prueba real con Bitrix.
     """
 
-    if value is None:
+    if valor is None:
         return []
 
-    raw = str(value).strip()
-    digits = re.sub(r"\D", "", raw)
+    crudo = str(valor).strip()
+    digitos = re.sub(r"\D", "", crudo)
 
-    if not digits:
+    if not digitos:
         return []
 
-    variants: List[str] = []
+    variantes: List[str] = []
 
-    if len(digits) == 10 and digits.startswith("3"):
-        variants.append(f"57{digits}")
-        variants.append(digits)
-        variants.append(f"+57{digits}")
+    if len(digitos) == 10 and digitos.startswith("3"):
+        variantes.append(f"57{digitos}")
+        variantes.append(digitos)
+        variantes.append(f"+57{digitos}")
 
-    elif len(digits) == 12 and digits.startswith("57"):
-        variants.append(digits)
-        variants.append(digits[-10:])
-        variants.append(f"+{digits}")
+    elif len(digitos) == 12 and digitos.startswith("57"):
+        variantes.append(digitos)
+        variantes.append(digitos[-10:])
+        variantes.append(f"+{digitos}")
 
     else:
-        variants.append(digits)
-        if raw.startswith("+"):
-            variants.append(raw)
+        variantes.append(digitos)
 
-    # Quitar duplicados conservando orden
-    unique_variants: List[str] = []
-    for item in variants:
-        if item not in unique_variants:
-            unique_variants.append(item)
+        if crudo.startswith("+"):
+            variantes.append(crudo)
 
-    return unique_variants
+    variantes_unicas: List[str] = []
+
+    for item in variantes:
+        if item not in variantes_unicas:
+            variantes_unicas.append(item)
+
+    return variantes_unicas
 
 
-def build_bitrix_lookup_criteria(
-    input_variables: Dict[str, Any],
-) -> BitrixLookupCriteria:
+def construir_criterios_busqueda_bitrix(
+    variables_entrada: Dict[str, Any],
+) -> CriteriosBusquedaBitrix:
     """
     Construye criterios de búsqueda desde input_variables.
 
@@ -5386,46 +5438,41 @@ def build_bitrix_lookup_criteria(
     - CORREO
 
     Ignora:
-    - WHATSAPP_DISPONIBLE, porque no pertenece al cliente.
+    - WHATSAPP_DISPONIBLE
     """
-    cedula = clean_str(get_input(input_variables, "CEDULA"))
-    telefono = get_input(input_variables, "TELEFONO")
-    correo = clean_str(get_input(input_variables, "CORREO"))
-    nombre = clean_str(get_input(input_variables, "NOMBRE"))
-    id_libranza = clean_str(get_input(input_variables, "ID_LIBRANZA"))
 
-    return BitrixLookupCriteria(
+    cedula = limpiar_texto(obtener_variable_entrada(variables_entrada, "CEDULA"))
+    telefono = obtener_variable_entrada(variables_entrada, "TELEFONO")
+    correo = limpiar_texto(obtener_variable_entrada(variables_entrada, "CORREO"))
+    nombre = limpiar_texto(obtener_variable_entrada(variables_entrada, "NOMBRE"))
+    id_libranza = limpiar_texto(obtener_variable_entrada(variables_entrada, "ID_LIBRANZA"))
+
+    return CriteriosBusquedaBitrix(
         cedula=cedula,
-        telefono_variants=normalize_phone_variants(telefono),
+        variantes_telefono=normalizar_variantes_telefono(telefono),
         correo=correo.lower() if correo else None,
         nombre=nombre,
         id_libranza=id_libranza,
     )
 
 
-def build_static_contact_select() -> List[str]:
+def construir_select_busqueda_contacto() -> List[str]:
     """
-    Construye el select estático de contacto.
+    Construye el select limpio para búsqueda de contacto.
 
-    Campos validados:
-    - id
-    - name
-    - lastName
-    - email
-    - phone
-
-    Campo de cédula:
-    - UF_CRM_1697774324
+    Importante:
+    No se incluye UF_CRM_1697774324 en el select de búsqueda.
+    Ese campo se usa solo en el filter por cédula.
     """
-    select = CONTACT_LOOKUP_SELECT.copy()
 
-    if BITRIX_CONTACT_CEDULA_FIELD:
-        select.append(BITRIX_CONTACT_CEDULA_FIELD)
-
-    return select
+    return CONTACT_LOOKUP_SELECT.copy()
 
 
-POSITIVE_GESTION_VALUES = {
+# ============================================================
+# Validación de intención positiva de pago
+# ============================================================
+
+VALORES_GESTION_POSITIVA = {
     "pago_hoy",
     "promesa_pago",
     "pago_fraccionado",
@@ -5435,315 +5482,473 @@ POSITIVE_GESTION_VALUES = {
     "acuerdo",
 }
 
-NEGATIVE_GESTION_VALUES = {
+VALORES_GESTION_NEGATIVA = {
     "no_acuerdo",
     "sin_respuesta",
     "cierre_sin_acuerdo",
     "numero_equivocado",
 }
 
-VALIDATION_OK_VALUES = {
+VALORES_VALIDACION_IDENTIDAD_OK = {
     "validado",
     "valido",
     "validada",
 }
 
 
-def evaluate_payment_intent(output_vars: Dict[str, Any]) -> Dict[str, Any]:
+def evaluar_intencion_pago(variables_salida: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Evalúa si la llamada confirma intención real de pago.
+    Evalúa si la llamada confirma intención positiva de pago.
 
     Reglas:
     - Debió contestar un humano.
     - La identidad debe estar validada.
     - Debe existir pago_hoy=Si o interes_pagar=Si con acuerdo/promesa/fecha.
     """
-    resultvalidacion = normalize_text(output_vars.get("resultvalidacion"))
-    gestion_final = normalize_text(output_vars.get("gestion_final"))
-    objetivo = normalize_text(output_vars.get("objetivo"))
 
-    interes_pagar = output_vars.get("interes_pagar")
-    pago_hoy = output_vars.get("pago_hoy")
-    fecha_acuerdo_pago = output_vars.get("fechacuerdopago")
-    contesto = output_vars.get("contesto")
+    resultado_validacion = normalizar_texto(variables_salida.get("resultvalidacion"))
+    gestion_final = normalizar_texto(variables_salida.get("gestion_final"))
+    objetivo = normalizar_texto(variables_salida.get("objetivo"))
 
-    detalle_acuerdo = normalize_text(output_vars.get("detalle_acuerdo"))
-    resumen = normalize_text(output_vars.get("resumen"))
-    resumen_llamada = normalize_text(output_vars.get("resumenllamada"))
-    objdetallada = normalize_text(output_vars.get("objdetallada"))
-    obsjdetallada = normalize_text(output_vars.get("obsjdetallada"))
+    interes_pagar = variables_salida.get("interes_pagar")
+    pago_hoy = variables_salida.get("pago_hoy")
+    fecha_acuerdo_pago = variables_salida.get("fechacuerdopago")
+    contesto = variables_salida.get("contesto")
 
-    blockers: List[str] = []
-    warnings: List[str] = []
-    positive_signals: List[str] = []
+    detalle_acuerdo = normalizar_texto(variables_salida.get("detalle_acuerdo"))
+    resumen = normalizar_texto(variables_salida.get("resumen"))
+    resumen_llamada = normalizar_texto(variables_salida.get("resumenllamada"))
+    obj_detallada = normalizar_texto(variables_salida.get("objdetallada"))
+    obs_detallada = normalizar_texto(variables_salida.get("obsjdetallada"))
 
-    if not is_true(contesto):
-        blockers.append(
-            "La llamada no fue contestada por un humano o no hubo conversación efectiva."
-        )
+    bloqueadores: List[str] = []
+    advertencias: List[str] = []
+    senales_positivas: List[str] = []
+
+    if not es_verdadero(contesto):
+        bloqueadores.append("La llamada no fue contestada por un humano o no hubo conversación efectiva.")
     else:
-        positive_signals.append("contesto=true")
+        senales_positivas.append("contesto=true")
 
-    if resultvalidacion not in VALIDATION_OK_VALUES:
-        blockers.append(
-            f"Identidad no validada: resultvalidacion={resultvalidacion or 'vacio'}."
-        )
+    if resultado_validacion not in VALORES_VALIDACION_IDENTIDAD_OK:
+        bloqueadores.append(f"Identidad no validada: resultvalidacion={resultado_validacion or 'vacio'}.")
     else:
-        positive_signals.append("resultvalidacion=validado")
+        senales_positivas.append("resultvalidacion=validado")
 
     if objetivo and objetivo != "cobro_libranza":
-        warnings.append(f"Objetivo diferente al esperado: objetivo={objetivo}.")
+        advertencias.append(f"Objetivo diferente al esperado: objetivo={objetivo}.")
 
-    if gestion_final in NEGATIVE_GESTION_VALUES:
-        blockers.append(f"Gestión final negativa: gestion_final={gestion_final}.")
+    if gestion_final in VALORES_GESTION_NEGATIVA:
+        bloqueadores.append(f"Gestión final negativa: gestion_final={gestion_final}.")
 
-    has_positive_gestion = gestion_final in POSITIVE_GESTION_VALUES
-    has_payment_date = bool(str(fecha_acuerdo_pago or "").strip())
+    tiene_gestion_positiva = gestion_final in VALORES_GESTION_POSITIVA
+    tiene_fecha_pago = bool(str(fecha_acuerdo_pago or "").strip())
 
-    agreement_text = " ".join(
+    texto_acuerdo = " ".join(
         [
             detalle_acuerdo,
             resumen,
             resumen_llamada,
-            objdetallada,
-            obsjdetallada,
+            obj_detallada,
+            obs_detallada,
         ]
     )
 
-    has_agreement_text = (
-        "acuerdo" in agreement_text
-        and "sin_acuerdo" not in agreement_text
-        and "no_acuerdo" not in agreement_text
+    tiene_texto_acuerdo = (
+        "acuerdo" in texto_acuerdo
+        and "sin_acuerdo" not in texto_acuerdo
+        and "no_acuerdo" not in texto_acuerdo
     )
 
-    if is_yes(interes_pagar):
-        positive_signals.append("interes_pagar=Si")
+    if es_si(interes_pagar):
+        senales_positivas.append("interes_pagar=Si")
 
-    if is_yes(pago_hoy):
-        positive_signals.append("pago_hoy=Si")
+    if es_si(pago_hoy):
+        senales_positivas.append("pago_hoy=Si")
 
-    if has_positive_gestion:
-        positive_signals.append(f"gestion_final={gestion_final}")
+    if tiene_gestion_positiva:
+        senales_positivas.append(f"gestion_final={gestion_final}")
 
-    if has_payment_date:
-        positive_signals.append(f"fechacuerdopago={fecha_acuerdo_pago}")
+    if tiene_fecha_pago:
+        senales_positivas.append(f"fechacuerdopago={fecha_acuerdo_pago}")
 
-    if has_agreement_text:
-        positive_signals.append("texto_contiene_acuerdo")
+    if tiene_texto_acuerdo:
+        senales_positivas.append("texto_contiene_acuerdo")
 
-    payment_intent = is_yes(pago_hoy) or (
-        is_yes(interes_pagar)
-        and (has_positive_gestion or has_payment_date or has_agreement_text)
+    intencion_pago = (
+        es_si(pago_hoy)
+        or (
+            es_si(interes_pagar)
+            and (
+                tiene_gestion_positiva
+                or tiene_fecha_pago
+                or tiene_texto_acuerdo
+            )
+        )
     )
 
-    if not payment_intent:
-        blockers.append(
+    if not intencion_pago:
+        bloqueadores.append(
             "No hay intención de pago suficiente. Se requiere pago_hoy=Si "
             "o interes_pagar=Si con acuerdo, promesa o fecha de pago."
         )
 
-    approved = len(blockers) == 0
+    aprobado = len(bloqueadores) == 0
 
     return {
-        "approved": approved,
-        "payment_intent": payment_intent,
-        "positive_signals": positive_signals,
-        "blockers": blockers,
-        "warnings": warnings,
-        "normalized": {
-            "resultvalidacion": resultvalidacion,
-            "gestion_final": gestion_final,
-            "objetivo": objetivo,
-            "interes_pagar": normalize_text(interes_pagar),
-            "pago_hoy": normalize_text(pago_hoy),
-            "fechacuerdopago": fecha_acuerdo_pago,
-            "contesto": is_true(contesto),
-        },
-    }
+    # Llaves nuevas en español
+    "aprobado": aprobado,
+    "intencion_pago": intencion_pago,
+    "senales_positivas": senales_positivas,
+    "bloqueadores": bloqueadores,
+    "advertencias": advertencias,
+    "normalizado": {
+        "resultvalidacion": resultado_validacion,
+        "gestion_final": gestion_final,
+        "objetivo": objetivo,
+        "interes_pagar": normalizar_texto(interes_pagar),
+        "pago_hoy": normalizar_texto(pago_hoy),
+        "fechacuerdopago": fecha_acuerdo_pago,
+        "contesto": es_verdadero(contesto),
+    },
+
+    # Llaves de compatibilidad con el endpoint anterior
+    "approved": aprobado,
+    "payment_intent": intencion_pago,
+    "positive_signals": senales_positivas,
+    "blockers": bloqueadores,
+    "warnings": advertencias,
+    "normalized": {
+        "resultvalidacion": resultado_validacion,
+        "gestion_final": gestion_final,
+        "objetivo": objetivo,
+        "interes_pagar": normalizar_texto(interes_pagar),
+        "pago_hoy": normalizar_texto(pago_hoy),
+        "fechacuerdopago": fecha_acuerdo_pago,
+        "contesto": es_verdadero(contesto),
+    },
+}
 
 
-async def bitrix_call(
-    method: str,
-    payload: Optional[Dict[str, Any]] = None,
-    max_retries: int = 3,
-    retry_delay_seconds: float = 1.0,
+# ============================================================
+# Cliente Bitrix24 con reintentos
+# ============================================================
+
+async def llamar_bitrix(
+    metodo: str,
+    cuerpo: Optional[Dict[str, Any]] = None,
+    max_reintentos: int = 3,
+    espera_segundos: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Ejecuta POST contra un método REST de Bitrix24 con manejo de errores y reintentos.
+    Ejecuta POST contra un método REST de Bitrix24 con manejo de errores.
 
-    Reintenta cuando:
+    Reintenta:
     - timeout
     - error de conexión
     - HTTP 429
     - HTTP 5xx
+    - errores de API reintentables como QUERY_LIMIT_EXCEEDED
 
-    No reintenta cuando:
-    - Bitrix responde HTTP 200, aunque no haya resultados.
-    - Bitrix responde error funcional 4xx distinto de 429.
+    No reintenta:
+    - HTTP 200 sin resultados
+    - HTTP 200 con item sin id
+    - HTTP 4xx funcional distinto de 429
     """
 
-    payload = payload or {}
+    cuerpo = cuerpo or {}
 
     if not BITRIX_BASE_URL:
-        raise BitrixAPIError(
-            message="BITRIX_BASE_URL no está configurado.",
-            method=method,
+        raise ErrorBitrixAPI(
+            mensaje="BITRIX_BASE_URL no está configurado.",
+            metodo=metodo,
         )
 
-    url = f"{BITRIX_BASE_URL}/{method}.json"
+    url = f"{BITRIX_BASE_URL}/{metodo}.json"
+    ultimo_error: Optional[Exception] = None
 
-    last_error: Optional[Exception] = None
+    errores_api_reintentables = {
+        "QUERY_LIMIT_EXCEEDED",
+        "TOO_MANY_REQUESTS",
+        "OPERATION_TIME_LIMIT",
+    }
 
-    for attempt in range(1, max_retries + 1):
+    for intento in range(1, max_reintentos + 1):
         logger.info(
-            "Bitrix request iniciado | method=%s | attempt=%s/%s | payload=%s",
-            method,
-            attempt,
-            max_retries,
-            json.dumps(payload, ensure_ascii=False, default=str),
+            "Bitrix request iniciado | metodo=%s | intento=%s/%s | cuerpo=%s",
+            metodo,
+            intento,
+            max_reintentos,
+            json.dumps(cuerpo, ensure_ascii=False, default=str),
         )
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(url, json=payload)
+                respuesta_http = await client.post(url, json=cuerpo)
 
             try:
-                data = response.json()
+                datos = respuesta_http.json()
             except ValueError as exc:
                 logger.error(
-                    "Bitrix respondió contenido no JSON | method=%s | status=%s | text=%s",
-                    method,
-                    response.status_code,
-                    response.text[:1000],
+                    "Bitrix respondió contenido no JSON | metodo=%s | estado=%s | texto=%s",
+                    metodo,
+                    respuesta_http.status_code,
+                    respuesta_http.text[:1000],
                 )
-                raise BitrixAPIError(
-                    message="Bitrix24 respondió contenido no JSON.",
-                    method=method,
-                    status_code=response.status_code,
-                    response_data=response.text[:1000],
+                raise ErrorBitrixAPI(
+                    mensaje="Bitrix24 respondió contenido no JSON.",
+                    metodo=metodo,
+                    codigo_estado=respuesta_http.status_code,
+                    respuesta=respuesta_http.text[:1000],
                 ) from exc
 
-            if response.status_code == 200:
-                if "error" in data:
+            if respuesta_http.status_code == 200:
+                if "error" in datos:
+                    codigo_error = str(datos.get("error", "")).upper()
+
+                    if codigo_error in errores_api_reintentables and intento < max_reintentos:
+                        logger.warning(
+                            "Bitrix respondió error de API reintentable | metodo=%s | error=%s | intento=%s/%s",
+                            metodo,
+                            codigo_error,
+                            intento,
+                            max_reintentos,
+                        )
+                        await asyncio.sleep(espera_segundos * intento)
+                        continue
+
                     logger.error(
-                        "Bitrix respondió error de API | method=%s | error=%s | description=%s",
-                        method,
-                        data.get("error"),
-                        data.get("error_description"),
+                        "Bitrix respondió error de API | metodo=%s | error=%s | descripcion=%s",
+                        metodo,
+                        datos.get("error"),
+                        datos.get("error_description"),
                     )
-                    raise BitrixAPIError(
-                        message=data.get("error_description")
-                        or data.get("error")
-                        or "Error Bitrix24.",
-                        method=method,
-                        status_code=response.status_code,
-                        response_data=data,
+                    raise ErrorBitrixAPI(
+                        mensaje=datos.get("error_description") or datos.get("error") or "Error Bitrix24.",
+                        metodo=metodo,
+                        codigo_estado=respuesta_http.status_code,
+                        respuesta=datos,
                     )
 
                 logger.info(
-                    "Bitrix request exitoso | method=%s | attempt=%s | status=200",
-                    method,
-                    attempt,
+                    "Bitrix request exitoso | metodo=%s | intento=%s | estado=200",
+                    metodo,
+                    intento,
                 )
-                return data
+                return datos
 
-            if response.status_code == 429 or response.status_code >= 500:
+            if respuesta_http.status_code == 429 or respuesta_http.status_code >= 500:
                 logger.warning(
-                    "Bitrix respondió error reintentable | method=%s | status=%s | attempt=%s/%s | response=%s",
-                    method,
-                    response.status_code,
-                    attempt,
-                    max_retries,
-                    json.dumps(data, ensure_ascii=False, default=str),
+                    "Bitrix respondió error reintentable | metodo=%s | estado=%s | intento=%s/%s",
+                    metodo,
+                    respuesta_http.status_code,
+                    intento,
+                    max_reintentos,
                 )
 
-                last_error = BitrixAPIError(
-                    message="Bitrix24 respondió error reintentable.",
-                    method=method,
-                    status_code=response.status_code,
-                    response_data=data,
+                ultimo_error = ErrorBitrixAPI(
+                    mensaje="Bitrix24 respondió error reintentable.",
+                    metodo=metodo,
+                    codigo_estado=respuesta_http.status_code,
+                    respuesta=datos,
                 )
 
-                if attempt < max_retries:
-                    await asyncio.sleep(retry_delay_seconds * attempt)
+                if intento < max_reintentos:
+                    await asyncio.sleep(espera_segundos * intento)
                     continue
 
-                raise last_error
+                raise ultimo_error
 
             logger.error(
-                "Bitrix respondió error HTTP no reintentable | method=%s | status=%s | response=%s",
-                method,
-                response.status_code,
-                json.dumps(data, ensure_ascii=False, default=str),
+                "Bitrix respondió error HTTP no reintentable | metodo=%s | estado=%s | respuesta=%s",
+                metodo,
+                respuesta_http.status_code,
+                json.dumps(datos, ensure_ascii=False, default=str),
             )
 
-            raise BitrixAPIError(
-                message="Bitrix24 respondió error HTTP no reintentable.",
-                method=method,
-                status_code=response.status_code,
-                response_data=data,
+            raise ErrorBitrixAPI(
+                mensaje="Bitrix24 respondió error HTTP no reintentable.",
+                metodo=metodo,
+                codigo_estado=respuesta_http.status_code,
+                respuesta=datos,
             )
 
         except httpx.TimeoutException as exc:
-            last_error = exc
+            ultimo_error = exc
+
             logger.warning(
-                "Timeout llamando Bitrix | method=%s | attempt=%s/%s | error=%s",
-                method,
-                attempt,
-                max_retries,
+                "Timeout llamando Bitrix | metodo=%s | intento=%s/%s | error=%s",
+                metodo,
+                intento,
+                max_reintentos,
                 str(exc),
             )
 
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delay_seconds * attempt)
+            if intento < max_reintentos:
+                await asyncio.sleep(espera_segundos * intento)
                 continue
 
-            raise BitrixAPIError(
-                message="Timeout al llamar Bitrix24.",
-                method=method,
+            raise ErrorBitrixAPI(
+                mensaje="Timeout al llamar Bitrix24.",
+                metodo=metodo,
             ) from exc
 
         except httpx.RequestError as exc:
-            last_error = exc
+            ultimo_error = exc
+
             logger.warning(
-                "Error de conexión llamando Bitrix | method=%s | attempt=%s/%s | error=%s",
-                method,
-                attempt,
-                max_retries,
+                "Error de conexión llamando Bitrix | metodo=%s | intento=%s/%s | error=%s",
+                metodo,
+                intento,
+                max_reintentos,
                 str(exc),
             )
 
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delay_seconds * attempt)
+            if intento < max_reintentos:
+                await asyncio.sleep(espera_segundos * intento)
                 continue
 
-            raise BitrixAPIError(
-                message="Error de conexión al llamar Bitrix24.",
-                method=method,
+            raise ErrorBitrixAPI(
+                mensaje="Error de conexión al llamar Bitrix24.",
+                metodo=metodo,
             ) from exc
 
-    raise BitrixAPIError(
-        message=f"No fue posible completar la llamada a Bitrix24. Último error: {last_error}",
-        method=method,
+    raise ErrorBitrixAPI(
+        mensaje=f"No fue posible completar la llamada a Bitrix24. Último error: {ultimo_error}",
+        metodo=metodo,
     )
 
 
-def extract_bitrix_items(bitrix_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+
+def extraer_items_bitrix(respuesta_bitrix: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extrae items desde respuestas de crm.item.list.
     """
-    result = bitrix_response.get("result") or {}
 
-    if isinstance(result, dict) and isinstance(result.get("items"), list):
-        return result["items"]
+    resultado = respuesta_bitrix.get("result") or {}
 
-    if isinstance(result, list):
-        return result
+    if isinstance(resultado, dict) and isinstance(resultado.get("items"), list):
+        return resultado["items"]
+
+    if isinstance(resultado, list):
+        return resultado
 
     return []
 
 
-async def find_contact_by_cedula(cedula: str) -> Optional[Dict[str, Any]]:
+def contacto_bitrix_valido(contacto: Optional[Dict[str, Any]]) -> bool:
+    """
+    Valida que el contacto retornado por Bitrix sea utilizable.
+
+    Para crear el deal se necesita:
+    contactIds: [id_contacto]
+    """
+
+    if not contacto:
+        return False
+
+    id_contacto = contacto.get("id") or contacto.get("ID")
+
+    if id_contacto is None:
+        logger.warning(
+            "Bitrix retornó un contacto sin id. Se tratará como inválido | contacto=%s",
+            json.dumps(contacto, ensure_ascii=False, default=str),
+        )
+        return False
+
+    try:
+        int(id_contacto)
+        return True
+    except (TypeError, ValueError):
+        logger.warning(
+            "Bitrix retornó un id de contacto inválido | id=%s | contacto=%s",
+            id_contacto,
+            json.dumps(contacto, ensure_ascii=False, default=str),
+        )
+        return False
+
+
+# ============================================================
+# Búsqueda de contacto en Bitrix
+# ============================================================
+
+async def buscar_contacto_por_telefono(
+    variantes_telefono: List[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Busca contacto por teléfono probando una variante por petición.
+
+    Orden típico:
+    1. 573002613153
+    2. 3002613153
+    3. +573002613153
+
+    El ciclo termina apenas Bitrix retorna un contacto con id válido.
+    """
+
+    if not variantes_telefono:
+        logger.info("No hay teléfono del cliente para consultar.")
+        return None
+
+    logger.info("Buscando contacto por teléfono | variantes=%s", variantes_telefono)
+
+    for telefono in variantes_telefono:
+        valor_telefono: Any = telefono
+
+        # Replica la petición manual que funcionó:
+        # "filter": {"@phone": 573002613153}
+        if str(telefono).isdigit():
+            valor_telefono = int(telefono)
+
+        cuerpo = {
+            "entityTypeId": CONTACT_ENTITY_TYPE_ID,
+            "select": construir_select_busqueda_contacto(),
+            "filter": {
+                "@phone": valor_telefono,
+            },
+        }
+
+        logger.info(
+            "Intentando búsqueda por variante de teléfono | telefono=%s | cuerpo=%s",
+            telefono,
+            json.dumps(cuerpo, ensure_ascii=False, default=str),
+        )
+
+        datos = await llamar_bitrix("crm.item.list", cuerpo)
+        items = extraer_items_bitrix(datos)
+
+        logger.info(
+            "Respuesta Bitrix por variante | telefono=%s | total_items=%s | items=%s",
+            telefono,
+            len(items),
+            json.dumps(items, ensure_ascii=False, default=str),
+        )
+
+        if not items:
+            logger.info("Sin contacto para variante | telefono=%s", telefono)
+            continue
+
+        primer_item = items[0]
+
+        if contacto_bitrix_valido(primer_item):
+            logger.info(
+                "Contacto encontrado por teléfono | telefono=%s | id=%s",
+                telefono,
+                primer_item.get("id") or primer_item.get("ID"),
+            )
+            return primer_item
+
+        logger.warning(
+            "Bitrix retornó item sin id para variante | telefono=%s | item=%s",
+            telefono,
+            json.dumps(primer_item, ensure_ascii=False, default=str),
+        )
+
+    logger.info("No se encontró contacto válido por ninguna variante de teléfono.")
+    return None
+
+
+async def buscar_contacto_por_cedula(cedula: str) -> Optional[Dict[str, Any]]:
     """
     Busca contacto por cédula/documento de identidad.
 
@@ -5751,26 +5956,26 @@ async def find_contact_by_cedula(cedula: str) -> Optional[Dict[str, Any]]:
     No lo incluye en select para evitar respuestas sin id.
     """
 
-    payload = {
+    cuerpo = {
         "entityTypeId": CONTACT_ENTITY_TYPE_ID,
-        "select": build_contact_lookup_select(),
+        "select": construir_select_busqueda_contacto(),
         "filter": {
             BITRIX_CONTACT_CEDULA_FIELD: cedula,
         },
     }
 
     logger.info(
-        "Buscando contacto por cédula | cedula=%s | field=%s | payload=%s",
+        "Buscando contacto por cédula | cedula=%s | campo=%s | cuerpo=%s",
         cedula,
         BITRIX_CONTACT_CEDULA_FIELD,
-        json.dumps(payload, ensure_ascii=False, default=str),
+        json.dumps(cuerpo, ensure_ascii=False, default=str),
     )
 
-    data = await bitrix_call("crm.item.list", payload)
-    items = extract_bitrix_items(data)
+    datos = await llamar_bitrix("crm.item.list", cuerpo)
+    items = extraer_items_bitrix(datos)
 
     logger.info(
-        "Respuesta búsqueda cédula | items=%s",
+        "Respuesta búsqueda por cédula | items=%s",
         json.dumps(items, ensure_ascii=False, default=str),
     )
 
@@ -5778,155 +5983,42 @@ async def find_contact_by_cedula(cedula: str) -> Optional[Dict[str, Any]]:
         logger.info("Bitrix respondió 200 pero no encontró contacto por cédula.")
         return None
 
-    first_item = items[0]
+    primer_item = items[0]
 
-    if not is_valid_bitrix_contact(first_item):
+    if not contacto_bitrix_valido(primer_item):
         logger.warning(
             "Bitrix encontró item por cédula pero sin id válido | item=%s",
-            json.dumps(first_item, ensure_ascii=False, default=str),
+            json.dumps(primer_item, ensure_ascii=False, default=str),
         )
         return None
 
-    logger.info("Contacto encontrado por cédula | id=%s", first_item.get("id"))
-    return first_item
+    logger.info("Contacto encontrado por cédula | id=%s", primer_item.get("id"))
+    return primer_item
 
-
-async def find_contact_by_phone(telefono_variants: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    Busca contacto por teléfono del cliente.
-    Estrategia:
-    1. Intenta cada variante individualmente con el formato que funcionó en Bitrix:
-        filter: {"@phone": 573002613153}
-    2. Si no encuentra, intenta con array como fallback:
-        filter: {"@phone": ["573002613153", "3002613153", "+573002613153"]}
-
-    Detiene la búsqueda apenas obtiene un contacto con id válido.
-    """
-
-    if not telefono_variants:
-        logger.info("No hay teléfono del cliente para consultar.")
-        return None
-
-    select = build_contact_lookup_select()
-
-    logger.info("Buscando contacto por teléfono | variants=%s", telefono_variants)
-
-    # Intento 1: variante por variante, como tu prueba manual.
-    for phone in telefono_variants:
-        phone_value: Any = phone
-
-        # Si es puramente numérico, enviarlo como int para replicar tu prueba:
-        # "@phone": 573002613153
-        if str(phone).isdigit():
-            phone_value = int(phone)
-
-        payload = {
-            "entityTypeId": CONTACT_ENTITY_TYPE_ID,
-            "select": select,
-            "filter": {
-                "@phone": phone_value,
-            },
-        }
-
-        logger.info(
-            "Buscando contacto por teléfono individual | phone=%s | payload=%s",
-            phone,
-            json.dumps(payload, ensure_ascii=False, default=str),
-        )
-
-        data = await bitrix_call("crm.item.list", payload)
-        items = extract_bitrix_items(data)
-
-        logger.info(
-            "Respuesta búsqueda teléfono individual | phone=%s | items=%s",
-            phone,
-            json.dumps(items, ensure_ascii=False, default=str),
-        )
-
-        if not items:
-            continue
-
-        first_item = items[0]
-
-        if is_valid_bitrix_contact(first_item):
-            logger.info(
-                "Contacto válido encontrado por teléfono individual | phone=%s | id=%s",
-                phone,
-                first_item.get("id") or first_item.get("ID"),
-            )
-            return first_item
-
-        logger.warning(
-            "Item encontrado por teléfono, pero sin id válido | phone=%s | item=%s",
-            phone,
-            json.dumps(first_item, ensure_ascii=False, default=str),
-        )
-
-    # Intento 2: fallback con array.
-    payload = {
-        "entityTypeId": CONTACT_ENTITY_TYPE_ID,
-        "select": select,
-        "filter": {
-            "@phone": telefono_variants,
-        },
-    }
-
-    logger.info(
-        "Buscando contacto por teléfono en array fallback | payload=%s",
-        json.dumps(payload, ensure_ascii=False, default=str),
-    )
-
-    data = await bitrix_call("crm.item.list", payload)
-    items = extract_bitrix_items(data)
-
-    logger.info(
-        "Respuesta búsqueda teléfono fallback | items=%s",
-        json.dumps(items, ensure_ascii=False, default=str),
-    )
-
-    if not items:
-        logger.info("Bitrix respondió 200 pero no encontró contacto por teléfono.")
-        return None
-
-    first_item = items[0]
-
-    if not is_valid_bitrix_contact(first_item):
-        logger.warning(
-            "Bitrix encontró item por teléfono pero sin id válido | item=%s",
-            json.dumps(first_item, ensure_ascii=False, default=str),
-        )
-        return None
-
-    logger.info("Contacto encontrado por teléfono fallback | id=%s", first_item.get("id"))
-    return first_item
-
-
-async def find_contact_by_email(correo: str) -> Optional[Dict[str, Any]]:
+async def buscar_contacto_por_correo(correo: str) -> Optional[Dict[str, Any]]:
     """
     Busca contacto por correo electrónico.
-
-    Usa select limpio para garantizar que Bitrix devuelva id.
     """
 
-    payload = {
+    cuerpo = {
         "entityTypeId": CONTACT_ENTITY_TYPE_ID,
-        "select": build_contact_lookup_select(),
+        "select": construir_select_busqueda_contacto(),
         "filter": {
             "email": correo,
         },
     }
 
     logger.info(
-        "Buscando contacto por correo | correo=%s | payload=%s",
+        "Buscando contacto por correo | correo=%s | cuerpo=%s",
         correo,
-        json.dumps(payload, ensure_ascii=False, default=str),
+        json.dumps(cuerpo, ensure_ascii=False, default=str),
     )
 
-    data = await bitrix_call("crm.item.list", payload)
-    items = extract_bitrix_items(data)
+    datos = await llamar_bitrix("crm.item.list", cuerpo)
+    items = extraer_items_bitrix(datos)
 
     logger.info(
-        "Respuesta búsqueda correo | items=%s",
+        "Respuesta búsqueda por correo | items=%s",
         json.dumps(items, ensure_ascii=False, default=str),
     )
 
@@ -5934,260 +6026,161 @@ async def find_contact_by_email(correo: str) -> Optional[Dict[str, Any]]:
         logger.info("Bitrix respondió 200 pero no encontró contacto por correo.")
         return None
 
-    first_item = items[0]
+    primer_item = items[0]
 
-    if not is_valid_bitrix_contact(first_item):
+    if not contacto_bitrix_valido(primer_item):
         logger.warning(
             "Bitrix encontró item por correo pero sin id válido | item=%s",
-            json.dumps(first_item, ensure_ascii=False, default=str),
+            json.dumps(primer_item, ensure_ascii=False, default=str),
         )
         return None
 
-    logger.info("Contacto encontrado por correo | id=%s", first_item.get("id"))
-    return first_item
+    logger.info("Contacto encontrado por correo | id=%s", primer_item.get("id"))
+    return primer_item
 
 
-async def find_contact_from_input_variables(
-    input_variables: Dict[str, Any],
+async def buscar_contacto_desde_variables_entrada(
+    variables_entrada: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """
-    Busca contacto en Bitrix usando datos del cliente.
+    Orquesta la búsqueda del contacto en Bitrix.
 
-    Nuevo orden requerido:
-    1. TELEFONO -> phone
-    2. CEDULA -> UF_CRM_1697774324
-    3. CORREO -> email, como fallback opcional
+    Orden:
+    1. Teléfono, probando variante por variante.
+    2. Cédula.
+    3. Correo.
 
-    Reglas:
-    - Si Bitrix responde 200 y encuentra contacto con id válido, se detiene.
-    - Si Bitrix responde 200 pero no hay contacto o no trae id, se pasa al siguiente criterio.
-    - Si Bitrix falla por timeout/conexión/5xx, se reintenta.
+    Si encuentra un contacto con id, retorna inmediatamente.
     """
 
-    criteria = build_bitrix_lookup_criteria(input_variables)
+    criterios = construir_criterios_busqueda_bitrix(variables_entrada)
 
     logger.info(
         "Criterios de búsqueda construidos | %s",
-        json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
+        json.dumps(criterios.__dict__, ensure_ascii=False, default=str),
     )
 
-    if criteria.telefono_variants:
-        contact = await find_contact_by_phone(criteria.telefono_variants)
+    if criterios.variantes_telefono:
+        contacto = await buscar_contacto_por_telefono(criterios.variantes_telefono)
 
-        if is_valid_bitrix_contact(contact):
-            logger.info(
-                "Contacto válido encontrado por teléfono | id=%s", contact.get("id")
-            )
-            return contact
+        if contacto_bitrix_valido(contacto):
+            return contacto
 
-        logger.info(
-            "No se obtuvo contacto válido por teléfono. Se intentará por cédula."
-        )
+        logger.info("No se encontró por teléfono. Se intentará por cédula.")
 
-    if criteria.cedula:
-        contact = await find_contact_by_cedula(criteria.cedula)
+    if criterios.cedula:
+        contacto = await buscar_contacto_por_cedula(criterios.cedula)
 
-        if is_valid_bitrix_contact(contact):
-            logger.info(
-                "Contacto válido encontrado por cédula | id=%s", contact.get("id")
-            )
-            return contact
+        if contacto_bitrix_valido(contacto):
+            return contacto
 
-        logger.info("No se obtuvo contacto válido por cédula. Se intentará por correo.")
+        logger.info("No se encontró por cédula. Se intentará por correo.")
 
-    if criteria.correo:
-        contact = await find_contact_by_email(criteria.correo)
+    if criterios.correo:
+        contacto = await buscar_contacto_por_correo(criterios.correo)
 
-        if is_valid_bitrix_contact(contact):
-            logger.info(
-                "Contacto válido encontrado por correo | id=%s", contact.get("id")
-            )
-            return contact
+        if contacto_bitrix_valido(contacto):
+            return contacto
 
     logger.warning(
-        "No se encontró contacto válido con TELEFONO, CEDULA ni CORREO | criteria=%s",
-        json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
+        "No se encontró contacto válido con teléfono, cédula ni correo | criterios=%s",
+        json.dumps(criterios.__dict__, ensure_ascii=False, default=str),
     )
 
     return None
 
 
-async def create_deal_in_resultado_llamada_ia(
-    input_variables: Dict[str, Any],
-    output_vars: Dict[str, Any],
-    contact: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    Crea una tarjeta en HOR CARTERA / RESULTADO LLAMADA IA.
+# ============================================================
+# Mapeo y creación de deal en RESULTADO LLAMADA IA
+# ============================================================
 
-    Requiere contacto válido, porque debe enviar:
-    contactIds: [contact_id]
-    """
-
-    if not is_valid_bitrix_contact(contact):
-        raise BitrixAPIError(
-            message="No se puede crear deal porque el contacto no tiene id válido.",
-            method="crm.item.add",
-            response_data=contact,
-        )
-
-    contact_id = int(contact.get("id") or contact.get("ID"))
-
-    fields = build_resultado_llamada_ia_fields(
-        input_variables=input_variables,
-        output_vars=output_vars,
-        contact_id=contact_id,
-    )
-
-    payload = {
-        "entityTypeId": DEAL_ENTITY_TYPE_ID,
-        "fields": fields,
-        "useOriginalUfNames": "Y",
-    }
-
-    logger.info(
-        "Creando deal en RESULTADO LLAMADA IA | payload=%s",
-        json.dumps(payload, ensure_ascii=False, default=str),
-    )
-
-    data = await bitrix_call("crm.item.add", payload)
-
-    logger.info(
-        "Deal creado correctamente en RESULTADO LLAMADA IA | response=%s",
-        json.dumps(data, ensure_ascii=False, default=str),
-    )
-
-    return data.get("result")
-
-
-def bitrix_api_error_to_http(exc: BitrixAPIError) -> HTTPException:
-    """
-    Convierte un BitrixAPIError en HTTPException.
-    """
-    return HTTPException(
-        status_code=502,
-        detail={
-            "ok": False,
-            "error_type": "bitrix_api_error",
-            "message": exc.message,
-            "bitrix_method": exc.method,
-            "bitrix_status_code": exc.status_code,
-            "bitrix_response": exc.response_data,
-        },
-    )
-
-
-def is_valid_bitrix_contact(contact: Optional[Dict[str, Any]]) -> bool:
-    """
-    Valida que el contacto retornado por Bitrix sea utilizable.
-
-    Un contacto sin id no sirve para crear contactIds en el deal.
-    """
-
-    if not contact:
-        return False
-
-    contact_id = contact.get("id") or contact.get("ID")
-
-    if contact_id is None:
-        logger.warning(
-            "Bitrix retornó un contacto sin id. Se tratará como inválido | contact=%s",
-            json.dumps(contact, ensure_ascii=False, default=str),
-        )
-        return False
-
-    try:
-        int(contact_id)
-        return True
-    except (TypeError, ValueError):
-        logger.warning(
-            "Bitrix retornó un id de contacto inválido | id=%s | contact=%s",
-            contact_id,
-            json.dumps(contact, ensure_ascii=False, default=str),
-        )
-        return False
-
-
-def to_int_or_none(value: Any) -> Optional[int]:
+def convertir_a_entero_o_none(valor: Any) -> Optional[int]:
     """
     Convierte valores numéricos a int.
-    Soporta strings con comas, puntos y espacios.
+
+    Soporta:
+    - 2445083
+    - "2,445,083"
+    - "$2.445.083"
     """
 
-    if value is None:
+    if valor is None:
         return None
 
-    text = str(value).strip()
+    texto = str(valor).strip()
 
-    if not text:
+    if not texto:
         return None
 
-    cleaned = re.sub(r"[^\d-]", "", text)
+    limpio = re.sub(r"[^\d-]", "", texto)
 
-    if not cleaned:
+    if not limpio:
         return None
 
     try:
-        return int(cleaned)
+        return int(limpio)
     except ValueError:
         return None
 
 
-def build_resultado_llamada_ia_fields(
-    input_variables: Dict[str, Any],
-    output_vars: Dict[str, Any],
-    contact_id: int,
+def construir_campos_resultado_llamada_ia(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+    id_contacto: int,
 ) -> Dict[str, Any]:
     """
-    Construye fields para crm.item.add en la etapa RESULTADO LLAMADA IA.
+    Construye los fields para crm.item.add en la etapa RESULTADO LLAMADA IA.
 
     Embudo:
     - HOR CARTERA -> categoryId = 0
 
     Etapa:
     - RESULTADO LLAMADA IA -> stageId = UC_L3QC2Y
-
-    Contacto:
-    - contactIds = [contact_id]
     """
 
-    pagaduria = clean_str(get_input(input_variables, "PAGADURIA"))
-    cuotas_en_mora = clean_str(get_input(input_variables, "CUOTAS_EN_MORA"))
-    valor_total_mora = to_int_or_none(
-        get_input(input_variables, "MORA_TOTAL") or get_input(input_variables, "MORA")
-    )
-    valor_confirmado = to_int_or_none(
-        output_vars.get("valor_confirmado")
-        or output_vars.get("valorconfirmado")
-        or get_input(input_variables, "VALOR_CONFIRMADO")
+    pagaduria = limpiar_texto(obtener_variable_entrada(variables_entrada, "PAGADURIA"))
+    cuotas_en_mora = limpiar_texto(obtener_variable_entrada(variables_entrada, "CUOTAS_EN_MORA"))
+
+    valor_total_mora = convertir_a_entero_o_none(
+        obtener_variable_entrada(variables_entrada, "VALOR_TOTAL_MORA")
+        or obtener_variable_entrada(variables_entrada, "MORA_TOTAL")
+        or obtener_variable_entrada(variables_entrada, "MORA")
     )
 
-    resumen_llamada = clean_str(output_vars.get("resumenllamada"))
-    detalle_acuerdo = clean_str(output_vars.get("detalle_acuerdo"))
-    gestion_final = clean_str(output_vars.get("gestion_final"))
-    motivo_principal = clean_str(output_vars.get("motivo_principal"))
-    interes_pagar = clean_str(output_vars.get("interes_pagar"))
-    pago_hoy = clean_str(output_vars.get("pago_hoy"))
-    fecha_acuerdo_pago = clean_str(output_vars.get("fechacuerdopago"))
+    valor_confirmado = convertir_a_entero_o_none(
+        variables_salida.get("valor_confirmado")
+        or variables_salida.get("valorconfirmado")
+        or obtener_variable_entrada(variables_entrada, "VALOR_CONFIRMADO")
+    )
 
-    id_libranza = clean_str(get_input(input_variables, "ID_LIBRANZA"))
-    telefono_cliente = clean_str(get_input(input_variables, "TELEFONO"))
-    cedula_cliente = clean_str(get_input(input_variables, "CEDULA"))
+    resumen_llamada = limpiar_texto(variables_salida.get("resumenllamada"))
+    detalle_acuerdo = limpiar_texto(variables_salida.get("detalle_acuerdo"))
+    gestion_final = limpiar_texto(variables_salida.get("gestion_final"))
+    motivo_principal = limpiar_texto(variables_salida.get("motivo_principal"))
+    interes_pagar = limpiar_texto(variables_salida.get("interes_pagar"))
+    pago_hoy = limpiar_texto(variables_salida.get("pago_hoy"))
+    fecha_acuerdo_pago = limpiar_texto(variables_salida.get("fechacuerdopago"))
 
-    nombre_cliente = clean_str(get_input(input_variables, "NOMBRE")) or "Cliente"
-    title = f"Resultado llamada IA - {nombre_cliente}"
+    id_libranza = limpiar_texto(obtener_variable_entrada(variables_entrada, "ID_LIBRANZA"))
+    telefono_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "TELEFONO"))
+    cedula_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "CEDULA"))
+    nombre_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "NOMBRE")) or "Cliente"
+
+    titulo = f"Resultado llamada IA - {nombre_cliente}"
 
     if cedula_cliente:
-        title += f" - CC {cedula_cliente}"
+        titulo += f" - CC {cedula_cliente}"
 
-    fields: Dict[str, Any] = {
-        "title": title,
+    campos: Dict[str, Any] = {
+        "title": titulo,
         "categoryId": BITRIX_DEAL_CATEGORY_ID,
         "stageId": BITRIX_DEAL_STAGE_ID,
-        # Relación con contacto encontrado.
-        "contactId": contact_id,
-        "contactIds": [contact_id],
-        # Campos personalizados según mapeo entregado.
+
+        # Relación con el contacto encontrado.
+        "contactId": id_contacto,
+        "contactIds": [id_contacto],
+
+        # Campos personalizados solicitados.
         "UF_CRM_1773780818920": pagaduria,
         "UF_CRM_1773781100010": cuotas_en_mora,
         "UF_CRM_1773841728850": valor_total_mora,
@@ -6208,18 +6201,80 @@ def build_resultado_llamada_ia_fields(
     }
 
     if BITRIX_ASSIGNED_BY_ID:
-        fields["assignedById"] = BITRIX_ASSIGNED_BY_ID
+        campos["assignedById"] = BITRIX_ASSIGNED_BY_ID
 
-    # Campo monto nativo del deal, opcional pero útil.
     if valor_total_mora is not None:
-        fields["opportunity"] = valor_total_mora
-        fields["currencyId"] = "COP"
+        campos["opportunity"] = valor_total_mora
+        campos["currencyId"] = "COP"
 
-    # Quitar claves con None solo si Bitrix te rechaza nulos.
-    # Si quieres enviar explícitamente null, comenta esta línea.
-    # fields = {k: v for k, v in fields.items() if v is not None}
+    return campos
 
-    return fields
+
+def convertir_error_bitrix_a_http(exc: ErrorBitrixAPI) -> HTTPException:
+    """
+    Convierte ErrorBitrixAPI en HTTPException para responder al cliente.
+    """
+
+    return HTTPException(
+        status_code=502,
+        detail={
+            "ok": False,
+            "tipo_error": "error_api_bitrix",
+            "mensaje": exc.mensaje,
+            "metodo_bitrix": exc.metodo,
+            "codigo_estado_bitrix": exc.codigo_estado,
+            "respuesta_bitrix": exc.respuesta,
+        },
+    )
+
+
+
+async def crear_deal_resultado_llamada_ia(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+    contacto: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Crea una tarjeta/deal en HOR CARTERA / RESULTADO LLAMADA IA.
+
+    Requiere contacto válido porque debe enviar:
+    contactIds: [id_contacto]
+    """
+
+    if not contacto_bitrix_valido(contacto):
+        raise ErrorBitrixAPI(
+            mensaje="No se puede crear deal porque el contacto no tiene id válido.",
+            metodo="crm.item.add",
+            respuesta=contacto,
+        )
+
+    id_contacto = int(contacto.get("id") or contacto.get("ID"))
+
+    campos = construir_campos_resultado_llamada_ia(
+        variables_entrada=variables_entrada,
+        variables_salida=variables_salida,
+        id_contacto=id_contacto,
+    )
+
+    cuerpo = {
+        "entityTypeId": DEAL_ENTITY_TYPE_ID,
+        "fields": campos,
+        "useOriginalUfNames": "Y",
+    }
+
+    logger.info(
+        "Creando deal en RESULTADO LLAMADA IA | cuerpo=%s",
+        json.dumps(cuerpo, ensure_ascii=False, default=str),
+    )
+
+    datos = await llamar_bitrix("crm.item.add", cuerpo)
+
+    logger.info(
+        "Deal creado correctamente en RESULTADO LLAMADA IA | respuesta=%s",
+        json.dumps(datos, ensure_ascii=False, default=str),
+    )
+
+    return datos.get("result")
 
 
 @app.post("/bitrix/debug/search-client")
@@ -6231,7 +6286,7 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
     method_name = "bitrix_debug_search_client"
 
     input_variables = payload.model_dump(exclude_none=True)
-    criteria = build_bitrix_lookup_criteria(input_variables)
+    criteria = construir_criterios_busqueda_bitrix(input_variables)
 
     logger.info(
         "Endpoint iniciado | POST /bitrix/debug/search-client | criteria=%s",
@@ -6239,7 +6294,7 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
     )
 
     try:
-        contact = await find_contact_from_input_variables(input_variables)
+        contact = await buscar_contacto_desde_variables_entrada(input_variables)
 
         if contact:
             logger.info(
@@ -6271,17 +6326,17 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
         logger.error("Error Bitrix en /bitrix/debug/search-client | %s", exc.message)
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.telefono_variants),
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             exc.message,
         )
-        raise bitrix_api_error_to_http(exc)
+        raise convertir_error_bitrix_a_http(exc)
 
     except Exception as exc:
         logger.error("Error interno en /bitrix/debug/search-client | %s", str(exc))
         logger.error(traceback.format_exc())
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.telefono_variants),
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             str(exc),
         )
         raise HTTPException(status_code=500, detail=f"Error interno: {str(exc)}")
@@ -6333,8 +6388,8 @@ async def call_completed_bitrix(request: Request):
         item.model_dump(exclude_none=True) for item in payload.extracted_variables
     ]
 
-    output_vars = build_output_map(extracted_variables)
-    criteria = build_bitrix_lookup_criteria(input_variables)
+    output_vars = construir_mapa_variables_salida(extracted_variables)
+    criteria = construir_criterios_busqueda_bitrix(input_variables)
 
     try:
         logger.info(
@@ -6347,17 +6402,17 @@ async def call_completed_bitrix(request: Request):
             json.dumps(output_vars, ensure_ascii=False, default=str),
         )
 
-        validation = evaluate_payment_intent(output_vars)
+        validation = evaluar_intencion_pago(output_vars)
 
         logger.info(
             "Resultado validación intención de pago | %s",
             json.dumps(validation, ensure_ascii=False, default=str),
         )
 
-        if not validation["approved"]:
+        if not validation.get("approved", validation.get("aprobado", False)):
             logger.info(
                 "Validación no aprobada. No se consulta Bitrix | blockers=%s",
-                json.dumps(validation["blockers"], ensure_ascii=False, default=str),
+                json.dumps(validation.get("blockers", validation.get("bloqueadores", [])), ensure_ascii=False, default=str),
             )
 
             return {
@@ -6377,7 +6432,7 @@ async def call_completed_bitrix(request: Request):
             json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
         )
 
-        contact = await find_contact_from_input_variables(input_variables)
+        contact = await buscar_contacto_desde_variables_entrada(input_variables)
 
         if contact:
             logger.info(
@@ -6395,7 +6450,7 @@ async def call_completed_bitrix(request: Request):
         if CREATE_DEAL_ON_VALID_PAYMENT:
             logger.info("CREATE_DEAL_ON_VALID_PAYMENT=true. Se intentará crear deal.")
 
-            if not is_valid_bitrix_contact(contact):
+            if not contacto_bitrix_valido(contact):
                 logger.error("No se crea deal porque no hay contacto válido con id.")
                 raise HTTPException(
                     status_code=404,
@@ -6406,11 +6461,10 @@ async def call_completed_bitrix(request: Request):
                     },
                 )
 
-            deal_result = await create_deal_in_resultado_llamada_ia(
-                input_variables=input_variables,
-                output_vars=output_vars,
-                contact=contact,
-            )
+            deal_result = await crear_deal_resultado_llamada_ia(
+                variables_entrada=input_variables,
+                variables_salida=output_vars,
+                contacto=contact,)
 
             logger.info(
                 "Deal creado desde webhook | %s",
@@ -6439,10 +6493,10 @@ async def call_completed_bitrix(request: Request):
         )
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.telefono_variants),
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             exc.message,
         )
-        raise bitrix_api_error_to_http(exc)
+        raise convertir_error_bitrix_a_http(exc)
 
     except HTTPException:
         raise
@@ -6452,13 +6506,10 @@ async def call_completed_bitrix(request: Request):
         logger.error(traceback.format_exc())
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.telefono_variants),
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             str(exc),
         )
         raise HTTPException(status_code=500, detail=f"Error interno: {str(exc)}")
     
     
-    # --- Registro del módulo de pagos ---
-from pagos.inicializador import registrar_modulo_pagos
 
-registrar_modulo_pagos(app)

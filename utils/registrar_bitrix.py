@@ -1,12 +1,32 @@
 import logging
 from typing import Dict, Any
-import time
+#import time
 import httpx
-from models.models import WebhookPayload
 from utils.notify_error import info_notify, error_notify
-from utils.config import settings
-import requests
-import json
+import os
+
+
+def obtener_base_url_bitrix_correo() -> str:
+    """
+    Obtiene la URL base de Bitrix desde variables de entorno.
+
+    No debe existir ningún webhook hardcodeado en el código.
+    """
+
+    base_url = (
+        os.getenv("BITRIX_CORREO_BASE_URL")
+        or os.getenv("BITRIX_BASE_URL")
+        or ""
+    ).rstrip("/")
+
+    if not base_url:
+        raise RuntimeError(
+            "No está configurada BITRIX_CORREO_BASE_URL ni BITRIX_BASE_URL."
+        )
+
+    return base_url
+
+base_url_bitrix = obtener_base_url_bitrix_correo()
 
 # Cache liviano en memoria para evitar reintentos inmediatos de envios webinar
 WEBINAR_CACHE_TTL = 300  # segundos
@@ -52,7 +72,7 @@ async def registrar_en_bitrix(celular: str, tipo_proceso: str = "Campaña llamad
         logging.info(f"Buscando cliente en Bitrix24 con teléfono: {telefono}")
         
         # ========== PETICIÓN 1: Buscar contacto por teléfono ==========
-        url_contact = "https://horizontesas-fontumi.bitrix24.es/rest/6/untkqcnft2vadt5d/crm.contact.list"
+        url_contact = f"{base_url_bitrix}/crm.contact.list.json"
         
         payload_contact = {
             "filter": {
@@ -76,7 +96,7 @@ async def registrar_en_bitrix(celular: str, tipo_proceso: str = "Campaña llamad
             logging.debug(f"Respuesta completa de búsqueda: {response.text}")
             
             if response.status_code != 200:
-                logging.error(f"❌ Error al obtener el contacto")
+                logging.error("Error al obtener el contacto")
                 logging.error(f"Status: {response.status_code}")
                 logging.error(f"Response: {response.text}")
                 await error_notify(
@@ -117,7 +137,7 @@ async def registrar_en_bitrix(celular: str, tipo_proceso: str = "Campaña llamad
             stage_id = stage_id_map.get(tipo_proceso.lower(), "Campaña llamadas IA financiación posgrados IUB")
             logging.info(f"Tipo de proceso: {tipo_proceso} -> STAGE_ID: {stage_id}")
             
-            url_deal = "https://horizontesas-fontumi.bitrix24.es/rest/6/untkqcnft2vadt5d/crm.deal.add"
+            url_deal = f"{base_url_bitrix}/crm.deal.add.json"
             
             payload_deal = {
                 "fields": {
@@ -140,7 +160,7 @@ async def registrar_en_bitrix(celular: str, tipo_proceso: str = "Campaña llamad
             logging.info(f"Respuesta de creación de deal - Status: {response_deal.status_code}")
             
             if response_deal.status_code != 200:
-                logging.error(f"❌ Error al crear el deal")
+                logging.error("Error al crear el deal")
                 logging.error(f"Status: {response_deal.status_code}")
                 logging.error(f"Response: {response_deal.text}")
                 await error_notify(

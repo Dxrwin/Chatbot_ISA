@@ -152,21 +152,6 @@ class ServicioOrdenesPago:
 
         id_orden_pago = await self.repositorio_ordenes.crear(datos_orden)
 
-        try:
-            validar_payload_creacion_antes_de_payvalida(solicitud)
-        except ErrorValidacionPayvalida as error:
-            await self.repositorio_auditoria.crear(
-                contexto_auditoria=contexto_auditoria,
-                id_orden_pago=None,
-                sistema_origen=solicitud.sistema_origen,
-                referencia_externa=solicitud.referencia_externa,
-                codigo_respuesta=422,
-                exitoso=False,
-                mensaje_error=error.mensaje,
-            )
-            raise
-
-
         await self.servicio_eventos.registrar_evento(
             id_orden_pago=id_orden_pago,
             tipo_evento=EventosOrdenPago.ORDEN_CREADA_LOCALMENTE,
@@ -196,6 +181,8 @@ class ServicioOrdenesPago:
             datos_evento={"url": url_creacion},
         )
 
+        respuesta_proveedor_registrada = False
+
         try:
             respuesta_payvalida, codigo_http, duracion_ms = await self.cliente_payvalida.crear_orden(
                 payload_payvalida
@@ -211,6 +198,7 @@ class ServicioOrdenesPago:
                 mensaje_error=None if exitoso else str(respuesta_payvalida),
                 duracion_ms=duracion_ms,
             )
+            respuesta_proveedor_registrada = True
 
             if not exitoso:
                 await self.servicio_eventos.registrar_evento(
@@ -247,14 +235,19 @@ class ServicioOrdenesPago:
             return self.construir_respuesta_orden(orden_actualizada)
 
         except Exception as error:
-            await self.repositorio_solicitudes.actualizar_respuesta(
-                id_solicitud=id_solicitud_proveedor,
-                respuesta_recibida=None,
-                codigo_http=None,
-                exitoso=False,
-                mensaje_error=str(error),
-                duracion_ms=None,
-            )
+            if not respuesta_proveedor_registrada:
+                await self.repositorio_solicitudes.actualizar_respuesta(
+                    id_solicitud=id_solicitud_proveedor,
+                    respuesta_recibida=None,
+                    codigo_http=None,
+                    exitoso=False,
+                    mensaje_error=str(error),
+                    duracion_ms=None,
+                )
+
+            if respuesta_proveedor_registrada and isinstance(error, ErrorProveedorPago):
+                raise
+
             await self.servicio_eventos.registrar_evento(
                 id_orden_pago=id_orden_pago,
                 tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
@@ -343,11 +336,29 @@ class ServicioOrdenesPago:
             descripcion="Consulta manual de estado enviada a Payválida",
         )
 
-        respuesta, codigo_http, duracion_ms = await self.cliente_payvalida.consultar_orden(
-            codigo_orden_interno=orden["codigo_orden_interno"],
-            merchant=self.cliente_payvalida.configuracion.merchant,
-            checksum=checksum,
-        )
+        try:
+            respuesta, codigo_http, duracion_ms = await self.cliente_payvalida.consultar_orden(
+                codigo_orden_interno=orden["codigo_orden_interno"],
+                merchant=self.cliente_payvalida.configuracion.merchant,
+                checksum=checksum,
+            )
+        except Exception as error:
+            await self.repositorio_solicitudes.actualizar_respuesta(
+                id_solicitud=id_solicitud,
+                respuesta_recibida=None,
+                codigo_http=None,
+                exitoso=False,
+                mensaje_error=str(error),
+                duracion_ms=None,
+            )
+            await self.servicio_eventos.registrar_evento(
+                id_orden_pago=id_orden_pago,
+                tipo_evento=EventosOrdenPago.CONSULTA_ESTADO_FALLIDA,
+                origen_evento=OrigenEventoPago.SISTEMA,
+                descripcion="Error al consultar estado en Payválida",
+                datos_evento={"error": str(error)},
+            )
+            raise
 
         exitoso = codigo_http in (200, 201)
         await self.repositorio_solicitudes.actualizar_respuesta(
