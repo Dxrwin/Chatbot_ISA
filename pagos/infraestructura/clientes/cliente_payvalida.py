@@ -72,6 +72,30 @@ class ClientePayvalida:
         duracion_ms = int((time.time() - inicio) * 1000)
         return self._extraer_json_seguro(respuesta), respuesta.status_code, duracion_ms
 
+    async def actualizar_orden(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int, int]:
+        """
+        Actualiza una orden pendiente en Payválida.
+
+        Payválida documenta PATCH sobre /api/v3/porders con payload completo.
+        """
+        inicio = time.time()
+        url = f"{self.configuracion.url_base}/api/v3/porders"
+
+        try:
+            async with httpx.AsyncClient(timeout=self._construir_timeout()) as cliente:
+                respuesta = await cliente.patch(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.TimeoutException as error:
+            raise self._construir_error_http("actualizar orden", error) from error
+        except httpx.RequestError as error:
+            raise self._construir_error_http("actualizar orden", error) from error
+
+        duracion_ms = int((time.time() - inicio) * 1000)
+        return self._extraer_json_seguro(respuesta), respuesta.status_code, duracion_ms
+
     async def consultar_orden(
         self,
         codigo_orden_interno: str,

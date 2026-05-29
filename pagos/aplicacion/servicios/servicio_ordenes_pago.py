@@ -1,4 +1,5 @@
 import uuid
+from datetime import date, datetime
 from typing import Any, Dict
 
 from pagos.constantes import (
@@ -9,6 +10,7 @@ from pagos.constantes import (
 )
 from pagos.utilidades.validaciones_payvalida import (
     ErrorValidacionPayvalida,
+    validar_fecha_expiracion_payvalida,
     validar_payload_creacion_antes_de_payvalida,
 )
 from pagos.excepciones import ErrorOrdenNoEncontrada, ErrorProveedorPago
@@ -48,6 +50,143 @@ class ServicioOrdenesPago:
         consecutivo = uuid.uuid4().hex[:10].upper()
         return f"OP{fecha}{consecutivo}"
 
+    def obtener_id_deal_bitrix(self, solicitud: SolicitudCrearOrdenPago) -> int | None:
+        """
+        Extrae el ID del deal Bitrix desde metadatos, si existe.
+        """
+        id_deal = (solicitud.metadatos or {}).get("id_deal_bitrix")
+        try:
+            return int(id_deal)
+        except (TypeError, ValueError):
+            return None
+
+    def obtener_clave_pago_bitrix(self, solicitud: SolicitudCrearOrdenPago) -> str | None:
+        """
+        Extrae la clave estable de pago Bitrix, si el mapper la incluyo.
+        """
+        clave = (solicitud.metadatos or {}).get("clave_pago_bitrix")
+        if clave is None:
+            return None
+
+        texto = str(clave).strip()
+        return texto or None
+
+    def fecha_expiracion_no_vencida(self, valor) -> bool:
+        """
+        Valida si una fecha de expiración local sigue activa.
+        """
+        if not valor:
+            return False
+
+        if isinstance(valor, datetime):
+            fecha = valor.date()
+        elif isinstance(valor, date):
+            fecha = valor
+        else:
+            texto = str(valor).strip()
+            fecha = None
+            for formato in ("%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    fecha = datetime.strptime(texto[:10], formato).date()
+                    break
+                except ValueError:
+                    continue
+
+            if fecha is None:
+                return False
+
+        return fecha >= date.today()
+
+    def orden_tiene_link_activo(self, orden: Dict[str, Any]) -> bool:
+        """
+        Determina si una orden existente puede reutilizarse sin llamar Payválida.
+        """
+        return (
+            orden.get("estado") == EstadosOrdenPago.PENDIENTE
+            and bool(orden.get("enlace_pago"))
+            and bool(orden.get("id_orden_proveedor"))
+            and bool(orden.get("referencia_proveedor"))
+            and self.fecha_expiracion_no_vencida(orden.get("fecha_expiracion"))
+        )
+
+    async def registrar_auditoria_idempotente(
+        self,
+        orden: Dict[str, Any],
+        solicitud: SolicitudCrearOrdenPago,
+        contexto_auditoria: Dict[str, Any],
+    ) -> None:
+        await self.repositorio_auditoria.crear(
+            contexto_auditoria=contexto_auditoria,
+            id_orden_pago=orden["id"],
+            sistema_origen=solicitud.sistema_origen,
+            referencia_externa=orden.get("referencia_externa") or solicitud.referencia_externa,
+            codigo_respuesta=200,
+            exitoso=True,
+        )
+
+    async def obtener_orden_reutilizable_por_clave_pago_bitrix(
+        self,
+        solicitud: SolicitudCrearOrdenPago,
+        contexto_auditoria: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """
+        Busca una orden previa del mismo cliente/acuerdo y sincroniza con Payvalida
+        antes de decidir si se reutiliza o si se permite crear una nueva.
+        """
+        clave_pago_bitrix = self.obtener_clave_pago_bitrix(solicitud)
+        if not clave_pago_bitrix:
+            return None
+
+        candidatas = await self.repositorio_ordenes.obtener_candidatas_por_clave_pago_bitrix(
+            sistema_origen=solicitud.sistema_origen,
+            clave_pago_bitrix=clave_pago_bitrix,
+        )
+
+        for candidata in candidatas:
+            await self.sincronizar_estado_orden_pago(
+                id_orden_pago=candidata["id"],
+                contexto_auditoria=contexto_auditoria,
+            )
+
+            orden_actualizada = await self.repositorio_ordenes.obtener_por_id(candidata["id"])
+            if not orden_actualizada:
+                continue
+
+            if self.orden_tiene_link_activo(orden_actualizada):
+                await self.registrar_auditoria_idempotente(
+                    orden=orden_actualizada,
+                    solicitud=solicitud,
+                    contexto_auditoria=contexto_auditoria,
+                )
+                return orden_actualizada
+
+            if orden_actualizada.get("estado") == EstadosOrdenPago.APROBADA:
+                await self.registrar_auditoria_idempotente(
+                    orden=orden_actualizada,
+                    solicitud=solicitud,
+                    contexto_auditoria=contexto_auditoria,
+                )
+                return orden_actualizada
+
+            if orden_actualizada.get("estado") == EstadosOrdenPago.DESCONOCIDA:
+                mensaje = (
+                    "Existe una orden previa para el mismo cliente/acuerdo, "
+                    "pero Payvalida no permitio confirmar su estado. "
+                    "No se crea una orden duplicada."
+                )
+                await self.repositorio_auditoria.crear(
+                    contexto_auditoria=contexto_auditoria,
+                    id_orden_pago=orden_actualizada["id"],
+                    sistema_origen=solicitud.sistema_origen,
+                    referencia_externa=orden_actualizada.get("referencia_externa"),
+                    codigo_respuesta=409,
+                    exitoso=False,
+                    mensaje_error=mensaje,
+                )
+                raise ErrorProveedorPago(mensaje)
+
+        return None
+
     async def crear_orden_pago(
         self,
         solicitud: SolicitudCrearOrdenPago,
@@ -57,6 +196,13 @@ class ServicioOrdenesPago:
         Crea una orden local, la registra en Payválida y retorna el enlace de pago.
         """
         datos_solicitud = modelo_a_diccionario(solicitud)
+
+        orden_reutilizable = await self.obtener_orden_reutilizable_por_clave_pago_bitrix(
+            solicitud=solicitud,
+            contexto_auditoria=contexto_auditoria,
+        )
+        if orden_reutilizable:
+            return self.construir_respuesta_orden(orden_reutilizable, idempotente=True)
 
         try:
             validar_payload_creacion_antes_de_payvalida(solicitud)
@@ -72,6 +218,21 @@ class ServicioOrdenesPago:
             )
             raise
 
+        id_deal_bitrix = self.obtener_id_deal_bitrix(solicitud)
+        if id_deal_bitrix is not None:
+            orden_activa_deal = await self.repositorio_ordenes.obtener_link_activo_por_deal_bitrix(
+                sistema_origen=solicitud.sistema_origen,
+                id_deal_bitrix=id_deal_bitrix,
+            )
+
+            if orden_activa_deal:
+                await self.registrar_auditoria_idempotente(
+                    orden=orden_activa_deal,
+                    solicitud=solicitud,
+                    contexto_auditoria=contexto_auditoria,
+                )
+                return self.construir_respuesta_orden(orden_activa_deal, idempotente=True)
+
         orden_existente = await self.repositorio_ordenes.obtener_por_sistema_y_referencia(
             sistema_origen=solicitud.sistema_origen,
             referencia_externa=solicitud.referencia_externa,
@@ -83,15 +244,28 @@ class ServicioOrdenesPago:
             orden_tiene_referencia_proveedor = bool(orden_existente.get("referencia_proveedor"))
 
             if orden_tiene_enlace and orden_tiene_id_proveedor and orden_tiene_referencia_proveedor:
+                if self.orden_tiene_link_activo(orden_existente):
+                    await self.registrar_auditoria_idempotente(
+                        orden=orden_existente,
+                        solicitud=solicitud,
+                        contexto_auditoria=contexto_auditoria,
+                    )
+                    return self.construir_respuesta_orden(orden_existente, idempotente=True)
+
+                mensaje = (
+                    "Ya existe una orden previa para este sistema_origen y referencia_externa, "
+                    "pero no tiene un link activo reutilizable porque no está PENDIENTE o ya venció."
+                )
                 await self.repositorio_auditoria.crear(
                     contexto_auditoria=contexto_auditoria,
                     id_orden_pago=orden_existente["id"],
                     sistema_origen=solicitud.sistema_origen,
                     referencia_externa=solicitud.referencia_externa,
-                    codigo_respuesta=200,
-                    exitoso=True,
+                    codigo_respuesta=409,
+                    exitoso=False,
+                    mensaje_error=mensaje,
                 )
-                return self.construir_respuesta_orden(orden_existente, idempotente=True)
+                raise ErrorProveedorPago(mensaje)
 
             mensaje = (
                 "Ya existe una orden previa para este sistema_origen y referencia_externa, "
@@ -412,6 +586,160 @@ class ServicioOrdenesPago:
 
         orden_actualizada = await self.repositorio_ordenes.obtener_por_id(id_orden_pago)
         return self.construir_respuesta_orden(orden_actualizada)
+
+    async def actualizar_expiracion_orden_pago(
+        self,
+        id_orden_pago: int,
+        fecha_expiracion: str,
+        contexto_auditoria: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Actualiza la expiración de una orden pendiente en Payválida y en base local.
+        """
+        orden = await self.repositorio_ordenes.obtener_por_id(id_orden_pago)
+
+        if not orden:
+            await self.repositorio_auditoria.crear(
+                contexto_auditoria=contexto_auditoria,
+                id_orden_pago=None,
+                codigo_respuesta=404,
+                exitoso=False,
+                mensaje_error="Orden de pago no encontrada",
+            )
+            raise ErrorOrdenNoEncontrada("Orden de pago no encontrada")
+
+        if orden.get("estado") != EstadosOrdenPago.PENDIENTE:
+            mensaje = "Solo se puede actualizar la expiración de órdenes en estado PENDIENTE."
+            await self.repositorio_auditoria.crear(
+                contexto_auditoria=contexto_auditoria,
+                id_orden_pago=id_orden_pago,
+                sistema_origen=orden.get("sistema_origen"),
+                referencia_externa=orden.get("referencia_externa"),
+                codigo_respuesta=409,
+                exitoso=False,
+                mensaje_error=mensaje,
+            )
+            raise ErrorProveedorPago(mensaje)
+
+        try:
+            validar_fecha_expiracion_payvalida(fecha_expiracion)
+        except ErrorValidacionPayvalida as error:
+            await self.repositorio_auditoria.crear(
+                contexto_auditoria=contexto_auditoria,
+                id_orden_pago=id_orden_pago,
+                sistema_origen=orden.get("sistema_origen"),
+                referencia_externa=orden.get("referencia_externa"),
+                codigo_respuesta=422,
+                exitoso=False,
+                mensaje_error=error.mensaje,
+            )
+            raise
+
+        datos_orden = dict(orden)
+        datos_orden["fecha_expiracion_payvalida"] = fecha_expiracion
+        payload_payvalida = self.servicio_payvalida.construir_payload_creacion_orden(datos_orden)
+        url_actualizacion = f"{self.cliente_payvalida.configuracion.url_base}/api/v3/porders"
+
+        id_solicitud = await self.repositorio_solicitudes.crear(
+            id_orden_pago=id_orden_pago,
+            proveedor=ProveedoresPago.PAYVALIDA,
+            operacion="actualizar_orden",
+            metodo_http="PATCH",
+            url=url_actualizacion,
+            payload_enviado=payload_payvalida,
+        )
+
+        await self.servicio_eventos.registrar_evento(
+            id_orden_pago=id_orden_pago,
+            tipo_evento=EventosOrdenPago.ACTUALIZACION_PAYVALIDA_SOLICITADA,
+            origen_evento=OrigenEventoPago.API_INTERNA,
+            descripcion="Solicitud de actualización enviada a Payválida",
+            datos_evento={"fecha_expiracion": fecha_expiracion},
+        )
+
+        respuesta_registrada = False
+
+        try:
+            respuesta_payvalida, codigo_http, duracion_ms = await self.cliente_payvalida.actualizar_orden(
+                payload_payvalida
+            )
+
+            exitoso = codigo_http in (200, 201) and respuesta_payvalida.get("CODE") == "0000"
+            await self.repositorio_solicitudes.actualizar_respuesta(
+                id_solicitud=id_solicitud,
+                respuesta_recibida=respuesta_payvalida,
+                codigo_http=codigo_http,
+                exitoso=exitoso,
+                mensaje_error=None if exitoso else str(respuesta_payvalida),
+                duracion_ms=duracion_ms,
+            )
+            respuesta_registrada = True
+
+            if not exitoso:
+                await self.servicio_eventos.registrar_evento(
+                    id_orden_pago=id_orden_pago,
+                    tipo_evento=EventosOrdenPago.ACTUALIZACION_PAYVALIDA_FALLIDA,
+                    origen_evento=OrigenEventoPago.PAYVALIDA,
+                    descripcion="Payválida no actualizó la orden correctamente",
+                    datos_evento=respuesta_payvalida,
+                )
+                raise ErrorProveedorPago(f"Payválida respondió error al actualizar orden: {respuesta_payvalida}")
+
+            data = respuesta_payvalida.get("DATA", {})
+            await self.repositorio_ordenes.actualizar_expiracion_y_datos_proveedor(
+                id_orden_pago=id_orden_pago,
+                fecha_expiracion=convertir_fecha_payvalida_a_mysql(fecha_expiracion),
+                datos={
+                    "id_orden_proveedor": str(data.get("PVordenID")) if data.get("PVordenID") else None,
+                    "referencia_proveedor": str(data.get("Referencia")) if data.get("Referencia") else None,
+                    "enlace_pago": data.get("checkout"),
+                    "estado_proveedor": data.get("Operacion"),
+                    "respuesta_creacion_proveedor": respuesta_payvalida,
+                },
+            )
+
+            await self.servicio_eventos.registrar_evento(
+                id_orden_pago=id_orden_pago,
+                tipo_evento=EventosOrdenPago.ORDEN_ACTUALIZADA_PAYVALIDA,
+                origen_evento=OrigenEventoPago.PAYVALIDA,
+                descripcion="Payválida actualizó la orden correctamente",
+                datos_evento=respuesta_payvalida,
+            )
+
+            await self.repositorio_auditoria.crear(
+                contexto_auditoria=contexto_auditoria,
+                id_orden_pago=id_orden_pago,
+                sistema_origen=orden.get("sistema_origen"),
+                referencia_externa=orden.get("referencia_externa"),
+                codigo_respuesta=200,
+                exitoso=True,
+            )
+
+            orden_actualizada = await self.repositorio_ordenes.obtener_por_id(id_orden_pago)
+            return self.construir_respuesta_orden(orden_actualizada)
+
+        except Exception as error:
+            if not respuesta_registrada:
+                await self.repositorio_solicitudes.actualizar_respuesta(
+                    id_solicitud=id_solicitud,
+                    respuesta_recibida=None,
+                    codigo_http=None,
+                    exitoso=False,
+                    mensaje_error=str(error),
+                    duracion_ms=None,
+                )
+
+            if respuesta_registrada and isinstance(error, ErrorProveedorPago):
+                raise
+
+            await self.servicio_eventos.registrar_evento(
+                id_orden_pago=id_orden_pago,
+                tipo_evento=EventosOrdenPago.ACTUALIZACION_PAYVALIDA_FALLIDA,
+                origen_evento=OrigenEventoPago.SISTEMA,
+                descripcion="Error al actualizar la orden en Payválida",
+                datos_evento={"error": str(error)},
+            )
+            raise
 
     def construir_respuesta_orden(
         self,

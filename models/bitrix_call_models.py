@@ -34,7 +34,28 @@ _INPUT_VARIABLE_KEYS = frozenset(
         "TELEFONO",
         "PAGADURIA",
         "MORA_TOTAL",
+        "VALOR_MORA",
         "ID_LIBRANZA",
+        "ID_CREDITO",
+        "ORIGEN",
+        "OBJETIVO",
+        "NOMBRE_ESTUDIANTE",
+        "CEDULA_TITULAR",
+        "NOMBRE_COTITULAR",
+        "IDENTIFICACION_COTITULAR",
+        "NUMERO_IDENTIFICACION",
+        "NOMBRE_LINEA_CREDITO",
+        "UNIVERSIDAD",
+        "EDAD",
+        "PERFIL_ECONOMICO",
+        "ESTADO_CREDITO",
+        "VALOR_FINANCIADO",
+        "VALOR_DESEMBOLSADO",
+        "CUOTAS",
+        "DIAS_ATRASO",
+        "FECHA_SOLICITUD",
+        "FECHA_DESEMBOLSO",
+        "PROVEEDOR_PAGO",
         "OBSERVACIONES",
         "TOTAL_CREDITO",
         "CORREO_CARTERA",
@@ -82,7 +103,24 @@ def _canonical_input_field(key: str) -> Optional[str]:
         "telefono": "TELEFONO",
         "pagaduria": "PAGADURIA",
         "mora_total": "MORA_TOTAL",
+        "valor_mora": "VALOR_MORA",
         "id_libranza": "ID_LIBRANZA",
+        "id_credito": "ID_CREDITO",
+        "codigo_credito": "ID_CREDITO",
+        "origen": "ORIGEN",
+        "objetivo": "OBJETIVO",
+        "nombre_estudiante": "NOMBRE",
+        "nombre_cliente": "NOMBRE",
+        "cedula_titular": "CEDULA",
+        "documento_titular": "CEDULA",
+        "numero_identificacion": "IDENTIFICACION_COTITULAR",
+        "identificacion_cotitular": "IDENTIFICACION_COTITULAR",
+        "identificacion_cliente": "CEDULA",
+        "celular": "TELEFONO",
+        "phone": "TELEFONO",
+        "email": "CORREO",
+        "universidad": "UNIVERSIDAD",
+        "proveedor_pago": "PROVEEDOR_PAGO",
         "observaciones": "OBSERVACIONES",
         "total_credito": "TOTAL_CREDITO",
         "correo_cartera": "CORREO_CARTERA",
@@ -124,6 +162,21 @@ def _normalize_extracted_item(item: Any) -> Optional[Dict[str, Any]]:
         "value": value,
         "description": item.get("description") or item.get("Description"),
     }
+
+
+def _validate_optional_email(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    text = str(value).strip().lower()
+    if text == "":
+        return None
+
+    pattern = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+    if not re.fullmatch(pattern, text):
+        raise ValueError("CORREO debe tener formato valido, por ejemplo cliente@dominio.com.")
+
+    return text
 
 
 def _extracted_to_list(extracted: Any) -> List[Dict[str, Any]]:
@@ -177,6 +230,8 @@ class BitrixCallInputVariables(BaseModel):
     MOTIVO: Optional[str] = None
     NOMBRE: Optional[str] = None
     CAMPANIA: Optional[str] = None
+    ORIGEN: Optional[str] = None
+    OBJETIVO: Optional[str] = None
 
     TELEFONO: Optional[Union[int, str]] = Field(
         None,
@@ -186,6 +241,22 @@ class BitrixCallInputVariables(BaseModel):
     PAGADURIA: Optional[str] = None
     MORA_TOTAL: Optional[Union[int, float, str]] = None
     ID_LIBRANZA: Optional[str] = None
+    ID_CREDITO: Optional[str] = None
+    UNIVERSIDAD: Optional[str] = None
+    VALOR_MORA: Optional[Union[int, float, str]] = None
+    NOMBRE_COTITULAR: Optional[str] = None
+    IDENTIFICACION_COTITULAR: Optional[Union[int, str]] = None
+    NOMBRE_LINEA_CREDITO: Optional[str] = None
+    EDAD: Optional[Union[int, str]] = None
+    PERFIL_ECONOMICO: Optional[str] = None
+    ESTADO_CREDITO: Optional[str] = None
+    VALOR_FINANCIADO: Optional[Union[int, float, str]] = None
+    VALOR_DESEMBOLSADO: Optional[Union[int, float, str]] = None
+    CUOTAS: Optional[Union[int, str]] = None
+    DIAS_ATRASO: Optional[Union[int, str]] = None
+    FECHA_SOLICITUD: Optional[str] = None
+    FECHA_DESEMBOLSO: Optional[str] = None
+    PROVEEDOR_PAGO: Optional[str] = None
     OBSERVACIONES: Optional[str] = None
     TOTAL_CREDITO: Optional[Union[int, float, str]] = None
     CORREO_CARTERA: Optional[str] = None
@@ -216,6 +287,8 @@ class BitrixCallInputVariables(BaseModel):
             canonical = _canonical_input_field(key)
             target_key = canonical if canonical else key
             normalized[target_key] = value
+            if canonical and str(key).strip() != canonical:
+                normalized[key] = value
 
         return normalized
 
@@ -234,18 +307,9 @@ class BitrixCallInputVariables(BaseModel):
     @classmethod
     def normalize_email(cls, value: Any) -> Optional[str]:
         """
-        Normaliza correos a minúscula si vienen presentes.
+        Normaliza y valida correos si vienen presentes.
         """
-
-        if value is None:
-            return None
-
-        text = str(value).strip()
-
-        if text == "":
-            return None
-
-        return text.lower()
+        return _validate_optional_email(value)
 
     @field_validator("TELEFONO", mode="before")
     @classmethod
@@ -484,18 +548,9 @@ class BitrixDebugSearchClientRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: Any) -> Optional[str]:
         """
-        Normaliza correo a minúscula.
+        Normaliza y valida correo si viene presente.
         """
-
-        if value is None:
-            return None
-
-        text = str(value).strip()
-
-        if text == "":
-            return None
-
-        return text.lower()
+        return _validate_optional_email(value)
 
 
 class BitrixLookupCriteriaResponse(BaseModel):
@@ -528,3 +583,9 @@ class BitrixCallCompletedResponse(BaseModel):
     client: Optional[Dict[str, Any]] = None
     deal_created: bool = False
     deal: Optional[Dict[str, Any]] = None
+    payment_order_created: bool = False
+    payment_order: Optional[Dict[str, Any]] = None
+    bitrix_link_updated: Optional[bool] = None
+    bitrix_link_verified: Optional[bool] = None
+    bitrix_link_update: Optional[Dict[str, Any]] = None
+    agent_context: Optional[Dict[str, Any]] = None

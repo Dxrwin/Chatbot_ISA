@@ -1,7 +1,8 @@
 from pydantic import BaseModel, ValidationError, field_validator, Field
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 from utils.notify_error import (
     error_notify,
     get_cached_logs,
@@ -36,6 +37,15 @@ from models.bitrix_call_models import (
     BitrixCallCompletedResponse
     #BitrixDebugSearchClientRequest,
 )
+from pagos.aplicacion.servicios.servicio_ordenes_pago import ServicioOrdenesPago
+from pagos.excepciones import ErrorProveedorPago
+from pagos.utilidades.auditoria_http import construir_contexto_auditoria_http
+from pagos.utilidades.modelos import modelo_a_diccionario
+from pagos.utilidades.validaciones_payvalida import ErrorValidacionPayvalida
+from utils.bitrix_payvalida_mapper import (
+    construir_solicitud_pago_desde_bitrix,
+    construir_solicitud_pago_desde_bitrix_sin_deal,
+)
 from dataclasses import dataclass
 import json
 from models.models import WebhookPayload
@@ -45,7 +55,7 @@ import logging
 import asyncio
 from fastapi import Request
 from typing import Optional, Dict, Any, List, Union
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from utils.config import settings
 import re
@@ -4371,6 +4381,15 @@ async def obtener_pagos_mora(payload: MoraData):
                 0  # estado 4 = vencida (no se puede pagar directamente en Kuenta)
             )
             count_paid = 0  # estado 1 = ya pagada
+            return_data = {
+                "total_cuotas": len(installments) if isinstance(installments, list) else 0,
+                "cuotas_pagadas": 0,
+                "cuotas_pendientes_total": 0,
+                "dias_de_atraso": resumen.get("debtDays", 0),
+                "pendientes_estado_3": 0,
+                "vencidos_estado_4": 0,
+                "pago_pendiente": None,
+            }
 
             if installments and isinstance(installments, list):
                 for installment in installments:
@@ -5283,6 +5302,44 @@ def limpiar_texto(valor: Any) -> Optional[str]:
     return texto or None
 
 
+def convertir_a_json_seguro(valor: Any) -> Any:
+    """
+    Convierte estructuras con excepciones u objetos no JSON a valores serializables.
+    """
+    if isinstance(valor, BaseException):
+        return str(valor)
+
+    if isinstance(valor, dict):
+        return {clave: convertir_a_json_seguro(item) for clave, item in valor.items()}
+
+    if isinstance(valor, (list, tuple, set)):
+        return [convertir_a_json_seguro(item) for item in valor]
+
+    try:
+        json.dumps(valor)
+        return valor
+    except (TypeError, ValueError):
+        return str(valor)
+
+
+def correo_valido_basico(valor: Any) -> bool:
+    correo = limpiar_texto(valor)
+    if not correo:
+        return False
+
+    patron = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+    return re.fullmatch(patron, correo) is not None
+
+
+def normalizar_correo_o_none(valor: Any) -> Optional[str]:
+    correo = limpiar_texto(valor)
+    if not correo:
+        return None
+
+    correo = correo.lower()
+    return correo if correo_valido_basico(correo) else None
+
+
 def obtener_variable_entrada(
     variables_entrada: Dict[str, Any],
     nombre: str,
@@ -5300,6 +5357,293 @@ def obtener_variable_entrada(
             return valor
 
     return defecto
+
+
+VARIABLES_ENTRADA_DEBUG_WEBHOOK = [
+    "ORIGEN",
+    "OBJETIVO",
+    "CEDULA",
+    "CEDULA_TITULAR",
+    "NOMBRE",
+    "NOMBRE_ESTUDIANTE",
+    "TELEFONO",
+    "CORREO",
+    "ID_LIBRANZA",
+    "ID_CREDITO",
+    "PAGADURIA",
+    "UNIVERSIDAD",
+    "MORA_TOTAL",
+    "VALOR_MORA",
+    "VALOR_CONFIRMADO",
+]
+
+VARIABLES_SALIDA_DEBUG_WEBHOOK = [
+    "contesto",
+    "contestó",
+    "resultvalidacion",
+    "validacion_identidad",
+    "objetivo",
+    "obj",
+    "gestion_final",
+    "gestion",
+    "opcion_pago",
+    "opcpago",
+    "requiere_link_pago",
+    "linkpago",
+    "interes_pagar",
+    "intencion_pago",
+    "intpago",
+    "pago_hoy",
+    "pagohoy",
+    "fechacuerdopago",
+    "fecha_compromiso_pago",
+    "fechapago",
+    "valor_confirmado",
+    "valor_a_pagar",
+    "valorpago",
+    "valor_pago_parcial",
+    "valabono",
+    "intencion_abono",
+    "intabono",
+    "motivo_principal",
+    "motivo",
+]
+
+
+def resumir_variables_debug(
+    variables: Optional[Dict[str, Any]],
+    claves: List[str],
+) -> Dict[str, Any]:
+    """
+    Devuelve solo variables relevantes para depurar sin repetir todo el payload.
+    """
+    variables = variables or {}
+    resumen: Dict[str, Any] = {}
+
+    for clave in claves:
+        valor = obtener_variable_entrada(variables, clave)
+        if valor is not None:
+            resumen[clave] = convertir_a_json_seguro(valor)
+
+    return resumen
+
+
+def construir_sugerencias_error_webhook(
+    tipo_error: str,
+    error: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    error = error or {}
+    campo = str(error.get("campo") or "").strip()
+    valor = error.get("valor_recibido")
+    hoy = datetime.now(ZoneInfo("America/Bogota")).date()
+    fecha_maxima = hoy + timedelta(days=30)
+    sugerencias: List[str] = []
+
+    if campo == "pago.fecha_expiracion":
+        sugerencias.append(
+            "Enviar la fecha de acuerdo/expiracion en formato DD/MM/YYYY."
+        )
+        sugerencias.append(
+            f"La fecha debe estar entre {hoy.strftime('%d/%m/%Y')} y {fecha_maxima.strftime('%d/%m/%Y')}."
+        )
+        if valor:
+            sugerencias.append(
+                f"Valor recibido para fecha de expiracion: {valor}."
+            )
+    elif campo == "cliente.correo":
+        sugerencias.append(
+            "Enviar CORREO con formato valido, por ejemplo cliente@dominio.com."
+        )
+        sugerencias.append(
+            "Si Bitrix no tiene correo, el webhook usa input_variables.CORREO como fallback."
+        )
+    elif campo == "pago.monto":
+        sugerencias.append(
+            "Enviar valor_confirmado/VALOR_CONFIRMADO numerico; se aceptan separadores como 3000000, 3.000.000 o 3,000,000."
+        )
+        sugerencias.append(
+            "El monto principal debe salir del valor pactado por el cliente, no de MORA_TOTAL."
+        )
+    elif tipo_error == "contacto_bitrix_no_encontrado":
+        sugerencias.append(
+            "Verificar CEDULA, TELEFONO o CORREO para que coincidan con un contacto de Bitrix."
+        )
+    elif tipo_error == "error_bitrix":
+        sugerencias.append(
+            "Revisar metodo Bitrix, cuerpo enviado y respuesta cruda en el detalle del error."
+        )
+    elif tipo_error in {"error_proveedor_payvalida", "error_proveedor_pago"}:
+        sugerencias.append(
+            "Revisar respuesta real del proveedor y si la orden ya existe, esta vencida o fue pagada."
+        )
+    elif tipo_error == "validacion_payload":
+        sugerencias.append(
+            "Corregir los campos marcados en errores antes de reenviar el webhook."
+        )
+    elif tipo_error == "payload_gestion_incompleto":
+        sugerencias.append(
+            "Verificar que las variables minimas del objetivo esten presentes: identificacion del cliente, resultado de validacion, gestion y datos de pago si el flujo requiere link."
+        )
+    elif tipo_error == "json_invalido":
+        sugerencias.append(
+            "Enviar un JSON valido con input_variables y extracted_variables."
+        )
+
+    if not sugerencias:
+        sugerencias.append(
+            "Revisar el bloque debug para identificar etapa, variables clave y contexto del agente."
+        )
+
+    return sugerencias
+
+
+def resumir_contacto_debug(contact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(contact, dict):
+        return None
+
+    return convertir_a_json_seguro(
+        {
+            "id": contact.get("id") or contact.get("ID"),
+            "name": contact.get("name") or contact.get("NAME"),
+            "lastName": contact.get("lastName") or contact.get("LAST_NAME"),
+            "email": contact.get("email") or contact.get("EMAIL"),
+            "phone": contact.get("phone") or contact.get("PHONE"),
+        }
+    )
+
+
+def resumir_deal_debug(deal_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(deal_result, dict):
+        return None
+
+    item = deal_result.get("item") if isinstance(deal_result.get("item"), dict) else deal_result
+    if not isinstance(item, dict):
+        return None
+
+    return convertir_a_json_seguro(
+        {
+            "id": item.get("id") or item.get("ID"),
+            "title": item.get("title") or item.get("TITLE"),
+            "contactId": item.get("contactId") or item.get("CONTACT_ID"),
+            "categoryId": item.get("categoryId") or item.get("CATEGORY_ID"),
+            "stageId": item.get("stageId") or item.get("STAGE_ID"),
+            "opportunity": item.get("opportunity") or item.get("OPPORTUNITY"),
+            "currencyId": item.get("currencyId") or item.get("CURRENCY_ID"),
+            "link_pago": item.get("UF_CRM_1779835103174"),
+        }
+    )
+
+
+def resumir_orden_pago_debug(
+    payment_order_result: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(payment_order_result, dict):
+        return None
+
+    orden_externa = payment_order_result.get("orden_pago")
+    if isinstance(orden_externa, dict):
+        orden_externa = {
+            "id_orden_pago": orden_externa.get("id_orden_pago"),
+            "status_inicial": orden_externa.get("status_inicial"),
+            "valor_orden_pago": orden_externa.get("valor_orden_pago"),
+            "link_pago": orden_externa.get("link_pago"),
+        }
+
+    return convertir_a_json_seguro(
+        {
+            "id_orden_pago": payment_order_result.get("id_orden_pago"),
+            "codigo_orden_interno": payment_order_result.get("codigo_orden_interno"),
+            "referencia_externa": payment_order_result.get("referencia_externa"),
+            "proveedor": payment_order_result.get("proveedor"),
+            "estado": payment_order_result.get("estado"),
+            "monto": payment_order_result.get("monto"),
+            "moneda": payment_order_result.get("moneda"),
+            "enlace_pago": payment_order_result.get("enlace_pago")
+            or payment_order_result.get("link_pago"),
+            "idempotente": payment_order_result.get("idempotente"),
+            "orden_pago": orden_externa,
+        }
+    )
+
+
+def resumir_actualizacion_link_debug(
+    bitrix_link_update: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(bitrix_link_update, dict):
+        return None
+
+    return convertir_a_json_seguro(
+        {
+            "verificado": bitrix_link_update.get("verificado"),
+            "intentos": bitrix_link_update.get("intentos"),
+            "id_deal": bitrix_link_update.get("id_deal"),
+            "campo_link": bitrix_link_update.get("campo_link"),
+            "link_enviado": bitrix_link_update.get("link_enviado"),
+            "link_en_bitrix": bitrix_link_update.get("link_en_bitrix"),
+            "ultimo_error": bitrix_link_update.get("ultimo_error"),
+            "respuesta_update": bitrix_link_update.get("respuesta_update"),
+        }
+    )
+
+
+def construir_error_webhook_debug(
+    *,
+    tipo_error: str,
+    mensaje: str,
+    status_code: int,
+    action: str = "failed_call_completed",
+    input_variables: Optional[Dict[str, Any]] = None,
+    output_vars: Optional[Dict[str, Any]] = None,
+    contexto_agente: Optional[Dict[str, Any]] = None,
+    criteria: Any = None,
+    validation: Optional[Dict[str, Any]] = None,
+    contact: Optional[Dict[str, Any]] = None,
+    deal_result: Optional[Dict[str, Any]] = None,
+    payment_order_result: Optional[Dict[str, Any]] = None,
+    bitrix_link_update: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    criteria_dict = (
+        getattr(criteria, "__dict__", None)
+        if criteria is not None
+        else None
+    )
+    contact_id = None
+    if isinstance(contact, dict):
+        contact_id = contact.get("id") or contact.get("ID")
+
+    return convertir_a_json_seguro(
+        {
+            "ok": False,
+            "action": action,
+            "tipo_error": tipo_error,
+            "mensaje": mensaje,
+            "http_status": status_code,
+            "validation": validation,
+            "error": error,
+            "debug": {
+                "agent_context": contexto_agente,
+                "lookup_criteria": criteria_dict,
+                "client_found": contact is not None,
+                "client_id": contact_id,
+                "client": resumir_contacto_debug(contact),
+                "deal_created": deal_result is not None,
+                "deal": resumir_deal_debug(deal_result),
+                "payment_order_created": payment_order_result is not None,
+                "payment_order": resumir_orden_pago_debug(payment_order_result),
+                "bitrix_link_update": resumir_actualizacion_link_debug(bitrix_link_update),
+                "variables_entrada_clave": resumir_variables_debug(
+                    input_variables,
+                    VARIABLES_ENTRADA_DEBUG_WEBHOOK,
+                ),
+                "variables_salida_clave": resumir_variables_debug(
+                    output_vars,
+                    VARIABLES_SALIDA_DEBUG_WEBHOOK,
+                ),
+            },
+            "sugerencias": construir_sugerencias_error_webhook(tipo_error, error),
+        }
+    )
 
 
 def es_si(valor: Any) -> bool:
@@ -5336,6 +5680,54 @@ def es_verdadero(valor: Any) -> bool:
     }
 
 
+SALIDA_ALIAS_CANONICOS: Dict[str, List[str]] = {
+    # Base comun del agente con limite de 16 caracteres.
+    "validaid": ["resultvalidacion", "validacion_identidad"],
+    "obj": ["objetivo"],
+    "gestion": ["gestion_final"],
+    "opcpago": ["opcion_pago"],
+    "linkpago": ["requiere_link_pago"],
+    "intpago": ["interes_pagar", "intencion_pago"],
+    "pagohoy": ["pago_hoy"],
+    "fechapago": ["fechacuerdopago", "fecha_compromiso_pago"],
+    "valorpago": ["valor_confirmado", "valor_a_pagar"],
+    "detalle": ["detalle_acuerdo"],
+    "motivo": ["motivo_principal"],
+    "seguimiento": ["requseguimiento"],
+    "sigcanal": ["canalsiguiente"],
+    # One2Credit.
+    "intabono": ["intencion_abono"],
+    "valabono": ["valor_pago_parcial"],
+    "tipogestion": ["tipo_gestion"],
+    "alturamora": ["altura_mora"],
+    # Variantes frecuentes.
+    "resumen": ["resumenllamada"],
+    "contesto": ["contesto"],
+}
+
+
+def asignar_variable_salida_normalizada(
+    salida: Dict[str, Any],
+    nombre: Any,
+    valor: Any,
+) -> None:
+    """
+    Inserta una variable de salida y sus alias canonicos.
+
+    Esto permite que el agente use nombres cortos como `opcpago` o `valorpago`
+    sin obligar al resto del flujo a conocer esos nombres.
+    """
+
+    clave = normalizar_clave(nombre)
+    if not clave:
+        return
+
+    salida[clave] = valor
+
+    for alias in SALIDA_ALIAS_CANONICOS.get(clave, []):
+        salida.setdefault(alias, valor)
+
+
 def construir_mapa_variables_salida(variables_extraidas: Any) -> Dict[str, Any]:
     """
     Convierte extracted_variables en un diccionario normalizado.
@@ -5364,13 +5756,13 @@ def construir_mapa_variables_salida(variables_extraidas: Any) -> Dict[str, Any]:
             valor = elemento.get("value")
 
             if nombre:
-                salida[normalizar_clave(nombre)] = valor
+                asignar_variable_salida_normalizada(salida, nombre, valor)
 
         return salida
 
     if isinstance(variables_extraidas, dict):
         for clave, valor in variables_extraidas.items():
-            salida[normalizar_clave(clave)] = valor
+            asignar_variable_salida_normalizada(salida, clave, valor)
 
         return salida
 
@@ -5628,6 +6020,907 @@ def evaluar_intencion_pago(variables_salida: Dict[str, Any]) -> Dict[str, Any]:
         "contesto": es_verdadero(contesto),
     },
 }
+
+
+def obtener_variable_salida(
+    variables_salida: Dict[str, Any],
+    *nombres: str,
+    defecto: Any = None,
+) -> Any:
+    """
+    Obtiene una variable de salida por nombre normalizado.
+    """
+
+    for nombre in nombres:
+        clave = normalizar_clave(nombre)
+        if clave in variables_salida:
+            return variables_salida.get(clave)
+
+    return defecto
+
+
+def obtener_variable_entrada_o_salida(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+    *nombres: str,
+    defecto: Any = None,
+) -> Any:
+    """
+    Busca primero en salidas normalizadas y luego en entradas.
+    """
+
+    valor_salida = obtener_variable_salida(variables_salida, *nombres, defecto=None)
+    if valor_salida is not None:
+        return valor_salida
+
+    for nombre in nombres:
+        valor_entrada = obtener_variable_entrada(variables_entrada, nombre)
+        if valor_entrada is not None:
+            return valor_entrada
+
+    return defecto
+
+
+def interpretar_bool_opcional(valor: Any) -> Optional[bool]:
+    """
+    Interpreta booleanos declarados por agentes sin forzar defaults.
+    """
+
+    if value_is_missing(valor):
+        return None
+
+    if isinstance(valor, bool):
+        return valor
+
+    normalizado = normalizar_texto(valor)
+    if normalizado in {"true", "si", "s", "yes", "y", "1", "afirmativo"}:
+        return True
+    if normalizado in {"false", "no", "n", "0", "negativo"}:
+        return False
+    return None
+
+
+def value_is_missing(valor: Any) -> bool:
+    return valor is None or str(valor).strip() == ""
+
+
+def determinar_requiere_link_pago(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+) -> bool:
+    """
+    Decide si el evento debe intentar generar/recuperar link de pago.
+
+    Para compatibilidad, si no llega objetivo explicito se conserva el flujo
+    historico de cartera: llamada aprobada implica intento de pago Payvalida.
+    """
+
+    declarado = obtener_variable_entrada_o_salida(
+        variables_entrada,
+        variables_salida,
+        "requiere_link_pago",
+        "generar_link_pago",
+        "crear_link_pago",
+    )
+    bool_declarado = interpretar_bool_opcional(declarado)
+    if bool_declarado is not None:
+        return bool_declarado
+
+    objetivo = normalizar_texto(
+        obtener_variable_entrada_o_salida(
+            variables_entrada,
+            variables_salida,
+            "OBJETIVO",
+            "objetivo",
+        )
+    )
+
+    if objetivo in {
+        "registrar_gestion",
+        "registrar_gestion_refinanciacion",
+        "refinanciacion_final_credito",
+        "actualizar_contacto",
+        "solo_bitrix",
+    }:
+        return False
+
+    if any(token in objetivo for token in ("generar_link", "link_pago", "orden_pago", "cobranza", "cobro")):
+        return True
+
+    return not bool(objetivo)
+
+
+def determinar_proveedor_pago(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+) -> str:
+    proveedor = limpiar_texto(
+        obtener_variable_entrada_o_salida(
+            variables_entrada,
+            variables_salida,
+            "PROVEEDOR_PAGO",
+            "proveedor_pago",
+            "proveedor",
+        )
+    )
+    if proveedor:
+        return normalizar_texto(proveedor)
+
+    origen = normalizar_texto(obtener_variable_entrada(variables_entrada, "ORIGEN"))
+    objetivo = normalizar_texto(
+        obtener_variable_entrada_o_salida(
+            variables_entrada,
+            variables_salida,
+            "OBJETIVO",
+            "objetivo",
+        )
+    )
+
+    if (
+        "one2credit" in origen
+        or "one2credit" in objetivo
+        or "educativa" in origen
+        or "educativo" in origen
+        or "educativa" in objetivo
+        or "educativo" in objetivo
+    ):
+        return "api_externa"
+
+    return "payvalida"
+
+
+def construir_contexto_agente_universal(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+) -> Dict[str, Any]:
+    origen = limpiar_texto(obtener_variable_entrada(variables_entrada, "ORIGEN")) or "agente_no_especificado"
+    objetivo = limpiar_texto(
+        obtener_variable_entrada_o_salida(
+            variables_entrada,
+            variables_salida,
+            "OBJETIVO",
+            "objetivo",
+        )
+    ) or "flujo_legacy_cartera"
+    requiere_link_pago = determinar_requiere_link_pago(variables_entrada, variables_salida)
+    proveedor_pago = determinar_proveedor_pago(variables_entrada, variables_salida)
+
+    return {
+        "origen": origen,
+        "objetivo": objetivo,
+        "requiere_bitrix": True,
+        "requiere_link_pago": requiere_link_pago,
+        "proveedor_pago": proveedor_pago,
+        "usa_payvalida": requiere_link_pago and proveedor_pago == "payvalida",
+    }
+
+
+def evaluar_gestion_universal(
+    variables_salida: Dict[str, Any],
+    contexto_agente: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Validacion generica para agentes que no necesariamente generan pago.
+    """
+
+    contesto = obtener_variable_salida(variables_salida, "contesto", "contestó", "contesto_llamada")
+    validacion_identidad = obtener_variable_salida(
+        variables_salida,
+        "validacion_identidad",
+        "resultvalidacion",
+        "resultado_validacion",
+    )
+    gestion_final = normalizar_texto(obtener_variable_salida(variables_salida, "gestion_final"))
+    tipo_gestion = normalizar_texto(obtener_variable_salida(variables_salida, "tipo_gestion"))
+
+    bloqueadores: List[str] = []
+    advertencias: List[str] = []
+    senales_positivas: List[str] = []
+
+    if not es_verdadero(contesto):
+        bloqueadores.append("La gestion no fue contestada por el cliente o no hubo conversacion efectiva.")
+    else:
+        senales_positivas.append("contesto=true")
+
+    identidad_normalizada = normalizar_texto(validacion_identidad)
+    if identidad_normalizada not in VALORES_VALIDACION_IDENTIDAD_OK:
+        bloqueadores.append(
+            f"Identidad no validada: validacion_identidad={identidad_normalizada or 'vacio'}."
+        )
+    else:
+        senales_positivas.append("validacion_identidad=validado")
+
+    if gestion_final:
+        senales_positivas.append(f"gestion_final={gestion_final}")
+    else:
+        advertencias.append("No llego gestion_final; se registrara solo la trazabilidad disponible.")
+
+    aprobado = len(bloqueadores) == 0
+
+    return {
+        "aprobado": aprobado,
+        "intencion_pago": bool(contexto_agente.get("requiere_link_pago")),
+        "senales_positivas": senales_positivas,
+        "bloqueadores": bloqueadores,
+        "advertencias": advertencias,
+        "normalizado": {
+            "origen": contexto_agente.get("origen"),
+            "objetivo": contexto_agente.get("objetivo"),
+            "tipo_gestion": tipo_gestion,
+            "gestion_final": gestion_final,
+            "validacion_identidad": identidad_normalizada,
+            "contesto": es_verdadero(contesto),
+            "requiere_link_pago": bool(contexto_agente.get("requiere_link_pago")),
+            "proveedor_pago": contexto_agente.get("proveedor_pago"),
+        },
+        "approved": aprobado,
+        "payment_intent": bool(contexto_agente.get("requiere_link_pago")),
+        "positive_signals": senales_positivas,
+        "blockers": bloqueadores,
+        "warnings": advertencias,
+        "normalized": {
+            "origen": contexto_agente.get("origen"),
+            "objetivo": contexto_agente.get("objetivo"),
+            "tipo_gestion": tipo_gestion,
+            "gestion_final": gestion_final,
+            "validacion_identidad": identidad_normalizada,
+            "contesto": es_verdadero(contesto),
+            "requiere_link_pago": bool(contexto_agente.get("requiere_link_pago")),
+            "proveedor_pago": contexto_agente.get("proveedor_pago"),
+        },
+    }
+
+
+KUENTA_ONE2CREDIT_ORG_ID = ORG_ID or "beafcbd8-bba7-4303-ad8d-cf33026717b3"
+KUENTA_RECEIVABLES_URL = "https://api.kuenta.co/v1/receivables"
+ESTADOS_CREDITO_ONE2CREDIT_CONSULTA_MORA = {7, 10, 16}
+
+
+def construir_headers_kuenta_one2credit(token: str) -> Dict[str, str]:
+    return {
+        "Config-Organization-ID": KUENTA_ONE2CREDIT_ORG_ID,
+        "Organization-ID": KUENTA_ONE2CREDIT_ORG_ID,
+        "Authorization": token,
+    }
+
+
+def extraer_lista_creditos_one2credit(respuesta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = respuesta.get("data") if isinstance(respuesta, dict) else None
+    if isinstance(data, dict):
+        creditos = data.get("credits") or data.get("receivables") or data.get("items")
+        if isinstance(creditos, list):
+            return [credito for credito in creditos if isinstance(credito, dict)]
+    if isinstance(respuesta.get("credits"), list):
+        return [credito for credito in respuesta["credits"] if isinstance(credito, dict)]
+    return []
+
+
+def extraer_datos_credito_mora_one2credit(credito: Dict[str, Any]) -> Dict[str, Any]:
+    summary = credito.get("summary") if isinstance(credito.get("summary"), dict) else {}
+    credit_line = credito.get("creditLine") if isinstance(credito.get("creditLine"), dict) else {}
+
+    return {
+        "id_credito_mora": credito.get("ID") or credito.get("id"),
+        "consecutivo": credito.get("consecutive"),
+        "referencia_credito_mora": credito.get("reference"),
+        "parent_id_credito_mora": credito.get("parentID") or credito.get("parentId"),
+        "estado_credito_mora": credito.get("status"),
+        "saldo_credito_mora": summary.get("balance"),
+        "fecha_desembolso_mora": credito.get("disbursedAt"),
+        "titulo_de_linea_mora": credit_line.get("title"),
+    }
+
+
+async def consultar_creditos_one2credit_por_cedula(cedula: str) -> Dict[str, Any]:
+    method_name = "consultar_creditos_one2credit_por_cedula"
+    token = await obtener_token()
+    headers = construir_headers_kuenta_one2credit(token)
+    params = {
+        "limit": 10,
+        "include": "summary,installments",
+        "status": "0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22",
+        "q": cedula,
+        "order": "created_at:desc",
+    }
+
+    logger.info(
+        "Consultando creditos One2Credit por cedula | cedula=%s | url=%s | params=%s",
+        cedula,
+        KUENTA_RECEIVABLES_URL,
+        json.dumps(params, ensure_ascii=False, default=str),
+    )
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(KUENTA_RECEIVABLES_URL, params=params, headers=headers)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw_response": response.text}
+
+    logger.info(
+        "Respuesta creditos One2Credit | cedula=%s | status=%s | data=%s",
+        cedula,
+        response.status_code,
+        json.dumps(data, ensure_ascii=False, default=str),
+    )
+
+    await insertar_log(
+        method_name=method_name,
+        client_id=cedula,
+        error_message=f"Consulta creditos One2Credit status={response.status_code}",
+        http_code=response.status_code,
+        tipo="info" if response.status_code < 400 else "error",
+        payload_enviado=json.dumps(params, ensure_ascii=False, default=str),
+        respuesta_api=json.dumps(data, ensure_ascii=False, default=str),
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "ok": False,
+                "tipo_error": "error_consulta_creditos_one2credit",
+                "status_code": response.status_code,
+                "respuesta": data,
+            },
+        )
+
+    creditos = extraer_lista_creditos_one2credit(data)
+    if not creditos:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "ok": False,
+                "tipo_error": "credito_one2credit_no_encontrado",
+                "mensaje": "No se encontraron creditos One2Credit para la cedula enviada.",
+                "cedula": cedula,
+                "respuesta": data,
+            },
+        )
+
+    credito = creditos[0]
+    datos_credito = extraer_datos_credito_mora_one2credit(credito)
+    return {
+        "credito": credito,
+        "datos_credito": datos_credito,
+        "respuesta_proveedor": data,
+    }
+
+
+async def consultar_pagos_mora_interno_one2credit(id_credito: str) -> Dict[str, Any]:
+    logger.info("Consultando /pagos-mora para credito One2Credit | id_credito=%s", id_credito)
+    response = await obtener_pagos_mora(MoraData(id_credito=id_credito))
+    status_code = getattr(response, "status_code", 500)
+    try:
+        body = json.loads(response.body.decode("utf-8"))
+    except Exception:
+        body = {"raw_response": getattr(response, "body", b"").decode("utf-8", errors="replace")}
+
+    logger.info(
+        "Respuesta /pagos-mora para credito One2Credit | id_credito=%s | status=%s | body=%s",
+        id_credito,
+        status_code,
+        json.dumps(body, ensure_ascii=False, default=str),
+    )
+
+    if status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "ok": False,
+                "tipo_error": "error_pagos_mora_one2credit",
+                "id_credito": id_credito,
+                "status_code": status_code,
+                "respuesta": body,
+            },
+        )
+
+    return body
+
+
+def extraer_datos_pagos_mora_one2credit(respuesta_pagos_mora: Dict[str, Any]) -> Dict[str, Any]:
+    data = respuesta_pagos_mora.get("data") if isinstance(respuesta_pagos_mora, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    pago_pendiente = data.get("pago_pendiente") if isinstance(data.get("pago_pendiente"), dict) else {}
+
+    return {
+        "C_pendiente_mas_Cvencida": data.get("cuotas_pendientes_total"),
+        "dias_atraso": data.get("dias_de_atraso"),
+        "valor_pagar_legible": pago_pendiente.get("valor_total_legible"),
+        "fecha_pago": pago_pendiente.get("fecha_pago_legible"),
+        "id_cuota_pendiente": pago_pendiente.get("id"),
+        "cuotas_total": data.get("total_cuotas"),
+        "cuota_atraso": pago_pendiente.get("retrasado"),
+        "label_cuota_atraso": pago_pendiente.get("label_fecha"),
+        "Cuotas_pendientes": data.get("pendientes_estado_3"),
+        "Cuotas_vencidas": data.get("vencidos_estado_4"),
+    }
+
+
+def construir_mensaje_pagos_mora_one2credit(datos_mora: Dict[str, Any]) -> str:
+    cuota_atraso = bool(datos_mora.get("cuota_atraso"))
+    cuotas_pendientes = datos_mora.get("Cuotas_pendientes")
+    dias_atraso = datos_mora.get("dias_atraso")
+    valor_pagar = datos_mora.get("valor_pagar_legible") or "N/A"
+    fecha_pago = datos_mora.get("fecha_pago") or "N/A"
+
+    if cuota_atraso:
+        mensaje = (
+            f"*CUOTAS PENDIENTES:* {cuotas_pendientes}\n"
+            "----------------------------------------\n"
+            f"*DIAS DE ATRASO:* {dias_atraso}\n"
+            "----------------------------------------\n"
+            f"*VALOR PENDIENTE A PAGAR:*  {valor_pagar}\n"
+            "---------------------------------------\n"
+            f"*FECHA DE PAGO VENCIDA:*   {fecha_pago}"
+        )
+    else:
+        mensaje = (
+            f"*CUOTAS PENDIENTES:* {cuotas_pendientes}\n"
+            "----------------------------------------\n"
+            f"*DIAS DE ATRASO:* {dias_atraso}\n"
+            "----------------------------------------\n"
+            f"*PROXIMO VALOR A PAGAR:*  {valor_pagar}\n"
+            "---------------------------------------\n"
+            f"*PROXIMA FECHA DE PAGO:*   {fecha_pago}"
+        )
+
+    logger.info("Mensaje pagos mora One2Credit construido | %s", mensaje)
+    return mensaje
+
+
+def obtener_opcion_pago_one2credit(variables_salida: Dict[str, Any]) -> Optional[str]:
+    valor = obtener_variable_salida(
+        variables_salida,
+        "opcion_pago",
+        "opcion_de_pago",
+        "tipo_pago",
+        "tipo_de_pago",
+        "gestion_pago",
+        "modalidad_pago",
+        "decision_pago",
+    )
+    texto = normalizar_texto(valor)
+    if not texto:
+        return None
+    if "pago_total" in texto or texto == "total":
+        return "pago_total"
+    if "abona" in texto or "abono" in texto or "pago_parcial" in texto:
+        return "abono_deuda"
+    if "acuerdo" in texto:
+        return "acuerdo_pago"
+    return texto
+
+
+def extraer_valor_pago_parcial_one2credit(variables_salida: Dict[str, Any]) -> Optional[int]:
+    valor = obtener_variable_salida(
+        variables_salida,
+        "valor_pago_parcial",
+        "valor_abono",
+        "valor_a_abonar",
+        "monto_abono",
+        "monto_parcial",
+        "valor_a_pagar",
+    )
+    return convertir_a_entero_o_none(valor)
+
+
+def formatear_valor_fecha_payload(valor: Any, fecha: Any = "now") -> Dict[str, Any]:
+    valor_procesado = convertir_a_entero_o_none(valor)
+    if valor_procesado is None:
+        raise ValueError("valor no es numerico o no se pudo interpretar.")
+
+    if fecha is None or str(fecha).strip().lower() == "now":
+        fecha_procesada = datetime.now(ZoneInfo("America/Bogota")).strftime("%d/%m/%Y")
+    else:
+        fecha_procesada = str(fecha).strip()
+
+    return {
+        "valor": {
+            "original": valor,
+            "valor_procesado": valor_procesado,
+            "valor_legible": formatear_valor_moneda(valor_procesado),
+        },
+        "fecha": {
+            "original": fecha,
+            "valor_procesado": fecha_procesada,
+        },
+    }
+
+
+@app.get("/formatear")
+async def formatear_valor_fecha(valor: str = Query(...), fecha: str = Query("now")):
+    try:
+        return formatear_valor_fecha_payload(valor=valor, fecha=fecha)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+async def simular_orden_pago_total_one2credit(
+    id_credito_mora: str,
+    id_cuota_pendiente: str,
+) -> Dict[str, Any]:
+    method_name = "simular_orden_pago_total_one2credit"
+    token = await obtener_token()
+    headers = construir_headers_kuenta_one2credit(token)
+    payables_base_url = (
+        PAYABLE_URL.rstrip("/")
+        if PAYABLE_URL and "payables" in PAYABLE_URL.lower()
+        else "https://api.kuenta.co/v1/payables"
+    )
+    url = (
+        f"{payables_base_url}/{id_credito_mora}/installments/"
+        f"{id_cuota_pendiente}/orders/simulation"
+    )
+    params = {
+        "method": "payvalida",
+        "payvalidaMethod": "undefined",
+        "paymentMethod": "payvalida",
+    }
+
+    logger.info(
+        "Simulando orden pago total One2Credit | url=%s | params=%s",
+        url,
+        json.dumps(params, ensure_ascii=False, default=str),
+    )
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(url, params=params, headers=headers)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw_response": response.text}
+
+    await insertar_log(
+        method_name=method_name,
+        client_id=id_credito_mora,
+        error_message=f"Simulacion orden pago total status={response.status_code}",
+        http_code=response.status_code,
+        tipo="info" if response.status_code < 400 else "error",
+        payload_enviado=json.dumps(params, ensure_ascii=False, default=str),
+        respuesta_api=json.dumps(data, ensure_ascii=False, default=str),
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "ok": False,
+                "tipo_error": "error_simulacion_pago_total_one2credit",
+                "status_code": response.status_code,
+                "respuesta": data,
+            },
+        )
+
+    final_amount = None
+    data_block = data.get("data") if isinstance(data, dict) else {}
+    if isinstance(data_block, dict):
+        payment = data_block.get("payment") if isinstance(data_block.get("payment"), dict) else {}
+        final_amount = payment.get("finalAmount")
+
+    monto_final = convertir_a_entero_o_none(final_amount)
+    if monto_final is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "monto_final_orden_pago_faltante",
+                "mensaje": "La simulacion no retorno data.payment.finalAmount valido.",
+                "respuesta": data,
+            },
+        )
+
+    return {
+        "monto_final_orden_pago": monto_final,
+        "respuesta_simulacion": data,
+    }
+
+
+def extraer_body_json_response(response: Any) -> Dict[str, Any]:
+    try:
+        body = response.body.decode("utf-8") if isinstance(response.body, (bytes, bytearray)) else response.body
+        data = json.loads(body) if body else {}
+        return data if isinstance(data, dict) else {"data": data}
+    except Exception:
+        return {"raw_response": str(getattr(response, "body", ""))}
+
+
+def extraer_datos_orden_pago_one2credit(respuesta_orden: Dict[str, Any]) -> Dict[str, Any]:
+    data = respuesta_orden.get("data") if isinstance(respuesta_orden, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    order = data.get("order") if isinstance(data.get("order"), dict) else {}
+    meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+
+    return {
+        "id_orden_pago": order.get("id"),
+        "fecha_creacion_orden": order.get("createdAt"),
+        "status_inicial": order.get("status"),
+        "valor_orden_pago": order.get("amount"),
+        "tipo_pago": order.get("type"),
+        "link_pago": meta.get("checkout"),
+    }
+
+
+async def crear_orden_pago_one2credit_con_reintentos(
+    id_credito_mora: str,
+    id_cuota_pendiente: str,
+    amount: int | float,
+    max_intentos: int = 3,
+) -> Dict[str, Any]:
+    intentos = max(1, min(int(max_intentos or 3), 3))
+    ultimo_error = None
+    payload = InstallmentOrderCreateRequest(
+        amount=amount,
+        provider="payvalida",
+        collectionCosts=0,
+    )
+
+    for intento in range(1, intentos + 1):
+        logger.info(
+            "Creando orden One2Credit | intento=%s/%s | id_credito=%s | id_cuota=%s | amount=%s",
+            intento,
+            intentos,
+            id_credito_mora,
+            id_cuota_pendiente,
+            amount,
+        )
+        response = await create_installment_order(
+            id_credito_mora=id_credito_mora,
+            id_cuota_pendiente=id_cuota_pendiente,
+            payload=payload,
+        )
+        status_code = getattr(response, "status_code", 500)
+        body = extraer_body_json_response(response)
+
+        if status_code < 400:
+            datos_orden = extraer_datos_orden_pago_one2credit(body)
+            if datos_orden.get("link_pago"):
+                return {
+                    "respuesta_creacion": body,
+                    **datos_orden,
+                    "intentos": intento,
+                }
+            ultimo_error = {
+                "status_code": status_code,
+                "mensaje": "La orden fue creada pero no retorno data.order.meta.checkout.",
+                "respuesta": body,
+            }
+        else:
+            ultimo_error = {
+                "status_code": status_code,
+                "respuesta": body,
+            }
+
+        if intento < intentos:
+            await asyncio.sleep(intento)
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "ok": False,
+            "tipo_error": "orden_one2credit_sin_link",
+            "mensaje": "No se pudo crear una orden One2Credit con link de pago despues de reintentos.",
+            "ultimo_error": ultimo_error,
+        },
+    )
+
+
+def construir_mensaje_link_pago_one2credit(valor_pagar_legible: Any, link_pago: str) -> str:
+    mensaje = (
+        f"VALOR A PAGAR:\n{valor_pagar_legible or 'N/A'}\n"
+        "-----------------------------------------\n"
+        f"LINK DE PAGO:\n{link_pago}"
+    )
+    logger.info("Mensaje link pago One2Credit construido | %s", mensaje)
+    return mensaje
+
+
+async def resolver_orden_pago_one2credit(
+    opcion_pago: Optional[str],
+    variables_salida: Dict[str, Any],
+    datos_credito: Dict[str, Any],
+    datos_mora: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    id_credito_mora = limpiar_texto(datos_credito.get("id_credito_mora"))
+    id_cuota_pendiente = limpiar_texto(datos_mora.get("id_cuota_pendiente"))
+
+    if not opcion_pago:
+        return None
+
+    if opcion_pago == "acuerdo_pago":
+        return {
+            "estado": "PENDIENTE_FLUJO_ACUERDO_PAGO",
+            "mensaje": "Opcion Acuerdo de Pago tipificada; faltan las peticiones de este flujo.",
+        }
+
+    if not id_credito_mora or not id_cuota_pendiente:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "datos_orden_one2credit_incompletos",
+                "mensaje": "Se requiere id_credito_mora e id_cuota_pendiente para crear orden.",
+                "datos_credito": datos_credito,
+                "datos_mora": datos_mora,
+            },
+        )
+
+    if opcion_pago == "pago_total":
+        simulacion = await simular_orden_pago_total_one2credit(
+            id_credito_mora=id_credito_mora,
+            id_cuota_pendiente=id_cuota_pendiente,
+        )
+        monto = simulacion["monto_final_orden_pago"]
+        orden = await crear_orden_pago_one2credit_con_reintentos(
+            id_credito_mora=id_credito_mora,
+            id_cuota_pendiente=id_cuota_pendiente,
+            amount=monto,
+        )
+        valor_legible = datos_mora.get("valor_pagar_legible") or formatear_valor_moneda(monto)
+        return {
+            "opcion_pago": opcion_pago,
+            "monto_final_orden_pago": monto,
+            "valor_pagar_legible": valor_legible,
+            "mensaje_link_pago": construir_mensaje_link_pago_one2credit(
+                valor_pagar_legible=valor_legible,
+                link_pago=orden["link_pago"],
+            ),
+            **orden,
+            **simulacion,
+        }
+
+    if opcion_pago == "abono_deuda":
+        intencion_abono = obtener_variable_salida(
+            variables_salida,
+            "intencion_abono",
+            "interes_abonar",
+            "confirma_abono",
+            "intencion_pago",
+            "interes_pagar",
+        )
+        if not es_si(intencion_abono) and not es_verdadero(intencion_abono):
+            return {
+                "estado": "ABONO_SIN_INTENCION_POSITIVA",
+                "mensaje": "No se crea orden porque no hay intencion positiva de abono.",
+            }
+
+        valor_parcial = extraer_valor_pago_parcial_one2credit(variables_salida)
+        if valor_parcial is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "tipo_error": "valor_pago_parcial_requerido",
+                    "mensaje": "La opcion Abona Tu deuda requiere valor_pago_parcial o equivalente en variables de salida.",
+                },
+            )
+
+        formateado = formatear_valor_fecha_payload(valor=valor_parcial, fecha="now")
+        valor_procesado = formateado["valor"]["valor_procesado"]
+        orden = await crear_orden_pago_one2credit_con_reintentos(
+            id_credito_mora=id_credito_mora,
+            id_cuota_pendiente=id_cuota_pendiente,
+            amount=valor_procesado,
+        )
+        valor_legible = formateado["valor"]["valor_legible"]
+        return {
+            "opcion_pago": opcion_pago,
+            "valor_parcial_original": formateado["valor"]["original"],
+            "fecha_peticion_formateada": formateado["fecha"]["valor_procesado"],
+            "valor_parcial_procesado": valor_procesado,
+            "valor_pagar_legible": valor_legible,
+            "mensaje_link_pago": construir_mensaje_link_pago_one2credit(
+                valor_pagar_legible=valor_legible,
+                link_pago=orden["link_pago"],
+            ),
+            **orden,
+        }
+
+    return {
+        "estado": "OPCION_PAGO_NO_SOPORTADA",
+        "opcion_pago": opcion_pago,
+    }
+
+
+async def procesar_preconsulta_pago_one2credit_desde_evento(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    variables_salida = variables_salida or {}
+    cedula = limpiar_texto(
+        obtener_variable_entrada(variables_entrada, "CEDULA")
+        or obtener_variable_entrada(variables_entrada, "CEDULA_TITULAR")
+    )
+    if not cedula:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "cedula_requerida_one2credit",
+                "mensaje": "CEDULA o CEDULA_TITULAR es obligatoria para consultar creditos One2Credit.",
+            },
+        )
+
+    consulta_creditos = await consultar_creditos_one2credit_por_cedula(cedula)
+    datos_credito = consulta_creditos["datos_credito"]
+    estado_credito = datos_credito.get("estado_credito_mora")
+    try:
+        estado_credito_int = int(estado_credito)
+    except (TypeError, ValueError):
+        estado_credito_int = None
+
+    resultado = {
+        "proveedor": "one2credit_kuenta",
+        "etapa": "consulta_credito",
+        "cedula": cedula,
+        "datos_credito": datos_credito,
+        "estado_valido_para_pagos_mora": estado_credito_int in ESTADOS_CREDITO_ONE2CREDIT_CONSULTA_MORA,
+    }
+
+    if estado_credito_int not in ESTADOS_CREDITO_ONE2CREDIT_CONSULTA_MORA:
+        resultado.update(
+            {
+                "estado": "NO_APLICA_PAGOS_MORA",
+                "mensaje": (
+                    "El credito One2Credit no esta en estado 10, 7 o 16; "
+                    "no se consulta /pagos-mora en esta etapa."
+                ),
+            }
+        )
+        logger.info(
+            "Credito One2Credit no aplica para /pagos-mora | %s",
+            json.dumps(resultado, ensure_ascii=False, default=str),
+        )
+        return resultado
+
+    id_credito_mora = limpiar_texto(datos_credito.get("id_credito_mora"))
+    if not id_credito_mora:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "id_credito_mora_faltante",
+                "mensaje": "La consulta de creditos no retorno id_credito_mora.",
+                "datos_credito": datos_credito,
+            },
+        )
+
+    respuesta_pagos_mora = await consultar_pagos_mora_interno_one2credit(id_credito_mora)
+    datos_mora = extraer_datos_pagos_mora_one2credit(respuesta_pagos_mora)
+    mensaje = construir_mensaje_pagos_mora_one2credit(datos_mora)
+    opcion_pago = obtener_opcion_pago_one2credit(variables_salida)
+    orden_pago = await resolver_orden_pago_one2credit(
+        opcion_pago=opcion_pago,
+        variables_salida=variables_salida,
+        datos_credito=datos_credito,
+        datos_mora=datos_mora,
+    )
+
+    mensaje_final = (
+        orden_pago.get("mensaje_link_pago")
+        if isinstance(orden_pago, dict) and orden_pago.get("mensaje_link_pago")
+        else mensaje
+    )
+
+    resultado.update(
+        {
+            "etapa": "pagos_mora_consultado",
+            "estado": "ORDEN_PAGO_GENERADA" if isinstance(orden_pago, dict) and orden_pago.get("link_pago") else "PAGOS_MORA_CONSULTADO",
+            "opcion_pago": opcion_pago,
+            "datos_mora": datos_mora,
+            "mensaje_gestion": mensaje_final,
+            "mensaje_pagos_mora": mensaje,
+            "orden_pago": orden_pago,
+            "respuesta_pagos_mora": respuesta_pagos_mora,
+        }
+    )
+    logger.info(
+        "Preconsulta pagos One2Credit completada | %s",
+        json.dumps(resultado, ensure_ascii=False, default=str),
+    )
+    return resultado
 
 
 # ============================================================
@@ -6112,21 +7405,99 @@ def convertir_a_entero_o_none(valor: Any) -> Optional[int]:
     if not texto:
         return None
 
-    limpio = re.sub(r"[^\d-]", "", texto)
+    texto = re.sub(r"[^\d,.\-]", "", texto)
 
-    if not limpio:
+    if not texto:
         return None
+
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        partes = texto.split(",")
+        texto = texto.replace(",", ".") if len(partes[-1]) <= 2 else texto.replace(",", "")
+    elif "." in texto:
+        partes = texto.split(".")
+        if len(partes) > 2:
+            texto = "".join(partes[:-1]) + "." + partes[-1] if len(partes[-1]) <= 2 else "".join(partes)
+        elif len(partes[-1]) > 2:
+            texto = texto.replace(".", "")
 
     try:
-        return int(limpio)
-    except ValueError:
+        return int(Decimal(texto).quantize(Decimal("1")))
+    except (InvalidOperation, ValueError):
         return None
+
+
+def construir_comentarios_trazabilidad_gestion(
+    variables_entrada: Dict[str, Any],
+    variables_salida: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Guarda trazabilidad de campos especificos de producto sin mezclarlos con
+    campos legacy de libranza.
+    """
+
+    campos_entrada = [
+        "ORIGEN",
+        "OBJETIVO",
+        "ID_CREDITO",
+        "ID_LIBRANZA",
+        "UNIVERSIDAD",
+        "PAGADURIA",
+        "NOMBRE_LINEA_CREDITO",
+        "ESTADO_CREDITO",
+        "VALOR_MORA",
+        "MORA_TOTAL",
+        "VALOR_FINANCIADO",
+        "VALOR_DESEMBOLSADO",
+        "CUOTAS",
+        "DIAS_ATRASO",
+        "FECHA_SOLICITUD",
+        "FECHA_DESEMBOLSO",
+        "NOMBRE_COTITULAR",
+        "IDENTIFICACION_COTITULAR",
+    ]
+    campos_salida = [
+        "tipo_gestion",
+        "altura_mora",
+        "gestion_final",
+        "requiere_link_pago",
+        "proveedor_pago",
+        "interes_refinanciar",
+        "cuotas_restantes",
+        "valor_a_pagar",
+        "fecha_compromiso_pago",
+        "resumenllamada",
+        "resumen_llamada",
+        "detalle_acuerdo",
+    ]
+
+    lineas: List[str] = []
+
+    for campo in campos_entrada:
+        valor = obtener_variable_entrada(variables_entrada, campo)
+        if valor is not None and str(valor).strip() != "":
+            lineas.append(f"{campo}: {valor}")
+
+    for campo in campos_salida:
+        valor = variables_salida.get(normalizar_clave(campo))
+        if valor is not None and str(valor).strip() != "":
+            lineas.append(f"{campo}: {valor}")
+
+    if not lineas:
+        return None
+
+    return "\n".join(lineas)[:4000]
 
 
 def construir_campos_resultado_llamada_ia(
     variables_entrada: Dict[str, Any],
     variables_salida: Dict[str, Any],
     id_contacto: int,
+    enlace_pago: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Construye los fields para crm.item.add en la etapa RESULTADO LLAMADA IA.
@@ -6150,21 +7521,48 @@ def construir_campos_resultado_llamada_ia(
     valor_confirmado = convertir_a_entero_o_none(
         variables_salida.get("valor_confirmado")
         or variables_salida.get("valorconfirmado")
+        or variables_salida.get("valor_a_pagar")
+        or variables_salida.get("monto_acordado")
+        or variables_salida.get("monto_pactado")
         or obtener_variable_entrada(variables_entrada, "VALOR_CONFIRMADO")
     )
 
-    resumen_llamada = limpiar_texto(variables_salida.get("resumenllamada"))
+    resumen_llamada = limpiar_texto(
+        variables_salida.get("resumenllamada")
+        or variables_salida.get("resumen_llamada")
+        or variables_salida.get("resumen_gestion")
+    )
     detalle_acuerdo = limpiar_texto(variables_salida.get("detalle_acuerdo"))
     gestion_final = limpiar_texto(variables_salida.get("gestion_final"))
-    motivo_principal = limpiar_texto(variables_salida.get("motivo_principal"))
-    interes_pagar = limpiar_texto(variables_salida.get("interes_pagar"))
+    motivo_principal = limpiar_texto(
+        variables_salida.get("motivo_principal")
+        or variables_salida.get("tipo_gestion")
+        or variables_salida.get("altura_mora")
+    )
+    interes_pagar = limpiar_texto(
+        variables_salida.get("interes_pagar")
+        or variables_salida.get("intencion_pago")
+        or variables_salida.get("interes_refinanciar")
+    )
     pago_hoy = limpiar_texto(variables_salida.get("pago_hoy"))
-    fecha_acuerdo_pago = limpiar_texto(variables_salida.get("fechacuerdopago"))
+    fecha_acuerdo_pago = limpiar_texto(
+        variables_salida.get("fechacuerdopago")
+        or variables_salida.get("fecha_compromiso_pago")
+        or variables_salida.get("fecha_limite_pago")
+        or variables_salida.get("fecha_acuerdo_pago")
+    )
 
     id_libranza = limpiar_texto(obtener_variable_entrada(variables_entrada, "ID_LIBRANZA"))
     telefono_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "TELEFONO"))
     cedula_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "CEDULA"))
-    nombre_cliente = limpiar_texto(obtener_variable_entrada(variables_entrada, "NOMBRE")) or "Cliente"
+    nombre_cliente = limpiar_texto(
+        obtener_variable_entrada(variables_entrada, "NOMBRE")
+        or obtener_variable_entrada(variables_entrada, "NOMBRE_ESTUDIANTE")
+    ) or "Cliente"
+    comentarios_trazabilidad = construir_comentarios_trazabilidad_gestion(
+        variables_entrada=variables_entrada,
+        variables_salida=variables_salida,
+    )
 
     titulo = f"Resultado llamada IA - {nombre_cliente}"
 
@@ -6175,6 +7573,7 @@ def construir_campos_resultado_llamada_ia(
         "title": titulo,
         "categoryId": BITRIX_DEAL_CATEGORY_ID,
         "stageId": BITRIX_DEAL_STAGE_ID,
+        "comments": comentarios_trazabilidad,
 
         # Relación con el contacto encontrado.
         "contactId": id_contacto,
@@ -6198,6 +7597,7 @@ def construir_campos_resultado_llamada_ia(
         "UF_CRM_1778865126453": id_libranza,
         "UF_CRM_1778865231524": telefono_cliente,
         "UF_CRM_1778865296676": cedula_cliente,
+        "UF_CRM_1779835103174": limpiar_texto(enlace_pago),
     }
 
     if BITRIX_ASSIGNED_BY_ID:
@@ -6233,6 +7633,7 @@ async def crear_deal_resultado_llamada_ia(
     variables_entrada: Dict[str, Any],
     variables_salida: Dict[str, Any],
     contacto: Dict[str, Any],
+    enlace_pago: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Crea una tarjeta/deal en HOR CARTERA / RESULTADO LLAMADA IA.
@@ -6254,6 +7655,7 @@ async def crear_deal_resultado_llamada_ia(
         variables_entrada=variables_entrada,
         variables_salida=variables_salida,
         id_contacto=id_contacto,
+        enlace_pago=enlace_pago,
     )
 
     cuerpo = {
@@ -6275,6 +7677,574 @@ async def crear_deal_resultado_llamada_ia(
     )
 
     return datos.get("result")
+
+
+def extraer_item_bitrix_get(respuesta_bitrix: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Extrae item desde respuestas de crm.item.get.
+    """
+    resultado = respuesta_bitrix.get("result") or {}
+
+    if isinstance(resultado, dict) and isinstance(resultado.get("item"), dict):
+        return resultado["item"]
+
+    if isinstance(resultado, dict) and resultado.get("id"):
+        return resultado
+
+    return None
+
+
+async def obtener_deal_bitrix_por_id(id_deal: int) -> Dict[str, Any]:
+    """
+    Consulta un deal Bitrix por ID usando crm.item.get.
+    """
+    cuerpo = {
+        "entityTypeId": DEAL_ENTITY_TYPE_ID,
+        "id": id_deal,
+        "useOriginalUfNames": "Y",
+    }
+
+    datos = await llamar_bitrix("crm.item.get", cuerpo)
+    item = extraer_item_bitrix_get(datos)
+
+    if not item:
+        raise ErrorBitrixAPI(
+            mensaje="Bitrix no retornó el deal solicitado.",
+            metodo="crm.item.get",
+            respuesta=datos,
+        )
+
+    return item
+
+
+async def obtener_contacto_bitrix_por_id(id_contacto: int) -> Dict[str, Any]:
+    """
+    Consulta un contacto Bitrix por ID usando crm.item.get.
+    """
+    cuerpo = {
+        "entityTypeId": CONTACT_ENTITY_TYPE_ID,
+        "id": id_contacto,
+        "select": construir_select_busqueda_contacto(),
+    }
+
+    datos = await llamar_bitrix("crm.item.get", cuerpo)
+    item = extraer_item_bitrix_get(datos)
+
+    if not contacto_bitrix_valido(item):
+        raise ErrorBitrixAPI(
+            mensaje="Bitrix no retornó un contacto válido para el deal.",
+            metodo="crm.item.get",
+            respuesta=datos,
+        )
+
+    return item
+
+
+async def actualizar_link_pago_en_deal_bitrix(id_deal: int, enlace_pago: str) -> Dict[str, Any]:
+    """
+    Actualiza el campo personalizado Link de pago en el deal Bitrix.
+    """
+    cuerpo = {
+        "entityTypeId": DEAL_ENTITY_TYPE_ID,
+        "id": id_deal,
+        "fields": {
+            "UF_CRM_1779835103174": enlace_pago,
+        },
+        "useOriginalUfNames": "Y",
+    }
+
+    datos = await llamar_bitrix("crm.item.update", cuerpo)
+    return datos.get("result") or datos
+
+
+async def actualizar_y_verificar_link_pago_en_deal_bitrix(
+    id_deal: int,
+    enlace_pago: str,
+    max_intentos: int = 3,
+) -> Dict[str, Any]:
+    intentos = max(1, min(int(max_intentos or 3), 3))
+    errores = []
+    ultimo_update = None
+    ultimo_deal = None
+    ultimo_link = None
+
+    for intento in range(1, intentos + 1):
+        try:
+            logger.info(
+                "Verificando link de pago en deal Bitrix | intento=%s/%s | id_deal=%s | esperado=%s",
+                intento,
+                intentos,
+                id_deal,
+                enlace_pago,
+            )
+            ultimo_deal = await obtener_deal_bitrix_por_id(id_deal)
+            ultimo_link = extraer_link_pago_de_deal(ultimo_deal)
+
+            if ultimo_link == enlace_pago:
+                logger.info(
+                    "Link de pago ya verificado en deal Bitrix | intento=%s/%s | id_deal=%s",
+                    intento,
+                    intentos,
+                    id_deal,
+                )
+                return {
+                    "actualizado": ultimo_update is not None,
+                    "verificado": True,
+                    "intentos": intento,
+                    "link_en_bitrix": ultimo_link,
+                    "update_result": ultimo_update,
+                    "deal_actualizado": ultimo_deal,
+                    "errores": errores,
+                }
+
+            logger.info(
+                "Actualizando link de pago en deal Bitrix | intento=%s/%s | id_deal=%s | actual=%s | esperado=%s",
+                intento,
+                intentos,
+                id_deal,
+                ultimo_link,
+                enlace_pago,
+            )
+            ultimo_update = await actualizar_link_pago_en_deal_bitrix(
+                id_deal=id_deal,
+                enlace_pago=enlace_pago,
+            )
+            ultimo_deal = await obtener_deal_bitrix_por_id(id_deal)
+            ultimo_link = extraer_link_pago_de_deal(ultimo_deal)
+
+            if ultimo_link == enlace_pago:
+                logger.info(
+                    "Link de pago actualizado y verificado en deal Bitrix | intento=%s/%s | id_deal=%s",
+                    intento,
+                    intentos,
+                    id_deal,
+                )
+                return {
+                    "actualizado": True,
+                    "verificado": True,
+                    "intentos": intento,
+                    "link_en_bitrix": ultimo_link,
+                    "update_result": ultimo_update,
+                    "deal_actualizado": ultimo_deal,
+                    "errores": errores,
+                }
+
+        except Exception as exc:
+            error_serializable = convertir_a_json_seguro(
+                {
+                    "intento": intento,
+                    "tipo": type(exc).__name__,
+                    "mensaje": str(exc),
+                }
+            )
+            errores.append(error_serializable)
+            logger.error(
+                "Fallo verificando/actualizando link en deal Bitrix | intento=%s/%s | id_deal=%s | error=%s",
+                intento,
+                intentos,
+                id_deal,
+                str(exc),
+            )
+
+    logger.error(
+        "No se verifico link de pago en deal Bitrix despues de %s intentos | id_deal=%s | esperado=%s | ultimo=%s",
+        intentos,
+        id_deal,
+        enlace_pago,
+        ultimo_link,
+    )
+    return {
+        "actualizado": ultimo_update is not None,
+        "verificado": False,
+        "intentos": intentos,
+        "link_en_bitrix": ultimo_link,
+        "update_result": ultimo_update,
+        "deal_actualizado": ultimo_deal,
+        "errores": errores,
+    }
+
+
+async def actualizar_correo_contacto_bitrix_si_falta(
+    contacto: Dict[str, Any],
+    correo: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Completa el email del contacto en Bitrix cuando el contacto no lo tiene
+    y el webhook recibio un correo valido.
+    """
+    correo_normalizado = normalizar_correo_o_none(correo)
+    if not correo_normalizado:
+        return None
+
+    correo_actual = normalizar_correo_o_none(extraer_valor_contacto(contacto, "email"))
+    if correo_actual:
+        return None
+
+    id_contacto = contacto.get("id") or contacto.get("ID")
+    try:
+        id_contacto = int(id_contacto)
+    except (TypeError, ValueError):
+        return None
+
+    cuerpo = {
+        "entityTypeId": CONTACT_ENTITY_TYPE_ID,
+        "id": id_contacto,
+        "fields": {
+            "email": correo_normalizado,
+        },
+    }
+
+    datos = await llamar_bitrix("crm.item.update", cuerpo)
+    contacto["email"] = correo_normalizado
+    return datos.get("result") or datos
+
+
+def extraer_link_pago_de_deal(deal: Dict[str, Any]) -> Optional[str]:
+    return limpiar_texto(deal.get("UF_CRM_1779835103174"))
+
+
+def extraer_id_contacto_de_deal(deal: Dict[str, Any]) -> Optional[int]:
+    id_contacto = deal.get("contactId") or deal.get("CONTACT_ID")
+
+    if id_contacto is None and isinstance(deal.get("contactIds"), list) and deal["contactIds"]:
+        id_contacto = deal["contactIds"][0]
+
+    try:
+        return int(id_contacto)
+    except (TypeError, ValueError):
+        return None
+
+
+def construir_datos_pago_desde_deal_confirmado(
+    deal: Dict[str, Any],
+    contacto: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """
+    Reconstruye input_variables/output_vars desde los campos guardados en el deal.
+    """
+    correo_contacto = extraer_valor_contacto(contacto, "email")
+    telefono_contacto = extraer_valor_contacto(contacto, "phone")
+
+    input_variables = {
+        "CEDULA": limpiar_texto(deal.get("UF_CRM_1778865296676")),
+        "CORREO": limpiar_texto(correo_contacto),
+        "NOMBRE": limpiar_texto(deal.get("title")),
+        "TELEFONO": limpiar_texto(telefono_contacto or deal.get("UF_CRM_1778865231524")),
+        "PAGADURIA": limpiar_texto(deal.get("UF_CRM_1773780818920")),
+        "MORA_TOTAL": deal.get("UF_CRM_1773841728850"),
+        "MORA": deal.get("UF_CRM_1773841728850"),
+        "CUOTA": deal.get("UF_CRM_1773781100010"),
+        "ID_LIBRANZA": limpiar_texto(deal.get("UF_CRM_1778865126453")),
+        "VALOR_CONFIRMADO": deal.get("UF_CRM_1773841764862"),
+    }
+
+    output_vars = {
+        "valor_confirmado": deal.get("UF_CRM_1773841764862"),
+        "fechacuerdopago": limpiar_texto(deal.get("UF_CRM_1778864914788")),
+        "gestion_final": limpiar_texto(deal.get("UF_CRM_1778864749613")),
+        "motivo_principal": limpiar_texto(deal.get("UF_CRM_1778864857436")),
+        "interes_pagar": limpiar_texto(deal.get("UF_CRM_1778864879029")),
+        "pago_hoy": limpiar_texto(deal.get("UF_CRM_1778864893956")),
+        "resumenllamada": limpiar_texto(deal.get("UF_CRM_1773841785299")),
+        "detalle_acuerdo": limpiar_texto(deal.get("UF_CRM_1773841804045")),
+    }
+
+    validation = {
+        "aprobado": True,
+        "intencion_pago": True,
+        "origen_validacion": "deal_confirmado_bitrix",
+        "id_deal_bitrix": deal.get("id"),
+        "stageId": deal.get("stageId"),
+    }
+
+    return input_variables, output_vars, validation
+
+
+def extraer_valor_contacto(contacto: Dict[str, Any], campo: str) -> Optional[str]:
+    """
+    Extrae email/phone aunque Bitrix lo retorne como string, lista o dict.
+    """
+    valor = contacto.get(campo)
+
+    if isinstance(valor, str):
+        return valor
+
+    if isinstance(valor, list) and valor:
+        primero = valor[0]
+        if isinstance(primero, dict):
+            return primero.get("value") or primero.get("VALUE")
+        return str(primero)
+
+    if isinstance(valor, dict):
+        return valor.get("value") or valor.get("VALUE")
+
+    return None
+
+
+@app.api_route("/enviar-id-confirmado", methods=["GET", "POST"])
+async def crear_orden_pago_desde_deal_confirmado(
+    request: Request,
+    ID_DEAL: Optional[int] = Query(None),
+    id_deal: Optional[int] = Query(None),
+    deal_id: Optional[int] = Query(None),
+    ID: Optional[int] = Query(None),
+):
+    """
+    Webhook GET para automatizaciones Bitrix que envían el ID del deal confirmado.
+    """
+    method_name = "crear_orden_pago_desde_deal_confirmado"
+    id_deal_final = ID_DEAL or id_deal or deal_id or ID
+    raw_body = await request.body()
+    body_text = raw_body.decode("utf-8", errors="replace")
+
+    logger.info(
+        "Endpoint iniciado | %s /enviar-id-confirmado | url=%s | query=%s | client=%s | body_bytes=%s | body=%s",
+        request.method,
+        str(request.url),
+        dict(request.query_params),
+        request.client.host if request.client else None,
+        len(raw_body),
+        body_text,
+    )
+    logger.info("Parametro deal resuelto en /enviar-id-confirmado | id_deal=%s", id_deal_final)
+
+    if not id_deal_final or id_deal_final <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "mensaje": "Debe enviar un ID_DEAL numérico mayor a cero.",
+                "parametros_aceptados": ["ID_DEAL", "id_deal", "deal_id", "ID"],
+            },
+        )
+
+    try:
+        deal = await obtener_deal_bitrix_por_id(id_deal_final)
+        logger.info(
+            "Deal consultado en /enviar-id-confirmado | id_deal=%s | link_actual=%s | deal=%s",
+            id_deal_final,
+            extraer_link_pago_de_deal(deal),
+            json.dumps(deal, ensure_ascii=False, default=str),
+        )
+        enlace_existente = extraer_link_pago_de_deal(deal)
+        if enlace_existente:
+            respuesta = {
+                "ok": True,
+                "action": "payment_link_already_registered_in_deal",
+                "id_deal": id_deal_final,
+                "payment_order_created": False,
+                "payment_link": enlace_existente,
+                "bitrix_link_updated": False,
+                "deal": {"item": deal},
+            }
+            logger.info(
+                "Respuesta /enviar-id-confirmado con link existente | %s",
+                json.dumps(respuesta, ensure_ascii=False, default=str),
+            )
+            return respuesta
+
+        id_contacto = extraer_id_contacto_de_deal(deal)
+
+        if id_contacto is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "mensaje": "El deal no tiene contactId/contactIds válido para crear orden de pago.",
+                    "id_deal": id_deal_final,
+                },
+            )
+
+        contacto = await obtener_contacto_bitrix_por_id(id_contacto)
+        logger.info(
+            "Contacto consultado en /enviar-id-confirmado | id_contacto=%s | contacto=%s",
+            id_contacto,
+            json.dumps(contacto, ensure_ascii=False, default=str),
+        )
+        input_variables, output_vars, validation = construir_datos_pago_desde_deal_confirmado(
+            deal=deal,
+            contacto=contacto,
+        )
+        logger.info(
+            "Datos reconstruidos desde deal confirmado | input_variables=%s | output_vars=%s | validation=%s",
+            json.dumps(input_variables, ensure_ascii=False, default=str),
+            json.dumps(output_vars, ensure_ascii=False, default=str),
+            json.dumps(validation, ensure_ascii=False, default=str),
+        )
+        deal_result = {"item": deal}
+
+        solicitud_pago = construir_solicitud_pago_desde_bitrix(
+            input_variables=input_variables,
+            output_vars=output_vars,
+            validation=validation,
+            contact=contacto,
+            deal_result=deal_result,
+        )
+
+        contexto_pago = construir_contexto_auditoria_http(
+            request=request,
+            operacion="crear_orden_desde_deal_confirmado_bitrix",
+            payload_recibido=modelo_a_diccionario(solicitud_pago),
+        )
+
+        payment_order = await ServicioOrdenesPago().crear_orden_pago(
+            solicitud=solicitud_pago,
+            contexto_auditoria=contexto_pago,
+        )
+        logger.info(
+            "Orden Payvalida obtenida desde /enviar-id-confirmado | %s",
+            json.dumps(payment_order, ensure_ascii=False, default=str),
+        )
+
+        enlace_pago = payment_order.get("enlace_pago")
+        bitrix_link_update = None
+
+        if enlace_pago:
+            bitrix_link_update = await actualizar_y_verificar_link_pago_en_deal_bitrix(
+                id_deal=id_deal_final,
+                enlace_pago=enlace_pago,
+                max_intentos=3,
+            )
+            if isinstance(bitrix_link_update.get("deal_actualizado"), dict):
+                deal_result = {"item": bitrix_link_update["deal_actualizado"]}
+            if not bitrix_link_update.get("verificado"):
+                raise ErrorBitrixAPI(
+                    mensaje="No se pudo verificar el link de pago en el campo Bitrix del deal.",
+                    metodo="crm.item.update",
+                    respuesta=bitrix_link_update,
+                )
+
+        respuesta = {
+            "ok": True,
+            "action": "payment_order_created_from_confirmed_deal",
+            "id_deal": id_deal_final,
+            "client_found": True,
+            "client": contacto,
+            "deal": deal_result,
+            "payment_order_created": True,
+            "payment_order": payment_order,
+            "payment_link": enlace_pago,
+            "bitrix_link_updated": bitrix_link_update is not None,
+            "bitrix_link_verified": bool(bitrix_link_update and bitrix_link_update.get("verificado")),
+            "bitrix_link_update": bitrix_link_update,
+            #"agent_context": contexto_agente,
+        }
+        logger.info(
+            "Respuesta /enviar-id-confirmado | %s",
+            json.dumps(respuesta, ensure_ascii=False, default=str),
+        )
+        return respuesta
+
+    except ErrorBitrixAPI as exc:
+        logger.error("Error Bitrix en /enviar-id-confirmado | %s", exc.mensaje)
+        await error_notify(method_name, str(id_deal_final), exc.mensaje)
+        raise HTTPException(
+            status_code=502,
+            detail=construir_error_webhook_debug(
+                action="failed_enviar_id_confirmado",
+                tipo_error="error_bitrix",
+                mensaje=exc.mensaje,
+                status_code=502,
+                contact=locals().get("contacto"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "id_deal": id_deal_final,
+                    "mensaje": exc.mensaje,
+                    "metodo_bitrix": exc.metodo,
+                    "codigo_estado_bitrix": exc.codigo_estado,
+                    "respuesta_bitrix": exc.respuesta,
+                },
+            ),
+        )
+
+    except ErrorValidacionPayvalida as exc:
+        logger.error("Validación Payvalida falló en /enviar-id-confirmado | %s", exc.mensaje)
+        error_payvalida = exc.a_respuesta()
+        raise HTTPException(
+            status_code=422,
+            detail=construir_error_webhook_debug(
+                action="failed_enviar_id_confirmado",
+                tipo_error="validacion_payvalida",
+                mensaje=exc.mensaje,
+                status_code=422,
+                contact=locals().get("contacto"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    **error_payvalida,
+                    "id_deal": id_deal_final,
+                },
+            ),
+        )
+
+    except ErrorProveedorPago as exc:
+        logger.error("Proveedor Payvalida falló en /enviar-id-confirmado | %s", str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=construir_error_webhook_debug(
+                action="failed_enviar_id_confirmado",
+                tipo_error="error_proveedor_payvalida",
+                mensaje=str(exc),
+                status_code=502,
+                contact=locals().get("contacto"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "id_deal": id_deal_final,
+                    "mensaje": str(exc),
+                },
+            ),
+        )
+
+    except HTTPException:
+        raise
+
+    except ValueError as exc:
+        logger.error("Mapeo Bitrix a Payvalida falló en /enviar-id-confirmado | %s", str(exc))
+        raise HTTPException(
+            status_code=422,
+            detail=construir_error_webhook_debug(
+                action="failed_enviar_id_confirmado",
+                tipo_error="payload_gestion_incompleto",
+                mensaje=str(exc),
+                status_code=422,
+                contact=locals().get("contacto"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "id_deal": id_deal_final,
+                    "mensaje": str(exc),
+                },
+            ),
+        )
+
+    except Exception as exc:
+        logger.error("Error interno en /enviar-id-confirmado | %s", str(exc))
+        logger.error(traceback.format_exc())
+        await error_notify(method_name, str(id_deal_final), str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=construir_error_webhook_debug(
+                action="failed_enviar_id_confirmado",
+                tipo_error="error_interno",
+                mensaje=str(exc),
+                status_code=500,
+                contact=locals().get("contacto"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "id_deal": id_deal_final,
+                    "mensaje": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ),
+        )
 
 
 @app.post("/bitrix/debug/search-client")
@@ -6322,14 +8292,36 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
             "client": contact,
         }
 
-    except BitrixAPIError as exc:
-        logger.error("Error Bitrix en /bitrix/debug/search-client | %s", exc.message)
+    except ErrorBitrixAPI as exc:
+        logger.error("Error Bitrix en /bitrix/debug/search-client | %s", exc.mensaje)
         await error_notify(
             method_name,
             str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
-            exc.message,
+            exc.mensaje,
         )
-        raise convertir_error_bitrix_a_http(exc)
+        raise HTTPException(
+            status_code=502,
+            detail=construir_error_webhook_debug(
+                tipo_error="error_bitrix",
+                mensaje=exc.mensaje,
+                status_code=502,
+                input_variables=input_variables,
+                output_vars=output_vars,
+                contexto_agente=contexto_agente,
+                criteria=criteria,
+                validation=locals().get("validation"),
+                contact=locals().get("contact"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order_result"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "mensaje": exc.mensaje,
+                    "metodo_bitrix": exc.metodo,
+                    "codigo_estado_bitrix": exc.codigo_estado,
+                    "respuesta_bitrix": exc.respuesta,
+                },
+            ),
+        )
 
     except Exception as exc:
         logger.error("Error interno en /bitrix/debug/search-client | %s", str(exc))
@@ -6339,7 +8331,27 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
             str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             str(exc),
         )
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(exc)}")
+        raise HTTPException(
+            status_code=500,
+            detail=construir_error_webhook_debug(
+                tipo_error="error_interno",
+                mensaje=str(exc),
+                status_code=500,
+                input_variables=input_variables,
+                output_vars=output_vars,
+                contexto_agente=contexto_agente,
+                criteria=criteria,
+                validation=locals().get("validation"),
+                contact=locals().get("contact"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order_result"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "mensaje": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ),
+        )
 
 
 @app.post(
@@ -6371,17 +8383,74 @@ async def call_completed_bitrix(request: Request):
             json.dumps(incoming_json, ensure_ascii=False, indent=2, default=str),
         )
     except json.JSONDecodeError as exc:
-        logger.error("JSON entrante inválido | %s", exc)
-        raise HTTPException(status_code=400, detail=f"JSON inválido: {exc}")
+        logger.error("JSON entrante invalido | %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail=convertir_a_json_seguro(
+                {
+                    "ok": False,
+                    "action": "failed_call_completed",
+                    "tipo_error": "json_invalido",
+                    "mensaje": "El cuerpo recibido no es un JSON valido.",
+                    "http_status": 400,
+                    "error": {
+                        "mensaje": str(exc),
+                        "linea": exc.lineno,
+                        "columna": exc.colno,
+                        "posicion": exc.pos,
+                    },
+                    "debug": {
+                        "bytes_recibidos": len(raw_body),
+                        "body_preview": body_text[:1000],
+                    },
+                    "sugerencias": construir_sugerencias_error_webhook("json_invalido"),
+                }
+            ),
+        )
 
     try:
         payload = BitrixCallCompletedRequest.model_validate(incoming_json)
     except ValidationError as exc:
+        errores_validacion = convertir_a_json_seguro(exc.errors())
         logger.error(
             "Error validación BitrixCallCompletedRequest | %s",
-            json.dumps(exc.errors(), ensure_ascii=False, indent=2, default=str),
+            json.dumps(errores_validacion, ensure_ascii=False, indent=2, default=str),
         )
-        raise HTTPException(status_code=422, detail=exc.errors())
+        input_debug = (
+            incoming_json.get("input_variables")
+            if isinstance(incoming_json, dict) and isinstance(incoming_json.get("input_variables"), dict)
+            else {}
+        )
+        extracted_debug = (
+            incoming_json.get("extracted_variables")
+            if isinstance(incoming_json, dict)
+            else []
+        )
+        output_debug = construir_mapa_variables_salida(extracted_debug)
+        raise HTTPException(
+            status_code=422,
+            detail=convertir_a_json_seguro(
+                {
+                    "ok": False,
+                    "action": "failed_call_completed",
+                    "tipo_error": "validacion_payload",
+                    "mensaje": "El payload no cumple el contrato esperado del webhook.",
+                    "http_status": 422,
+                    "errores": errores_validacion,
+                    "debug": {
+                        "variables_entrada_clave": resumir_variables_debug(
+                            input_debug,
+                            VARIABLES_ENTRADA_DEBUG_WEBHOOK,
+                        ),
+                        "variables_salida_clave": resumir_variables_debug(
+                            output_debug,
+                            VARIABLES_SALIDA_DEBUG_WEBHOOK,
+                        ),
+                    },
+                    "sugerencias": construir_sugerencias_error_webhook("validacion_payload"),
+                }
+            ),
+        )
 
     input_variables = payload.input_variables.model_dump(exclude_none=True)
     extracted_variables = [
@@ -6389,6 +8458,7 @@ async def call_completed_bitrix(request: Request):
     ]
 
     output_vars = construir_mapa_variables_salida(extracted_variables)
+    contexto_agente = construir_contexto_agente_universal(input_variables, output_vars)
     criteria = construir_criterios_busqueda_bitrix(input_variables)
 
     try:
@@ -6402,10 +8472,19 @@ async def call_completed_bitrix(request: Request):
             json.dumps(output_vars, ensure_ascii=False, default=str),
         )
 
-        validation = evaluar_intencion_pago(output_vars)
+        validation = (
+            evaluar_intencion_pago(output_vars)
+            if contexto_agente.get("usa_payvalida")
+            else evaluar_gestion_universal(output_vars, contexto_agente)
+        )
 
         logger.info(
-            "Resultado validación intención de pago | %s",
+            "Contexto universal agente | %s",
+            json.dumps(contexto_agente, ensure_ascii=False, default=str),
+        )
+
+        logger.info(
+            "Resultado validacion gestion/agente | %s",
             json.dumps(validation, ensure_ascii=False, default=str),
         )
 
@@ -6425,6 +8504,9 @@ async def call_completed_bitrix(request: Request):
                 "client": None,
                 "deal_created": False,
                 "deal": None,
+                "payment_order_created": False,
+                "payment_order": None,
+                "agent_context": contexto_agente,
             }
 
         logger.info(
@@ -6439,6 +8521,22 @@ async def call_completed_bitrix(request: Request):
                 "CLIENTE ENCONTRADO EN BITRIX24 | %s",
                 json.dumps(contact, ensure_ascii=False, default=str),
             )
+            try:
+                correo_actualizado = await actualizar_correo_contacto_bitrix_si_falta(
+                    contacto=contact,
+                    correo=obtener_variable_entrada(input_variables, "CORREO"),
+                )
+                if correo_actualizado:
+                    logger.info(
+                        "Correo de contacto Bitrix actualizado desde input_variables | contacto_id=%s",
+                        contact.get("id") or contact.get("ID"),
+                    )
+            except ErrorBitrixAPI as exc:
+                logger.warning(
+                    "No se pudo actualizar correo del contacto Bitrix; se continua con fallback local | contacto_id=%s | error=%s",
+                    contact.get("id") or contact.get("ID"),
+                    exc.mensaje,
+                )
         else:
             logger.warning(
                 "CLIENTE NO ENCONTRADO EN BITRIX24 | criteria=%s",
@@ -6446,6 +8544,233 @@ async def call_completed_bitrix(request: Request):
             )
 
         deal_result = None
+        payment_order_result = None
+        bitrix_link_update = None
+
+        if CREATE_DEAL_ON_VALID_PAYMENT:
+            logger.info(
+                "CREATE_DEAL_ON_VALID_PAYMENT=true. Se procesara gestion universal | contexto=%s",
+                json.dumps(contexto_agente, ensure_ascii=False, default=str),
+            )
+
+            if not contacto_bitrix_valido(contact):
+                logger.error("No se crea orden/deal porque no hay contacto valido con id.")
+                raise HTTPException(
+                    status_code=404,
+                    detail=construir_error_webhook_debug(
+                        tipo_error="contacto_bitrix_no_encontrado",
+                        mensaje="No se encontro contacto valido en Bitrix para asociar el deal.",
+                        status_code=404,
+                        input_variables=input_variables,
+                        output_vars=output_vars,
+                        contexto_agente=contexto_agente,
+                        criteria=criteria,
+                        validation=validation,
+                        contact=contact,
+                        deal_result=deal_result,
+                        payment_order_result=payment_order_result,
+                        bitrix_link_update=bitrix_link_update,
+                    ),
+                )
+
+            try:
+                enlace_pago = None
+
+                if contexto_agente.get("usa_payvalida"):
+                    solicitud_pago = construir_solicitud_pago_desde_bitrix_sin_deal(
+                        input_variables=input_variables,
+                        output_vars=output_vars,
+                        validation=validation,
+                        contact=contact,
+                    )
+
+                    contexto_pago = construir_contexto_auditoria_http(
+                        request=request,
+                        operacion="crear_orden_desde_bitrix",
+                        payload_recibido=modelo_a_diccionario(solicitud_pago),
+                    )
+
+                    payment_order_result = await ServicioOrdenesPago().crear_orden_pago(
+                        solicitud=solicitud_pago,
+                        contexto_auditoria=contexto_pago,
+                    )
+
+                    logger.info(
+                        "Orden Payvalida creada/reutilizada antes de crear deal Bitrix | %s",
+                        json.dumps(payment_order_result, ensure_ascii=False, default=str),
+                    )
+
+                    enlace_pago = payment_order_result.get("enlace_pago")
+
+                elif contexto_agente.get("requiere_link_pago"):
+                    if contexto_agente.get("proveedor_pago") == "api_externa":
+                        payment_order_result = await procesar_preconsulta_pago_one2credit_desde_evento(
+                            variables_entrada=input_variables,
+                            variables_salida=output_vars,
+                        )
+                        mensaje_gestion = limpiar_texto(payment_order_result.get("mensaje_gestion"))
+                        if mensaje_gestion:
+                            output_vars.setdefault("resumenllamada", mensaje_gestion)
+                            output_vars.setdefault("detalle_acuerdo", mensaje_gestion)
+                        orden_pago_externa = payment_order_result.get("orden_pago")
+                        if isinstance(orden_pago_externa, dict):
+                            enlace_pago = limpiar_texto(orden_pago_externa.get("link_pago"))
+                            valor_orden_pago = orden_pago_externa.get("valor_orden_pago") or orden_pago_externa.get("monto_final_orden_pago") or orden_pago_externa.get("valor_parcial_procesado")
+                            if valor_orden_pago is not None:
+                                output_vars.setdefault("valor_confirmado", valor_orden_pago)
+                    else:
+                        payment_order_result = {
+                            "proveedor": contexto_agente.get("proveedor_pago"),
+                            "estado": "PENDIENTE_INTEGRACION",
+                            "idempotente": False,
+                            "mensaje": (
+                                "El evento requiere link de pago, pero el proveedor configurado "
+                                "no es Payvalida. Queda preparado para conectar el adaptador externo."
+                            ),
+                        }
+                    logger.info(
+                        "Gestion requiere link con proveedor externo | %s",
+                        json.dumps(payment_order_result, ensure_ascii=False, default=str),
+                    )
+
+                deal_result = await crear_deal_resultado_llamada_ia(
+                    variables_entrada=input_variables,
+                    variables_salida=output_vars,
+                    contacto=contact,
+                    enlace_pago=enlace_pago,
+                )
+
+                logger.info(
+                    "Deal creado desde webhook con link de pago | %s",
+                    json.dumps(deal_result, ensure_ascii=False, default=str),
+                )
+
+                item_deal_creado = deal_result.get("item") if isinstance(deal_result, dict) else None
+                id_deal_creado = item_deal_creado.get("id") if isinstance(item_deal_creado, dict) else None
+                if enlace_pago and id_deal_creado:
+                    bitrix_link_update = await actualizar_y_verificar_link_pago_en_deal_bitrix(
+                        id_deal=int(id_deal_creado),
+                        enlace_pago=enlace_pago,
+                        max_intentos=3,
+                    )
+
+                    if isinstance(bitrix_link_update.get("deal_actualizado"), dict):
+                        deal_result = {"item": bitrix_link_update["deal_actualizado"]}
+
+                    if enlace_pago and not bitrix_link_update.get("verificado"):
+                        raise ErrorBitrixAPI(
+                            mensaje="No se pudo verificar el link de pago en el campo Bitrix del deal.",
+                            metodo="crm.item.update",
+                            respuesta=bitrix_link_update,
+                        )
+
+                    logger.info(
+                        "Deal Bitrix verificado con link de pago | id_deal=%s | link=%s | verificado=%s",
+                        id_deal_creado,
+                        bitrix_link_update.get("link_en_bitrix"),
+                        bitrix_link_update.get("verificado"),
+                    )
+                elif id_deal_creado:
+                    logger.info(
+                        "Deal Bitrix creado sin verificacion de link porque no se genero enlace | id_deal=%s",
+                        id_deal_creado,
+                    )
+
+            except ErrorValidacionPayvalida as exc:
+                logger.error("Validacion Payvalida fallo antes de crear deal | %s", exc.mensaje)
+                error_payvalida = exc.a_respuesta()
+                raise HTTPException(
+                    status_code=422,
+                    detail=construir_error_webhook_debug(
+                        tipo_error="validacion_payvalida",
+                        mensaje=exc.mensaje,
+                        status_code=422,
+                        input_variables=input_variables,
+                        output_vars=output_vars,
+                        contexto_agente=contexto_agente,
+                        criteria=criteria,
+                        validation=validation,
+                        contact=contact,
+                        deal_result=deal_result,
+                        payment_order_result=payment_order_result,
+                        bitrix_link_update=bitrix_link_update,
+                        error=error_payvalida,
+                    ),
+                )
+            except ErrorProveedorPago as exc:
+                logger.error("Proveedor Payvalida fallo antes de crear deal | %s", str(exc))
+                raise HTTPException(
+                    status_code=502,
+                    detail=construir_error_webhook_debug(
+                        tipo_error="error_proveedor_payvalida",
+                        mensaje=str(exc),
+                        status_code=502,
+                        input_variables=input_variables,
+                        output_vars=output_vars,
+                        contexto_agente=contexto_agente,
+                        criteria=criteria,
+                        validation=validation,
+                        contact=contact,
+                        deal_result=deal_result,
+                        payment_order_result=payment_order_result,
+                        bitrix_link_update=bitrix_link_update,
+                        error={"mensaje": str(exc)},
+                    ),
+                )
+            except ValueError as exc:
+                logger.error("Mapeo/validacion de gestion fallo antes de crear deal | %s", str(exc))
+                raise HTTPException(
+                    status_code=422,
+                    detail=construir_error_webhook_debug(
+                        tipo_error="payload_gestion_incompleto",
+                        mensaje=str(exc),
+                        status_code=422,
+                        input_variables=input_variables,
+                        output_vars=output_vars,
+                        contexto_agente=contexto_agente,
+                        criteria=criteria,
+                        validation=validation,
+                        contact=contact,
+                        deal_result=deal_result,
+                        payment_order_result=payment_order_result,
+                        bitrix_link_update=bitrix_link_update,
+                        error={"mensaje": str(exc)},
+                    ),
+                )
+        else:
+            logger.info("CREATE_DEAL_ON_VALID_PAYMENT=false. No se crea deal.")
+
+        return {
+            "ok": True,
+            "action": "processed_call_completed",
+            "validation": validation,
+            "lookup_criteria": criteria.__dict__,
+            "ignored_fields": {
+                "WHATSAPP_DISPONIBLE": "No se uso para buscar cliente porque pertenece a otra entidad/canal."
+            },
+            "client_found": contact is not None,
+            "client": contact,
+            "deal_created": deal_result is not None,
+            "deal": deal_result,
+            "payment_order_created": bool(
+                payment_order_result
+                and (
+                    payment_order_result.get("id_orden_pago")
+                    or payment_order_result.get("codigo_orden_interno")
+                    or payment_order_result.get("enlace_pago")
+                    or payment_order_result.get("link_pago")
+                    or (
+                        isinstance(payment_order_result.get("orden_pago"), dict)
+                        and payment_order_result["orden_pago"].get("link_pago")
+                    )
+                )
+            ),
+            "payment_order": payment_order_result,
+            "bitrix_link_updated": bitrix_link_update is not None,
+            "bitrix_link_verified": bool(bitrix_link_update and bitrix_link_update.get("verificado")),
+            "bitrix_link_update": bitrix_link_update,
+            "agent_context": contexto_agente,
+        }
 
         if CREATE_DEAL_ON_VALID_PAYMENT:
             logger.info("CREATE_DEAL_ON_VALID_PAYMENT=true. Se intentará crear deal.")
@@ -6470,6 +8795,84 @@ async def call_completed_bitrix(request: Request):
                 "Deal creado desde webhook | %s",
                 json.dumps(deal_result, ensure_ascii=False, default=str),
             )
+
+            try:
+                solicitud_pago = construir_solicitud_pago_desde_bitrix(
+                    input_variables=input_variables,
+                    output_vars=output_vars,
+                    validation=validation,
+                    contact=contact,
+                    deal_result=deal_result,
+                )
+
+                contexto_pago = construir_contexto_auditoria_http(
+                    request=request,
+                    operacion="crear_orden_desde_bitrix",
+                    payload_recibido=modelo_a_diccionario(solicitud_pago),
+                )
+
+                payment_order_result = await ServicioOrdenesPago().crear_orden_pago(
+                    solicitud=solicitud_pago,
+                    contexto_auditoria=contexto_pago,
+                )
+
+                logger.info(
+                    "Orden Payvalida creada desde webhook Bitrix | %s",
+                    json.dumps(payment_order_result, ensure_ascii=False, default=str),
+                )
+
+                enlace_pago = payment_order_result.get("enlace_pago")
+                item_deal_creado = (
+                    deal_result.get("item")
+                    if isinstance(deal_result, dict) and isinstance(deal_result.get("item"), dict)
+                    else deal_result
+                )
+                id_deal_creado = item_deal_creado.get("id") if isinstance(item_deal_creado, dict) else None
+                if enlace_pago and id_deal_creado:
+                    bitrix_link_update = await actualizar_link_pago_en_deal_bitrix(
+                        id_deal=id_deal_creado,
+                        enlace_pago=enlace_pago,
+                    )
+
+            except ErrorValidacionPayvalida as exc:
+                logger.error("Validación Payvalida falló después de crear deal | %s", exc.mensaje)
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "ok": False,
+                        "deal_created": True,
+                        "deal": deal_result,
+                        "payment_order_created": False,
+                        "tipo_error": "validacion_payvalida",
+                        "error": exc.a_respuesta(),
+                    },
+                )
+            except ErrorProveedorPago as exc:
+                logger.error("Proveedor Payvalida falló después de crear deal | %s", str(exc))
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "ok": False,
+                        "deal_created": True,
+                        "deal": deal_result,
+                        "payment_order_created": False,
+                        "tipo_error": "error_proveedor_payvalida",
+                        "mensaje": str(exc),
+                    },
+                )
+            except ValueError as exc:
+                logger.error("Mapeo Bitrix a Payvalida falló después de crear deal | %s", str(exc))
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "ok": False,
+                        "deal_created": True,
+                        "deal": deal_result,
+                        "payment_order_created": False,
+                        "tipo_error": "payload_payvalida_incompleto",
+                        "mensaje": str(exc),
+                    },
+                )
         else:
             logger.info("CREATE_DEAL_ON_VALID_PAYMENT=false. No se crea deal.")
 
@@ -6485,18 +8888,44 @@ async def call_completed_bitrix(request: Request):
             "client": contact,
             "deal_created": deal_result is not None,
             "deal": deal_result,
+            "payment_order_created": payment_order_result is not None,
+            "payment_order": payment_order_result,
+            "bitrix_link_updated": bitrix_link_update is not None,
+            "bitrix_link_update": bitrix_link_update,
         }
 
-    except BitrixAPIError as exc:
+    except ErrorBitrixAPI as exc:
         logger.error(
-            "Error Bitrix en /webhooks/call-completed-bitrix | %s", exc.message
+            "Error Bitrix en /webhooks/call-completed-bitrix | %s", exc.mensaje
         )
         await error_notify(
             method_name,
             str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
-            exc.message,
+            exc.mensaje,
         )
-        raise convertir_error_bitrix_a_http(exc)
+        raise HTTPException(
+            status_code=502,
+            detail=construir_error_webhook_debug(
+                tipo_error="error_bitrix",
+                mensaje=exc.mensaje,
+                status_code=502,
+                input_variables=input_variables,
+                output_vars=output_vars,
+                contexto_agente=contexto_agente,
+                criteria=criteria,
+                validation=locals().get("validation"),
+                contact=locals().get("contact"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order_result"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "mensaje": exc.mensaje,
+                    "metodo_bitrix": exc.metodo,
+                    "codigo_estado_bitrix": exc.codigo_estado,
+                    "respuesta_bitrix": exc.respuesta,
+                },
+            ),
+        )
 
     except HTTPException:
         raise
@@ -6509,7 +8938,27 @@ async def call_completed_bitrix(request: Request):
             str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
             str(exc),
         )
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(exc)}")
+        raise HTTPException(
+            status_code=500,
+            detail=construir_error_webhook_debug(
+                tipo_error="error_interno",
+                mensaje=str(exc),
+                status_code=500,
+                input_variables=input_variables,
+                output_vars=output_vars,
+                contexto_agente=contexto_agente,
+                criteria=criteria,
+                validation=locals().get("validation"),
+                contact=locals().get("contact"),
+                deal_result=locals().get("deal_result"),
+                payment_order_result=locals().get("payment_order_result"),
+                bitrix_link_update=locals().get("bitrix_link_update"),
+                error={
+                    "mensaje": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ),
+        )
     
     
 

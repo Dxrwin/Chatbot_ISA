@@ -1,6 +1,43 @@
-from decimal import Decimal
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def normalizar_monto_decimal(valor: Any) -> Any:
+    if isinstance(valor, Decimal):
+        return valor
+
+    if valor is None:
+        return valor
+
+    texto = str(valor).strip()
+    if not texto:
+        return valor
+
+    texto = re.sub(r"[^\d,.\-]", "", texto)
+    if not texto:
+        return valor
+
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        partes = texto.split(",")
+        texto = texto.replace(",", ".") if len(partes[-1]) <= 2 else texto.replace(",", "")
+    elif "." in texto:
+        partes = texto.split(".")
+        if len(partes) > 2:
+            texto = "".join(partes[:-1]) + "." + partes[-1] if len(partes[-1]) <= 2 else "".join(partes)
+        elif len(partes[-1]) > 2:
+            texto = texto.replace(".", "")
+
+    try:
+        return Decimal(texto)
+    except (InvalidOperation, ValueError):
+        return valor
 
 
 class DatosClientePago(BaseModel):
@@ -17,6 +54,18 @@ class DatosClientePago(BaseModel):
     nombre: Optional[str] = None
     telefono: Optional[str] = None
 
+    @field_validator("correo", mode="before")
+    @classmethod
+    def normalizar_correo(cls, valor: Any) -> Optional[str]:
+        if valor is None:
+            return None
+
+        correo = str(valor).strip().lower()
+        if not correo:
+            return None
+
+        return correo
+
 
 class DatosPago(BaseModel):
     """
@@ -31,6 +80,11 @@ class DatosPago(BaseModel):
     iva: Optional[str] = "0"
     metodo_pago: Optional[str] = ""
     recurrente: bool = False
+
+    @field_validator("monto", mode="before")
+    @classmethod
+    def normalizar_monto(cls, valor: Any) -> Any:
+        return normalizar_monto_decimal(valor)
 
 
 class SolicitudCrearOrdenPago(BaseModel):
@@ -62,3 +116,11 @@ class RespuestaOrdenPago(BaseModel):
     id_orden_proveedor: Optional[str] = None
     referencia_proveedor: Optional[str] = None
     idempotente: bool = False
+
+
+class SolicitudActualizarExpiracionOrdenPago(BaseModel):
+    """
+    Payload para actualizar la fecha de expiración de una orden pendiente.
+    """
+
+    fecha_expiracion: str

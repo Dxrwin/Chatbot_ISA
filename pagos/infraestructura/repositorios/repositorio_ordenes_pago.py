@@ -117,6 +117,55 @@ class RepositorioOrdenesPago:
                 await cursor.execute(consulta, (sistema_origen, referencia_externa))
                 return await cursor.fetchone()
 
+    async def obtener_link_activo_por_deal_bitrix(
+        self,
+        sistema_origen: str,
+        id_deal_bitrix: int,
+    ) -> Optional[Dict[str, Any]]:
+        consulta = """
+            SELECT *
+            FROM ordenes_pago
+            WHERE sistema_origen = %s
+              AND estado = 'PENDIENTE'
+              AND enlace_pago IS NOT NULL
+              AND id_orden_proveedor IS NOT NULL
+              AND referencia_proveedor IS NOT NULL
+              AND fecha_expiracion >= CURDATE()
+              AND JSON_UNQUOTE(JSON_EXTRACT(metadatos, '$.id_deal_bitrix')) = %s
+            ORDER BY creado_en ASC
+            LIMIT 1
+        """
+
+        pool = await obtener_pool_mysql()
+        async with pool.acquire() as conexion:
+            async with conexion.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(consulta, (sistema_origen, str(id_deal_bitrix)))
+                return await cursor.fetchone()
+
+    async def obtener_candidatas_por_clave_pago_bitrix(
+        self,
+        sistema_origen: str,
+        clave_pago_bitrix: str,
+        limite: int = 10,
+    ) -> list[Dict[str, Any]]:
+        consulta = """
+            SELECT *
+            FROM ordenes_pago
+            WHERE sistema_origen = %s
+              AND enlace_pago IS NOT NULL
+              AND id_orden_proveedor IS NOT NULL
+              AND referencia_proveedor IS NOT NULL
+              AND JSON_UNQUOTE(JSON_EXTRACT(metadatos, '$.clave_pago_bitrix')) = %s
+            ORDER BY creado_en ASC
+            LIMIT %s
+        """
+
+        pool = await obtener_pool_mysql()
+        async with pool.acquire() as conexion:
+            async with conexion.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(consulta, (sistema_origen, clave_pago_bitrix, limite))
+                return await cursor.fetchall()
+
     async def actualizar_datos_proveedor(
         self,
         id_orden_pago: int,
@@ -133,6 +182,39 @@ class RepositorioOrdenesPago:
         """
 
         parametros = (
+            datos.get("id_orden_proveedor"),
+            datos.get("referencia_proveedor"),
+            datos.get("enlace_pago"),
+            datos.get("estado_proveedor"),
+            convertir_a_json(datos.get("respuesta_creacion_proveedor")),
+            id_orden_pago,
+        )
+
+        pool = await obtener_pool_mysql()
+        async with pool.acquire() as conexion:
+            async with conexion.cursor() as cursor:
+                await cursor.execute(consulta, parametros)
+                await conexion.commit()
+
+    async def actualizar_expiracion_y_datos_proveedor(
+        self,
+        id_orden_pago: int,
+        fecha_expiracion: str,
+        datos: Dict[str, Any],
+    ) -> None:
+        consulta = """
+            UPDATE ordenes_pago
+            SET fecha_expiracion = %s,
+                id_orden_proveedor = COALESCE(%s, id_orden_proveedor),
+                referencia_proveedor = COALESCE(%s, referencia_proveedor),
+                enlace_pago = COALESCE(%s, enlace_pago),
+                estado_proveedor = COALESCE(%s, estado_proveedor),
+                respuesta_creacion_proveedor = %s
+            WHERE id = %s
+        """
+
+        parametros = (
+            fecha_expiracion,
             datos.get("id_orden_proveedor"),
             datos.get("referencia_proveedor"),
             datos.get("enlace_pago"),

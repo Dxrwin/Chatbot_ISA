@@ -3,6 +3,7 @@ import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 
 class ErrorValidacionPayvalida(Exception):
@@ -203,7 +204,7 @@ def validar_fecha_expiracion_payvalida(fecha_expiracion: Optional[str]) -> None:
             regla="Debe tener formato DD/MM/YYYY. Ejemplo: 30/05/2026.",
         )
 
-    hoy = date.today()
+    hoy = datetime.now(ZoneInfo("America/Bogota")).date()
 
     if fecha < hoy:
         raise ErrorValidacionPayvalida(
