@@ -1,0 +1,45 @@
+image: python:3.11-alpine
+
+pipelines:
+  branches:
+    main:
+      - step:
+          name: Test & Deploy to CapRover
+          deployment: production
+          caches:
+            - pip
+          script:
+            - apk add --no-cache nodejs npm
+
+            - pip install --upgrade pip
+            - pip install -r requirements.txt
+            - pip install pytest
+
+            - |
+              echo "Checking for tests..."
+              if [ -d "tests" ]; then
+                echo "Running tests..."
+                pytest
+              else
+                echo "No tests found. Skipping..."
+              fi
+
+            - npm install -g caprover
+
+            - |
+              echo "Creating deployment package..."
+              tar -czf deploy.tar.gz \
+                --exclude=.git \
+                --exclude=venv \
+                --exclude=__pycache__ \
+                --exclude=.pytest_cache \
+                --exclude=*.pyc \
+                .
+
+            - |
+              echo "Deploying to CapRover..."
+              caprover deploy \
+                -t deploy.tar.gz \
+                -a $CAPROVER_APP_NAME \
+                -u $CAPROVER_URL \
+                -p $CAPROVER_PASSWORD
