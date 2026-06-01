@@ -34,7 +34,6 @@ def obtener_base_url_bitrix_correo() -> str:
     return base_url
 
 
-base_url_bitrix = obtener_base_url_bitrix_correo()
 # Cache liviano en memoria para evitar reintentos inmediatos de envios webinar
 WEBINAR_CACHE_TTL = 300  # segundos
 webinar_request_cache: Dict[str, float] = {}
@@ -69,6 +68,8 @@ async def integracion_bitrix(celular: str, tipo_proceso: str = "renovacion", tim
         }
     """
     try:
+        base_url_bitrix = obtener_base_url_bitrix_correo()
+
         # Validar entrada
         if not celular or not str(celular).strip():
             logging.warning("❌ Número de teléfono vacío para búsqueda en Bitrix24")

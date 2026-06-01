@@ -187,6 +187,149 @@ class ServicioOrdenesPago:
 
         return None
 
+    async def crear_en_payvalida_y_actualizar_orden(
+        self,
+        id_orden_pago: int,
+        datos_orden: Dict[str, Any],
+        datos_solicitud: Dict[str, Any],
+        contexto_auditoria: Dict[str, Any],
+        descripcion_evento_inicial: str = "Solicitud de creacion enviada a Payvalida",
+    ) -> Dict[str, Any]:
+        """
+        Ejecuta la creacion en Payvalida para una orden local existente.
+
+        Se usa tanto para ordenes nuevas como para recuperar ordenes locales que
+        quedaron incompletas antes de guardar link/proveedor.
+        """
+        payload_payvalida = self.servicio_payvalida.construir_payload_creacion_orden(datos_orden)
+
+        url_creacion = f"{self.cliente_payvalida.configuracion.url_base}/api/v3/porders"
+        id_solicitud_proveedor = await self.repositorio_solicitudes.crear(
+            id_orden_pago=id_orden_pago,
+            proveedor=ProveedoresPago.PAYVALIDA,
+            operacion="crear_orden",
+            metodo_http="POST",
+            url=url_creacion,
+            payload_enviado=payload_payvalida,
+        )
+
+        await self.servicio_eventos.registrar_evento(
+            id_orden_pago=id_orden_pago,
+            tipo_evento=EventosOrdenPago.SOLICITUD_CREACION_ENVIADA_A_PAYVALIDA,
+            origen_evento=OrigenEventoPago.API_INTERNA,
+            descripcion=descripcion_evento_inicial,
+            datos_evento={"url": url_creacion},
+        )
+
+        respuesta_proveedor_registrada = False
+
+        try:
+            respuesta_payvalida, codigo_http, duracion_ms = await self.cliente_payvalida.crear_orden(
+                payload_payvalida
+            )
+
+            exitoso = codigo_http in (200, 201) and respuesta_payvalida.get("CODE") == "0000"
+
+            await self.repositorio_solicitudes.actualizar_respuesta(
+                id_solicitud=id_solicitud_proveedor,
+                respuesta_recibida=respuesta_payvalida,
+                codigo_http=codigo_http,
+                exitoso=exitoso,
+                mensaje_error=None if exitoso else str(respuesta_payvalida),
+                duracion_ms=duracion_ms,
+            )
+            respuesta_proveedor_registrada = True
+
+            if not exitoso:
+                await self.repositorio_ordenes.actualizar_estado(
+                    id_orden_pago,
+                    EstadosOrdenPago.FALLIDA,
+                )
+                await self.servicio_eventos.registrar_evento(
+                    id_orden_pago=id_orden_pago,
+                    tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
+                    origen_evento=OrigenEventoPago.PAYVALIDA,
+                    descripcion="Payvalida no creo la orden correctamente",
+                    estado_nuevo=EstadosOrdenPago.FALLIDA,
+                    datos_evento=respuesta_payvalida,
+                )
+                raise ErrorProveedorPago(f"Payvalida respondio error: {respuesta_payvalida}")
+
+            data = respuesta_payvalida.get("DATA", {})
+            id_proveedor = str(data.get("PVordenID")) if data.get("PVordenID") else None
+            referencia_proveedor = str(data.get("Referencia")) if data.get("Referencia") else None
+            enlace_pago = data.get("checkout")
+
+            if not id_proveedor or not referencia_proveedor or not enlace_pago:
+                mensaje = (
+                    "Payvalida respondio exitosamente, pero la respuesta esta incompleta: "
+                    "faltan checkout, PVordenID o Referencia."
+                )
+                await self.repositorio_ordenes.actualizar_estado(
+                    id_orden_pago,
+                    EstadosOrdenPago.FALLIDA,
+                )
+                await self.servicio_eventos.registrar_evento(
+                    id_orden_pago=id_orden_pago,
+                    tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
+                    origen_evento=OrigenEventoPago.PAYVALIDA,
+                    descripcion=mensaje,
+                    estado_nuevo=EstadosOrdenPago.FALLIDA,
+                    datos_evento=respuesta_payvalida,
+                )
+                raise ErrorProveedorPago(mensaje)
+
+            await self.repositorio_ordenes.actualizar_datos_proveedor(
+                id_orden_pago=id_orden_pago,
+                datos={
+                    "id_orden_proveedor": id_proveedor,
+                    "referencia_proveedor": referencia_proveedor,
+                    "enlace_pago": enlace_pago,
+                    "estado_proveedor": data.get("Operacion"),
+                    "respuesta_creacion_proveedor": respuesta_payvalida,
+                },
+            )
+
+            await self.servicio_eventos.registrar_evento(
+                id_orden_pago=id_orden_pago,
+                tipo_evento=EventosOrdenPago.ENLACE_PAGO_GENERADO,
+                origen_evento=OrigenEventoPago.PAYVALIDA,
+                descripcion="Payvalida creo la orden y retorno enlace de pago",
+                datos_evento=respuesta_payvalida,
+            )
+
+            orden_actualizada = await self.repositorio_ordenes.obtener_por_id(id_orden_pago)
+            return self.construir_respuesta_orden(orden_actualizada)
+
+        except Exception as error:
+            if not respuesta_proveedor_registrada:
+                await self.repositorio_solicitudes.actualizar_respuesta(
+                    id_solicitud=id_solicitud_proveedor,
+                    respuesta_recibida=None,
+                    codigo_http=None,
+                    exitoso=False,
+                    mensaje_error=str(error),
+                    duracion_ms=None,
+                )
+
+            await self.repositorio_ordenes.actualizar_estado(
+                id_orden_pago,
+                EstadosOrdenPago.FALLIDA,
+            )
+
+            if respuesta_proveedor_registrada and isinstance(error, ErrorProveedorPago):
+                raise
+
+            await self.servicio_eventos.registrar_evento(
+                id_orden_pago=id_orden_pago,
+                tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
+                origen_evento=OrigenEventoPago.SISTEMA,
+                descripcion="Error al crear la orden en Payvalida",
+                estado_nuevo=EstadosOrdenPago.FALLIDA,
+                datos_evento={"error": str(error)},
+            )
+            raise
+
     async def crear_orden_pago(
         self,
         solicitud: SolicitudCrearOrdenPago,
@@ -269,8 +412,8 @@ class ServicioOrdenesPago:
 
             mensaje = (
                 "Ya existe una orden previa para este sistema_origen y referencia_externa, "
-                "pero la orden está incompleta porque no tiene enlace de pago o datos del proveedor. "
-                "Use una referencia_externa nueva o marque la orden previa como FALLIDA."
+                "pero la orden esta incompleta porque no tiene enlace de pago o datos del proveedor. "
+                "Se intentara completarla nuevamente con Payvalida."
             )
 
             await self.repositorio_auditoria.crear(
@@ -282,7 +425,30 @@ class ServicioOrdenesPago:
                 exitoso=False,
                 mensaje_error=mensaje,
             )
-            raise ErrorProveedorPago(mensaje)
+            datos_orden_existente = dict(orden_existente)
+            datos_orden_existente["fecha_expiracion_payvalida"] = solicitud.pago.fecha_expiracion
+            datos_orden_existente["monto"] = solicitud.pago.monto
+            datos_orden_existente["moneda"] = solicitud.pago.moneda
+            datos_orden_existente["codigo_pais"] = solicitud.pago.codigo_pais
+            datos_orden_existente["descripcion"] = solicitud.pago.descripcion
+            datos_orden_existente["iva"] = solicitud.pago.iva
+            datos_orden_existente["metodo_pago_solicitado"] = solicitud.pago.metodo_pago
+            datos_orden_existente["recurrente"] = 1 if solicitud.pago.recurrente else 0
+            datos_orden_existente["correo_cliente"] = solicitud.cliente.correo
+            datos_orden_existente["tipo_documento_cliente"] = solicitud.cliente.tipo_documento
+            datos_orden_existente["numero_documento_cliente"] = solicitud.cliente.numero_documento
+            datos_orden_existente["nombre_cliente"] = solicitud.cliente.nombre
+            datos_orden_existente["telefono_cliente"] = solicitud.cliente.telefono
+
+            return await self.crear_en_payvalida_y_actualizar_orden(
+                id_orden_pago=orden_existente["id"],
+                datos_orden=datos_orden_existente,
+                datos_solicitud=datos_solicitud,
+                contexto_auditoria=contexto_auditoria,
+                descripcion_evento_inicial=(
+                    "Reintento de creacion en Payvalida para orden local incompleta"
+                ),
+            )
 
         id_aplicacion = await self.repositorio_aplicaciones.crear_si_no_existe(
             codigo=solicitud.sistema_origen,
@@ -335,101 +501,12 @@ class ServicioOrdenesPago:
             datos_evento=datos_solicitud,
         )
 
-        payload_payvalida = self.servicio_payvalida.construir_payload_creacion_orden(datos_orden)
-
-        url_creacion = f"{self.cliente_payvalida.configuracion.url_base}/api/v3/porders"
-        id_solicitud_proveedor = await self.repositorio_solicitudes.crear(
+        return await self.crear_en_payvalida_y_actualizar_orden(
             id_orden_pago=id_orden_pago,
-            proveedor=ProveedoresPago.PAYVALIDA,
-            operacion="crear_orden",
-            metodo_http="POST",
-            url=url_creacion,
-            payload_enviado=payload_payvalida,
+            datos_orden=datos_orden,
+            datos_solicitud=datos_solicitud,
+            contexto_auditoria=contexto_auditoria,
         )
-
-        await self.servicio_eventos.registrar_evento(
-            id_orden_pago=id_orden_pago,
-            tipo_evento=EventosOrdenPago.SOLICITUD_CREACION_ENVIADA_A_PAYVALIDA,
-            origen_evento=OrigenEventoPago.API_INTERNA,
-            descripcion="Solicitud de creación enviada a Payválida",
-            datos_evento={"url": url_creacion},
-        )
-
-        respuesta_proveedor_registrada = False
-
-        try:
-            respuesta_payvalida, codigo_http, duracion_ms = await self.cliente_payvalida.crear_orden(
-                payload_payvalida
-            )
-
-            exitoso = codigo_http in (200, 201) and respuesta_payvalida.get("CODE") == "0000"
-
-            await self.repositorio_solicitudes.actualizar_respuesta(
-                id_solicitud=id_solicitud_proveedor,
-                respuesta_recibida=respuesta_payvalida,
-                codigo_http=codigo_http,
-                exitoso=exitoso,
-                mensaje_error=None if exitoso else str(respuesta_payvalida),
-                duracion_ms=duracion_ms,
-            )
-            respuesta_proveedor_registrada = True
-
-            if not exitoso:
-                await self.servicio_eventos.registrar_evento(
-                    id_orden_pago=id_orden_pago,
-                    tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
-                    origen_evento=OrigenEventoPago.PAYVALIDA,
-                    descripcion="Payválida no creó la orden correctamente",
-                    datos_evento=respuesta_payvalida,
-                )
-                raise ErrorProveedorPago(f"Payválida respondió error: {respuesta_payvalida}")
-
-            data = respuesta_payvalida.get("DATA", {})
-
-            await self.repositorio_ordenes.actualizar_datos_proveedor(
-                id_orden_pago=id_orden_pago,
-                datos={
-                    "id_orden_proveedor": str(data.get("PVordenID")) if data.get("PVordenID") else None,
-                    "referencia_proveedor": str(data.get("Referencia")) if data.get("Referencia") else None,
-                    "enlace_pago": data.get("checkout"),
-                    "estado_proveedor": data.get("Operacion"),
-                    "respuesta_creacion_proveedor": respuesta_payvalida,
-                },
-            )
-
-            await self.servicio_eventos.registrar_evento(
-                id_orden_pago=id_orden_pago,
-                tipo_evento=EventosOrdenPago.ENLACE_PAGO_GENERADO,
-                origen_evento=OrigenEventoPago.PAYVALIDA,
-                descripcion="Payválida creó la orden y retornó enlace de pago",
-                datos_evento=respuesta_payvalida,
-            )
-
-            orden_actualizada = await self.repositorio_ordenes.obtener_por_id(id_orden_pago)
-            return self.construir_respuesta_orden(orden_actualizada)
-
-        except Exception as error:
-            if not respuesta_proveedor_registrada:
-                await self.repositorio_solicitudes.actualizar_respuesta(
-                    id_solicitud=id_solicitud_proveedor,
-                    respuesta_recibida=None,
-                    codigo_http=None,
-                    exitoso=False,
-                    mensaje_error=str(error),
-                    duracion_ms=None,
-                )
-
-            if respuesta_proveedor_registrada and isinstance(error, ErrorProveedorPago):
-                raise
-
-            await self.servicio_eventos.registrar_evento(
-                id_orden_pago=id_orden_pago,
-                tipo_evento=EventosOrdenPago.CREACION_PAYVALIDA_FALLIDA,
-                origen_evento=OrigenEventoPago.SISTEMA,
-                descripcion="Error al crear la orden en Payválida",
-                datos_evento={"error": str(error)},
-            )
-            raise
 
     async def consultar_orden_pago(
         self,
