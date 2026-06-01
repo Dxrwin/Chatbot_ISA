@@ -7451,6 +7451,7 @@ def construir_comentarios_trazabilidad_gestion(
         "ESTADO_CREDITO",
         "VALOR_MORA",
         "MORA_TOTAL",
+        "VALOR_CONFIRMADO",
         "VALOR_FINANCIADO",
         "VALOR_DESEMBOLSADO",
         "CUOTAS",
@@ -7526,6 +7527,18 @@ def construir_campos_resultado_llamada_ia(
         or variables_salida.get("monto_pactado")
         or obtener_variable_entrada(variables_entrada, "VALOR_CONFIRMADO")
     )
+    valor_confirmado_legible = limpiar_texto(
+        variables_salida.get("valor_confirmado_legible")
+        or variables_salida.get("valor_confirmado_original")
+        or variables_salida.get("valor_confirmado")
+        or variables_salida.get("valor_a_pagar")
+        or obtener_variable_entrada(variables_entrada, "VALOR_CONFIRMADO")
+    )
+    valor_confirmado_dinero_bitrix = (
+        f"{valor_confirmado}|COP"
+        if valor_confirmado is not None
+        else None
+    )
 
     resumen_llamada = limpiar_texto(
         variables_salida.get("resumenllamada")
@@ -7563,6 +7576,13 @@ def construir_campos_resultado_llamada_ia(
         variables_entrada=variables_entrada,
         variables_salida=variables_salida,
     )
+    if valor_confirmado_legible:
+        linea_valor = f"VALOR_CONFIRMADO_LEGIBLE: {valor_confirmado_legible}"
+        comentarios_trazabilidad = (
+            f"{comentarios_trazabilidad}\n{linea_valor}"
+            if comentarios_trazabilidad
+            else linea_valor
+        )
 
     titulo = f"Resultado llamada IA - {nombre_cliente}"
 
@@ -7598,6 +7618,7 @@ def construir_campos_resultado_llamada_ia(
         "UF_CRM_1778865231524": telefono_cliente,
         "UF_CRM_1778865296676": cedula_cliente,
         "UF_CRM_1779835103174": limpiar_texto(enlace_pago),
+        "UF_CRM_1780334065381": valor_confirmado_dinero_bitrix,
     }
 
     if BITRIX_ASSIGNED_BY_ID:
