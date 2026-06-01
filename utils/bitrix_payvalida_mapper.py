@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from pagos.esquemas.esquema_orden_pago import SolicitudCrearOrdenPago
+from pagos.utilidades.fechas import normalizar_fecha_payvalida
 
 SISTEMA_ORIGEN_BITRIX_CARTERA = "bitrix_llamadas_cartera"
 DESCRIPCION_PAGO_CARTERA = "Pago cartera libranza"
@@ -168,6 +169,24 @@ def extraer_monto_pactado(output_vars: Dict[str, Any], input_variables: Dict[str
     return monto
 
 
+def obtener_valor_confirmado_original(
+    output_vars: Dict[str, Any],
+    input_variables: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Conserva el valor como llego desde el agente/input para trazabilidad visual.
+
+    El monto operativo se normaliza por separado para Payvalida.
+    """
+    valor = (
+        output_vars.get("valor_confirmado")
+        or output_vars.get("valorconfirmado")
+        or output_vars.get("valor_a_pagar")
+        or obtener_variable_entrada(input_variables, "VALOR_CONFIRMADO")
+    )
+    return limpiar_texto_pago(valor)
+
+
 def convertir_monto_a_decimal(valor: Any) -> Optional[Decimal]:
     if valor is None:
         return None
@@ -234,7 +253,10 @@ def construir_solicitud_pago_desde_bitrix(
     correo_bitrix = limpiar_correo_pago(contact.get("email"))
     telefono_bitrix = limpiar_texto_pago(contact.get("phone"))
     monto = extraer_monto_pactado(output_vars, input_variables)
-    fecha_acuerdo_pago = limpiar_texto_pago(output_vars.get("fechacuerdopago"))
+    valor_confirmado_original = obtener_valor_confirmado_original(output_vars, input_variables)
+    fecha_acuerdo_pago = normalizar_fecha_payvalida(
+        limpiar_texto_pago(output_vars.get("fechacuerdopago"))
+    )
     id_libranza = limpiar_texto_pago(obtener_variable_entrada(input_variables, "ID_LIBRANZA"))
     clave_pago_bitrix = construir_clave_pago_bitrix(
         sistema_origen=SISTEMA_ORIGEN_BITRIX_CARTERA,
@@ -262,6 +284,8 @@ def construir_solicitud_pago_desde_bitrix(
         "mora": obtener_variable_entrada(input_variables, "MORA"),
         "cuota": obtener_variable_entrada(input_variables, "CUOTA"),
         "valor_confirmado": str(monto),
+        "valor_confirmado_original": valor_confirmado_original,
+        "valor_confirmado_legible": valor_confirmado_original or str(monto),
         "gestion_final": limpiar_texto_pago(output_vars.get("gestion_final")),
         "motivo_principal": limpiar_texto_pago(output_vars.get("motivo_principal")),
         "interes_pagar": limpiar_texto_pago(output_vars.get("interes_pagar")),
@@ -311,7 +335,10 @@ def construir_solicitud_pago_desde_bitrix_sin_deal(
     correo_bitrix = limpiar_correo_pago(contact.get("email"))
     telefono_bitrix = limpiar_texto_pago(contact.get("phone"))
     monto = extraer_monto_pactado(output_vars, input_variables)
-    fecha_acuerdo_pago = limpiar_texto_pago(output_vars.get("fechacuerdopago"))
+    valor_confirmado_original = obtener_valor_confirmado_original(output_vars, input_variables)
+    fecha_acuerdo_pago = normalizar_fecha_payvalida(
+        limpiar_texto_pago(output_vars.get("fechacuerdopago"))
+    )
     id_libranza = limpiar_texto_pago(obtener_variable_entrada(input_variables, "ID_LIBRANZA"))
     referencia_externa, referencia_original = generar_referencia_externa_sin_deal(
         cedula=cedula,
@@ -342,6 +369,8 @@ def construir_solicitud_pago_desde_bitrix_sin_deal(
         "mora": obtener_variable_entrada(input_variables, "MORA"),
         "cuota": obtener_variable_entrada(input_variables, "CUOTA"),
         "valor_confirmado": str(monto),
+        "valor_confirmado_original": valor_confirmado_original,
+        "valor_confirmado_legible": valor_confirmado_original or str(monto),
         "gestion_final": limpiar_texto_pago(output_vars.get("gestion_final")),
         "motivo_principal": limpiar_texto_pago(output_vars.get("motivo_principal")),
         "interes_pagar": limpiar_texto_pago(output_vars.get("interes_pagar")),

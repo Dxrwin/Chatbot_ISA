@@ -4,6 +4,7 @@ from typing import Any, Dict
 
 from pagos.configuracion import obtener_configuracion_payvalida
 from pagos.constantes import EstadosOrdenPago
+from pagos.utilidades.fechas import normalizar_fecha_payvalida
 
 
 class ServicioPayvalida:
@@ -112,7 +113,7 @@ class ServicioPayvalida:
             "method": orden.get("metodo_pago_solicitado") or "",
             "language": "es",
             "recurrent": bool(orden.get("recurrente")),
-            "expiration": orden["fecha_expiracion_payvalida"],
+            "expiration": normalizar_fecha_payvalida(orden["fecha_expiracion_payvalida"]),
             "iva": orden.get("iva", "0"),
             "checksum": checksum,
             "user_di": orden.get("numero_documento_cliente"),
