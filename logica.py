@@ -18,6 +18,7 @@ from utils.enviar_correo_IA import (
 )
     # --- Registro del módulo de pagos ---
 from pagos.inicializador import registrar_modulo_pagos
+from renovaciones.inicializador import registrar_modulo_renovaciones
 
 from utils.auth import obtener_token
 from utils.external_client import ExternalClient
@@ -332,6 +333,7 @@ app = FastAPI(lifespan=lifespan)
 
 #inicalizacion del modlo de pagos
 registrar_modulo_pagos(app)
+registrar_modulo_renovaciones(app)
 
 # El middleware para detectar reinicios
 @app.middleware("http")
@@ -1508,6 +1510,98 @@ def extraer_campos_faltantes(kuenta_response: dict) -> dict:
     }
 
 
+CLAVES_SENSIBLES_DEPURACION = (
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "pass",
+    "client_secret",
+)
+
+
+def sanitizar_depuracion_kuenta(value: Any) -> Any:
+    """Redacta secretos antes de registrar o devolver trazas de Kuenta."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in CLAVES_SENSIBLES_DEPURACION):
+                sanitized[key] = "***REDACTED***"
+            else:
+                sanitized[key] = sanitizar_depuracion_kuenta(item)
+        return sanitized
+
+    if isinstance(value, list):
+        return [sanitizar_depuracion_kuenta(item) for item in value]
+
+    return value
+
+
+def truncar_depuracion_kuenta(value: Any, max_chars: int = 4000) -> str:
+    """Serializa trazas de Kuenta y limita respuestas grandes en logs."""
+    text = json.dumps(sanitizar_depuracion_kuenta(value), ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncado]"
+
+
+def extraer_error_kuenta_create_payable(response_data: Any) -> Dict[str, Any]:
+    """Normaliza formatos de error frecuentes de Kuenta para create_payable."""
+    if not isinstance(response_data, dict):
+        return {
+            "codigo": "Unknown",
+            "mensaje": str(response_data),
+            "detalle": response_data,
+        }
+
+    data = response_data.get("data")
+    data_dict = data if isinstance(data, dict) else {}
+
+    codigo = (
+        data_dict.get("code")
+        or response_data.get("code")
+        or response_data.get("CODE")
+        or response_data.get("error")
+        or "Unknown"
+    )
+    mensaje = (
+        data_dict.get("message")
+        or response_data.get("message")
+        or response_data.get("DESC")
+        or response_data.get("error_description")
+        or response_data.get("error")
+        or "Unknown"
+    )
+
+    return {
+        "codigo": codigo,
+        "mensaje": mensaje,
+        "detalle": sanitizar_depuracion_kuenta(response_data),
+    }
+
+
+def log_respuesta_create_payable_depuracion(
+    *,
+    codigo_estado_respuesta: int,
+    endpoint: str,
+    metodo_http_externo: str,
+    api_externa: str,
+    cuerpo_enviado: Dict[str, Any],
+    respuesta: Any,
+) -> None:
+    """Deja una traza unica antes de responder desde create_payable."""
+    logger.info(
+        "[RESPUESTA_CREATE_PAYABLE] codigo_estado_respuesta=%s | endpoint=%s | metodo_http_externo=%s | api_externa=%s | cuerpo_enviado=%s | respuesta=%s",
+        codigo_estado_respuesta,
+        endpoint,
+        metodo_http_externo,
+        api_externa,
+        truncar_depuracion_kuenta(cuerpo_enviado),
+        truncar_depuracion_kuenta(respuesta),
+    )
+
+
 @app.post("/payables/{client_id}")
 async def create_payable(client_id: str, payload: PayableRequest):
     """
@@ -1527,6 +1621,10 @@ async def create_payable(client_id: str, payload: PayableRequest):
             logger.info(f"   principal: ${payload.principal:,.2f}")
             logger.info(f"   initialFee: ${payload.initialFee:,.2f}")
             logger.info(f"   time: {payload.time} días")
+            logger.info(
+                "Cuerpo entrante create_payable (sanitizado) | %s",
+                truncar_depuracion_kuenta(payload.model_dump(exclude_none=False)),
+            )
 
             principal = payload.principal
             initial_fee = payload.initialFee
@@ -1538,25 +1636,46 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "creditLineId": payload.creditLineId,
                 "principal": principal,
                 "time": payload.time,
-                "disbursementMethod": payload.disbursementMethod,
                 "initialFee": initial_fee,
                 "paymentFrequency": payload.paymentFrequency,
                 "source": payload.source,
                 "redirectUrl": payload.redirectUrl,
                 "callbackUrl": payload.callbackUrl,
-                "meta": payload.meta,
             }
 
-            # Eliminar campos None
+            # DEBUG/FUTURO USO:
+            # disbursementMethod se deja fuera cuando no trae valor porque Kuenta
+            # puede rechazar null en KUENTA_PAYABLE_CREATE. Reactivar/enviar solo
+            # si el producto o la linea de credito exige metodo de desembolso:
+            # "disbursementMethod": payload.disbursementMethod,
+            if payload.disbursementMethod is not None:
+                new_payload["disbursementMethod"] = payload.disbursementMethod
+
+            # DEBUG/FUTURO USO:
+            # meta se deja fuera cuando no trae valor porque Kuenta puede rechazar
+            # null en KUENTA_PAYABLE_CREATE. Reactivar/enviar solo si el flujo
+            # requiere metadata real:
+            # "meta": payload.meta,
+            if payload.meta is not None:
+                new_payload["meta"] = payload.meta
+
+            # Eliminar campos None restantes antes de enviar a Kuenta.
             new_payload = {k: v for k, v in new_payload.items() if v is not None}
 
-            logger.info(f"Payload para Kuenta: {new_payload}")
+            logger.info(
+                "Cuerpo final para Kuenta (sanitizado) | %s",
+                truncar_depuracion_kuenta(new_payload),
+            )
 
             headers = {
                 "Config-Organization-ID": ORG_ID,
                 "Organization-ID": client_id,
                 "Authorization": token,
             }
+            logger.info(
+                "Encabezados para Kuenta (sanitizados) | %s",
+                truncar_depuracion_kuenta(headers),
+            )
 
             # Servicio externo para crear payable (configurado en BD)
             ext_client_post = None
@@ -1571,7 +1690,10 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
-            # last_error_response = None
+            status_code = None
+            error_code = "Unknown"
+            error_message = "No se obtuvo respuesta de Kuenta"
+            ultimo_error_kuenta = None
 
             for attempt in range(max_retries):
                 try:
@@ -1585,23 +1707,27 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         # Inyectar variables dinámicas ANTES de ejecutar
                         # IMPORTANTE: Estas variables se usarán tanto para headers como para body
                         dynamic_vars = {
-                            "creditLineId": payload.creditLineId,  # Corregido: minúscula
-                            "principal": principal,
-                            "time": payload.time,
-                            "paymentFrequency": payload.paymentFrequency,
-                            "initialFee": initial_fee,
-                            "disbursementMethod": payload.disbursementMethod,
-                            "source": payload.source,
-                            "redirectUrl": payload.redirectUrl,
-                            "callbackUrl": payload.callbackUrl,
-                            "meta": payload.meta,
+                            **new_payload,
+                            "access_token": token,
+                            "ORG_ID": ORG_ID,
                         }
 
-                        logger.info(f"Variables dinámicas a inyectar: {dynamic_vars}")
+                        logger.info(
+                            "Variables dinámicas a inyectar (sanitizadas): %s",
+                            truncar_depuracion_kuenta(dynamic_vars),
+                        )
                         ext_client_post.set_dynamic_values(dynamic_vars)
 
                         # header dinámicos
                         ext_client_post.set_headers(headers)
+
+                        # DEBUG/FUTURO USO:
+                        # KUENTA_PAYABLE_CREATE en BD puede tener placeholders para
+                        # meta y disbursementMethod. Para evitar enviar null, se fuerza
+                        # el body final limpio construido arriba. Si un flujo futuro
+                        # necesita esos parametros, agregarlos al new_payload solo con
+                        # valores reales, no None.
+                        ext_client_post.set_body(new_payload)
 
                         # Asignar URL si no está definida en la configuración
                         if not ext_client_post.url:
@@ -1623,28 +1749,41 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         response_data = response.json()
                         status_code = response.status_code
 
-                    # logger.info(f"   Response Data: {str(response_data)}")
+                    logger.info(
+                        "Respuesta KUENTA_PAYABLE_CREATE | intento=%s/%s | codigo_estado=%s | datos=%s",
+                        attempt + 1,
+                        max_retries,
+                        status_code,
+                        truncar_depuracion_kuenta(response_data),
+                    )
 
                     # ===== CASO 1: ÉXITO (200 o 201) =====
                     if status_code in (200, 201):
                         credit = response_data.get("data", {}).get("credit", {})
                         response_credit_id = credit.get("ID")
                         logger.info(
-                            f"Response: HTTP {status_code}, \n ID del credito: {response_credit_id}"
+                            f"Respuesta: HTTP {status_code}, \n ID del credito: {response_credit_id}"
                         )
                         break  # ¡Salió bien! Rompemos el ciclo.
 
                     # ===== CASO 2: ERROR DEL CLIENTE O REGLA DE NEGOCIO (400, 409, 422) =====
                     elif status_code in (400, 409, 422):
-                        error_code = response_data.get("data", {}).get(
-                            "code", "Unknown"
-                        )
-                        error_message = response_data.get("data", {}).get(
-                            "message", "Unknown"
-                        )
+                        error_info = extraer_error_kuenta_create_payable(response_data)
+                        error_code = error_info["codigo"]
+                        error_message = error_info["mensaje"]
+                        ultimo_error_kuenta = {
+                            "operacion": "KUENTA_PAYABLE_CREATE",
+                            "codigo_estado_kuenta": status_code,
+                            "codigo_error_kuenta": error_code,
+                            "mensaje_error_kuenta": error_message,
+                            "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                            "respuesta_kuenta": error_info["detalle"],
+                            "intento": attempt + 1,
+                        }
 
                         logger.error(
-                            f"HTTP {status_code} - Code: {error_code}, Msg: {error_message}"
+                            "KUENTA_PAYABLE_CREATE fallo sin reintento | %s",
+                            truncar_depuracion_kuenta(ultimo_error_kuenta),
                         )
 
                         # Lógica de traducción para el Frontend
@@ -1674,30 +1813,46 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                 http_code=status_code,
                                 tipo="error",
                                 traceback_str=None,
+                                respuesta_api=truncar_depuracion_kuenta(error_info["detalle"]),
+                                payload_enviado=truncar_depuracion_kuenta(new_payload),
                             )
 
+                            respuesta_final = {
+                                "estado": "error",
+                                "http_real": status_code,
+                                "codigo_tecnico": error_code,
+                                "mensaje": mensaje_amigable,
+                                "detalles_usuario": detalles_usuario,
+                                "depuracion": ultimo_error_kuenta,
+                            }
+                            log_respuesta_create_payable_depuracion(
+                                codigo_estado_respuesta=200,
+                                endpoint=f"/payables/{client_id}",
+                                metodo_http_externo="POST",
+                                api_externa=PAYABLE_URL,
+                                cuerpo_enviado=new_payload,
+                                respuesta=respuesta_final,
+                            )
                             return JSONResponse(
                                 status_code=200,  # Le decimos 200 OK para que el nodo pase feliz
-                                content={
-                                    "estado": "error",  # Pero aquí le decimos la cruda verdad
-                                    "http_real": status_code,  # El código real del error para que el frontend pueda reaccionar
-                                    "codigo_tecnico": error_code,
-                                    "mensaje": mensaje_amigable,
-                                    "detalles_usuario": detalles_usuario,
-                                },
+                                content=respuesta_final,
                             )
 
-                        # # FAIL FAST: NO TIENE SENTIDO REINTENTAR ESTO.
-                        # # Lanzamos la excepción de una vez para que el usuario corrija los datos.
-                        # raise HTTPException(
-                        #     status_code=400,
-                        #     detail={
-                        #         "estado": "error",
-                        #         "codigo_tecnico": error_code,
-                        #         "mensaje": mensaje_amigable,
-                        #         "detalles_usuario": detalles_usuario
-                        #     }
-                        # )
+                        raise HTTPException(
+                            status_code=status_code,
+                            detail={
+                                "estado": "error",
+                                "operacion": "KUENTA_PAYABLE_CREATE",
+                                "codigo_estado_kuenta": status_code,
+                                "codigo_error_kuenta": error_code,
+                                "mensaje_error_kuenta": error_message,
+                                "mensaje": mensaje_amigable,
+                                "detalles_usuario": detalles_usuario,
+                                "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                                "respuesta_kuenta": error_info["detalle"],
+                                "intento": attempt + 1,
+                            },
+                        )
 
                     # ===== CASO 3: ERROR DE AUTENTICACIÓN (401) =====
                     elif status_code in (401, 403):
@@ -1733,19 +1888,38 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                     # ===== CASO 4: ERRORES DE SERVIDOR O DESCONOCIDOS (5XX) =====
                     else:
+                        ultimo_error_kuenta = {
+                            "operacion": "KUENTA_PAYABLE_CREATE",
+                            "codigo_estado_kuenta": status_code,
+                            "codigo_error_kuenta": "error_servidor_o_estado_no_esperado",
+                            "mensaje_error_kuenta": "Error del servidor Kuenta o estado no esperado",
+                            "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                            "respuesta_kuenta": sanitizar_depuracion_kuenta(response_data),
+                            "intento": attempt + 1,
+                        }
                         logger.error(
-                            f"Error del servidor Kuenta HTTP {status_code}: {response_data}"
+                            "Error del servidor Kuenta | %s",
+                            truncar_depuracion_kuenta(ultimo_error_kuenta),
                         )
                         await error_notify(
                             method_name,
                             client_id,
-                            f"Error del servidor Kuenta HTTP {status_code}: {response_data}",
+                            f"Error del servidor Kuenta HTTP {status_code}: {truncar_depuracion_kuenta(response_data)}",
                         )
                         if attempt < max_retries - 1:
                             await asyncio.sleep(2**attempt)
                             continue
 
                 except httpx.TimeoutException as e:
+                    ultimo_error_kuenta = {
+                        "operacion": "KUENTA_PAYABLE_CREATE",
+                        "codigo_estado_kuenta": 504,
+                        "codigo_error_kuenta": "tiempo_espera_agotado",
+                        "mensaje_error_kuenta": str(e),
+                        "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                        "respuesta_kuenta": None,
+                        "intento": attempt + 1,
+                    }
                     if attempt < max_retries - 1:
                         wait_time = 2**attempt
                         logger.info(f"Reintentando en {wait_time}s...")
@@ -1754,6 +1928,15 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 except (httpx.TimeoutException, httpx.RequestError) as e:
                     # Errores puros de red. Los registramos y reintentamos.
                     error_traceback = traceback.format_exc()
+                    ultimo_error_kuenta = {
+                        "operacion": "KUENTA_PAYABLE_CREATE",
+                        "codigo_estado_kuenta": 502,
+                        "codigo_error_kuenta": "error_peticion",
+                        "mensaje_error_kuenta": str(e),
+                        "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                        "respuesta_kuenta": None,
+                        "intento": attempt + 1,
+                    }
                     logger.error(f"Error de red en intento {attempt + 1}: {str(e)}")
                     await error_notify(
                         method_name,
@@ -1776,12 +1959,26 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # Si el ciclo for terminó y no obtuvimos un ID, significa que se agotaron los reintentos
             # y todo falló. Matamos el proceso aquí para no hacer un GET a `/payables/None`.
             if not response_credit_id:
+                detalle_fallo_payable = ultimo_error_kuenta or {
+                    "operacion": "KUENTA_PAYABLE_CREATE",
+                    "codigo_estado_kuenta": status_code or 500,
+                    "codigo_error_kuenta": error_code,
+                    "mensaje_error_kuenta": error_message,
+                    "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                    "respuesta_kuenta": None,
+                    "intento": max_retries,
+                }
                 raise HTTPException(
                     status_code=status_code or 500,
                     detail={
                         "estado": "error",
-                        "codigo": error_code,
-                        "detalles_usuario": error_message,
+                        "operacion": "KUENTA_PAYABLE_CREATE",
+                        "codigo": detalle_fallo_payable.get("codigo_error_kuenta", error_code),
+                        "detalles_usuario": detalle_fallo_payable.get(
+                            "mensaje_error_kuenta",
+                            error_message,
+                        ),
+                        "depuracion": detalle_fallo_payable,
                     },
                 )
 
@@ -1969,6 +2166,14 @@ async def create_payable(client_id: str, payload: PayableRequest):
                     method_name, client_id, info_message, entity_id=str(id_cliente)
                 )
 
+                log_respuesta_create_payable_depuracion(
+                    codigo_estado_respuesta=200,
+                    endpoint=f"/payables/{client_id}",
+                    metodo_http_externo="POST",
+                    api_externa=PAYABLE_URL,
+                    cuerpo_enviado=new_payload,
+                    respuesta=response_data,
+                )
                 return response_data
 
             except Exception as e:
@@ -2010,6 +2215,14 @@ async def create_payable(client_id: str, payload: PayableRequest):
             http_code=http_exc.status_code,
             tipo="error",
         )
+        log_respuesta_create_payable_depuracion(
+            codigo_estado_respuesta=http_exc.status_code,
+            endpoint=f"/payables/{client_id}",
+            metodo_http_externo="POST",
+            api_externa=PAYABLE_URL,
+            cuerpo_enviado=locals().get("new_payload", {}),
+            respuesta=http_exc.detail,
+        )
         return JSONResponse(status_code=http_exc.status_code, content=http_exc.detail)
 
     except ValueError as e:
@@ -2022,14 +2235,20 @@ async def create_payable(client_id: str, payload: PayableRequest):
             http_code=400,
             tipo="error",
         )
-        return JSONResponse(
-            status_code=400,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_datos"],
-                "detalles_usuario": "Se detectó un valor numérico incorrecto en el proceso.",
-            },
+        respuesta_final = {
+            "estado": "error",
+            "mensaje": MENSAJES_CLIENTE["error_datos"],
+            "detalles_usuario": "Se detectó un valor numérico incorrecto en el proceso.",
+        }
+        log_respuesta_create_payable_depuracion(
+            codigo_estado_respuesta=400,
+            endpoint=f"/payables/{client_id}",
+            metodo_http_externo="POST",
+            api_externa=PAYABLE_URL,
+            cuerpo_enviado=locals().get("new_payload", {}),
+            respuesta=respuesta_final,
         )
+        return JSONResponse(status_code=400, content=respuesta_final)
     except Exception as e:
         # El catch-all final por si se nos cuela un IndexError, AttributeError, etc no previsto.
         error_traceback = traceback.format_exc()
@@ -2043,14 +2262,20 @@ async def create_payable(client_id: str, payload: PayableRequest):
             tipo="error",
             traceback_str=error_traceback,
         )
-        return JSONResponse(
-            status_code=500,
-            content={
-                "estado": "error",
-                "mensaje": MENSAJES_CLIENTE["error_general"],
-                "detalles_usuario": "El equipo técnico ya fue notificado. Disculpa las molestias.",
-            },
+        respuesta_final = {
+            "estado": "error",
+            "mensaje": MENSAJES_CLIENTE["error_general"],
+            "detalles_usuario": "El equipo técnico ya fue notificado. Disculpa las molestias.",
+        }
+        log_respuesta_create_payable_depuracion(
+            codigo_estado_respuesta=500,
+            endpoint=f"/payables/{client_id}",
+            metodo_http_externo="POST",
+            api_externa=PAYABLE_URL,
+            cuerpo_enviado=locals().get("new_payload", {}),
+            respuesta=respuesta_final,
         )
+        return JSONResponse(status_code=500, content=respuesta_final)
 
 
 @app.post(
@@ -3337,7 +3562,7 @@ async def obtener_estado(debtor_id: str, request: Request):
             # Obtener token una sola vez
 
             access_token = await obtener_token(client)
-            logger.info(f"Token obtenido: {access_token}")
+            logger.info("Token obtenido correctamente para consulta de orden Kuenta")
 
             if not access_token:
                 raise HTTPException(
@@ -8275,16 +8500,29 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
     """
 
     method_name = "bitrix_debug_search_client"
-
     input_variables = payload.model_dump(exclude_none=True)
-    criteria = construir_criterios_busqueda_bitrix(input_variables)
-
-    logger.info(
-        "Endpoint iniciado | POST /bitrix/debug/search-client | criteria=%s",
-        json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
-    )
+    output_vars = {}
+    contexto_agente = {
+        "origen": "bitrix_debug_search_client",
+        "objetivo": "debug_busqueda_cliente",
+        "requiere_bitrix": True,
+        "requiere_link_pago": False,
+    }
+    criteria = None
+    contact = None
+    validation = None
+    deal_result = None
+    payment_order_result = None
+    bitrix_link_update = None
 
     try:
+        criteria = construir_criterios_busqueda_bitrix(input_variables)
+
+        logger.info(
+            "Endpoint iniciado | POST /bitrix/debug/search-client | criteria=%s",
+            json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
+        )
+
         contact = await buscar_contacto_desde_variables_entrada(input_variables)
 
         if contact:
@@ -8315,9 +8553,14 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
 
     except ErrorBitrixAPI as exc:
         logger.error("Error Bitrix en /bitrix/debug/search-client | %s", exc.mensaje)
+        identificador_debug = (
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono)
+            if criteria is not None
+            else str(input_variables.get("CEDULA") or input_variables.get("CORREO") or "N/A")
+        )
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
+            identificador_debug,
             exc.mensaje,
         )
         raise HTTPException(
@@ -8330,11 +8573,11 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
                 output_vars=output_vars,
                 contexto_agente=contexto_agente,
                 criteria=criteria,
-                validation=locals().get("validation"),
-                contact=locals().get("contact"),
-                deal_result=locals().get("deal_result"),
-                payment_order_result=locals().get("payment_order_result"),
-                bitrix_link_update=locals().get("bitrix_link_update"),
+                validation=validation,
+                contact=contact,
+                deal_result=deal_result,
+                payment_order_result=payment_order_result,
+                bitrix_link_update=bitrix_link_update,
                 error={
                     "mensaje": exc.mensaje,
                     "metodo_bitrix": exc.metodo,
@@ -8347,9 +8590,14 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
     except Exception as exc:
         logger.error("Error interno en /bitrix/debug/search-client | %s", str(exc))
         logger.error(traceback.format_exc())
+        identificador_debug = (
+            str(criteria.cedula or criteria.correo or criteria.variantes_telefono)
+            if criteria is not None
+            else str(input_variables.get("CEDULA") or input_variables.get("CORREO") or "N/A")
+        )
         await error_notify(
             method_name,
-            str(criteria.cedula or criteria.correo or criteria.variantes_telefono),
+            identificador_debug,
             str(exc),
         )
         raise HTTPException(
@@ -8362,11 +8610,11 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
                 output_vars=output_vars,
                 contexto_agente=contexto_agente,
                 criteria=criteria,
-                validation=locals().get("validation"),
-                contact=locals().get("contact"),
-                deal_result=locals().get("deal_result"),
-                payment_order_result=locals().get("payment_order_result"),
-                bitrix_link_update=locals().get("bitrix_link_update"),
+                validation=validation,
+                contact=contact,
+                deal_result=deal_result,
+                payment_order_result=payment_order_result,
+                bitrix_link_update=bitrix_link_update,
                 error={
                     "mensaje": str(exc),
                     "traceback": traceback.format_exc(),
