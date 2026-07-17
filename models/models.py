@@ -20,9 +20,41 @@ class InputVariables(BaseModel):
     LINEA_CREDITO: Optional[str] = None
     ESTADO_CREDITO: Optional[str] = None
     CUOTAS_PENDIENTES: Optional[int] = None
+    TIPO: Optional[str] = None
+    SEGMENTO_CAMPANA: Optional[str] = None
 
     # Permite campos adicionales y acepta alias/camelCase
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_input_variable_names(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        aliases = {
+            "phone_number": "PHONE_NUMBER",
+            "telefono": "Celular",
+            "nombre_titular": "NOMBRE_TITULAR",
+            "correo": "CORREO",
+            "estado_credito": "ESTADO_CREDITO",
+            "tipo": "TIPO",
+            "universidad": "Universidad",
+            "segmento_campana": "SEGMENTO_CAMPANA",
+        }
+
+        for source, target in aliases.items():
+            if source in normalized and target not in normalized:
+                normalized[target] = normalized[source]
+
+        if "PHONE_NUMBER" in normalized and "Celular" not in normalized:
+            normalized["Celular"] = normalized["PHONE_NUMBER"]
+
+        if "SEGMENTO_CAMPANA" in normalized and "LINEA_CREDITO" not in normalized:
+            normalized["LINEA_CREDITO"] = normalized["SEGMENTO_CAMPANA"]
+
+        return normalized
 
     @field_validator("Contacto", "Celular", "PHONE_NUMBER", mode="before")
     @classmethod
@@ -57,6 +89,9 @@ class ExtractedVariables(BaseModel):
     acpt_info_email: Optional[bool] = Field(None, alias="acptInfoEmail")
     aceptoinfocorreo: Optional[str] = Field(None, alias="aceptoInfoCorreo")
     objetivo: Optional[str] = None
+    resumenllamada: Optional[str] = None
+    gestion_final: Optional[str] = None
+    requseguimiento: Optional[str] = None
     refinanciar: Optional[str] = None
     refinanciar_bool: Optional[bool] = None
     agendo_asst_assr: Optional[str] = Field(None, alias="agendoAsstAssr")
@@ -80,6 +115,28 @@ class ExtractedVariables(BaseModel):
 
     # Permite campos adicionales y acepta alias/camelCase
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_output_variable_names(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        aliases = {
+            "resumen_llamada": "resumenllamada",
+            "requiere_seguimiento": "requseguimiento",
+            "requ_seguimiento": "requseguimiento",
+        }
+
+        for source, target in aliases.items():
+            if source in normalized and target not in normalized:
+                normalized[target] = normalized[source]
+
+        if "resumenllamada" in normalized and "resumen" not in normalized:
+            normalized["resumen"] = normalized["resumenllamada"]
+
+        return normalized
 
 
 class WebhookPayload(BaseModel):
@@ -106,9 +163,16 @@ class WebhookPayload(BaseModel):
             
             # Si es una lista (incluso vacía), convertir a diccionario vacío
             if isinstance(extracted, list):
-                data["extracted_variables"] = {}
+                data["extracted_variables"] = {
+                    str(item.get("name") or item.get("Name") or item.get("key") or item.get("Key")).strip(): (
+                        item.get("value") if "value" in item else item.get("Value")
+                    )
+                    for item in extracted
+                    if isinstance(item, dict)
+                    and str(item.get("name") or item.get("Name") or item.get("key") or item.get("Key") or "").strip()
+                }
                 if "extractedVariables" in data:
-                    data["extractedVariables"] = {}
+                    data["extractedVariables"] = data["extracted_variables"]
             
             # Si es None, usa diccionario vacío
             elif extracted is None:
