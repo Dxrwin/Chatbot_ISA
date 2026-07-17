@@ -34,7 +34,9 @@ from utils.servicios_externos_service import (
 #from utils.linea_credito_links import obtener_link_por_linea_credito
 from models.bitrix_call_models import (
     BitrixCallCompletedRequest,
-    BitrixCallCompletedResponse
+    BitrixCallCompletedResponse,
+    BitrixProcessDestinationRequest,
+    BitrixProcessFieldMappingRequest,
     #BitrixDebugSearchClientRequest,
 )
 from pagos.aplicacion.servicios.servicio_ordenes_pago import ServicioOrdenesPago
@@ -45,6 +47,25 @@ from pagos.utilidades.validaciones_payvalida import ErrorValidacionPayvalida
 from utils.bitrix_payvalida_mapper import (
     construir_solicitud_pago_desde_bitrix,
     construir_solicitud_pago_desde_bitrix_sin_deal,
+)
+from utils.bitrix_process_service import (
+    MAPEOS_CAMPOS_PREDETERMINADOS,
+    PROCESOS_SOPORTADOS,
+    asignar_destino_bitrix_proceso,
+    asignar_mapeo_campo_proceso,
+    campos_logicos_soportados,
+    construir_campos_deal_proceso,
+    desactivar_destino_bitrix_proceso,
+    desactivar_mapeo_campo_proceso,
+    evaluar_interes_proceso,
+    filtrar_variables_salida_proceso,
+    listar_destinos_bitrix_procesos,
+    listar_mapeos_campos_configurados,
+    obtener_destino_bitrix_proceso,
+    obtener_mapeo_campo_configurado,
+    normalizar_codigo_proceso,
+    resolver_codigo_proceso,
+    resolver_mapeos_campos_proceso,
 )
 from dataclasses import dataclass
 import json
@@ -381,7 +402,7 @@ MENSAJES_USUARIO = {
 
 # Configuración de logs
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s\n"
 )
 logger = logging.getLogger(__name__)
 
@@ -9480,6 +9501,9 @@ async def crear_deal_resultado_llamada_ia(
     variables_entrada: Dict[str, Any],
     variables_salida: Dict[str, Any],
     contacto: Dict[str, Any],
+    codigo_proceso: str,
+    destino_bitrix: Dict[str, Any],
+    mapeos_campos: Dict[str, Dict[str, Any]],
     enlace_pago: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -9498,11 +9522,16 @@ async def crear_deal_resultado_llamada_ia(
 
     id_contacto = int(contacto.get("id") or contacto.get("ID"))
 
-    campos = construir_campos_resultado_llamada_ia(
+    campos = construir_campos_deal_proceso(
+        codigo_proceso=codigo_proceso,
         variables_entrada=variables_entrada,
         variables_salida=variables_salida,
         id_contacto=id_contacto,
+        category_id=int(destino_bitrix["category_id"]),
+        stage_id=str(destino_bitrix["stage_id"]),
         enlace_pago=enlace_pago,
+        assigned_by_id=BITRIX_ASSIGNED_BY_ID,
+        mapeos_campos=mapeos_campos,
     )
 
     cuerpo = {
@@ -9512,18 +9541,30 @@ async def crear_deal_resultado_llamada_ia(
     }
 
     logger.info(
-        "Creando deal en RESULTADO LLAMADA IA | cuerpo=%s",
+        "Creando deal Bitrix | proceso=%s | category_id=%s | stage_id=%s | cuerpo=%s",
+        codigo_proceso,
+        destino_bitrix.get("category_id"),
+        destino_bitrix.get("stage_id"),
         json.dumps(cuerpo, ensure_ascii=False, default=str),
     )
 
     datos = await llamar_bitrix("crm.item.add", cuerpo)
 
+    resultado_deal = datos.get("result") if isinstance(datos, dict) else None
+    item_creado = (
+        resultado_deal.get("item")
+        if isinstance(resultado_deal, dict) and isinstance(resultado_deal.get("item"), dict)
+        else resultado_deal
+    )
     logger.info(
-        "Deal creado correctamente en RESULTADO LLAMADA IA | respuesta=%s",
-        json.dumps(datos, ensure_ascii=False, default=str),
+        "Deal creado correctamente | proceso=%s | id_deal=%s | category_id=%s | stage_id=%s",
+        codigo_proceso,
+        item_creado.get("id") if isinstance(item_creado, dict) else None,
+        item_creado.get("categoryId") if isinstance(item_creado, dict) else destino_bitrix.get("category_id"),
+        item_creado.get("stageId") if isinstance(item_creado, dict) else destino_bitrix.get("stage_id"),
     )
 
-    return datos.get("result")
+    return resultado_deal
 
 
 def extraer_item_bitrix_get(respuesta_bitrix: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -9587,7 +9628,11 @@ async def obtener_contacto_bitrix_por_id(id_contacto: int) -> Dict[str, Any]:
     return item
 
 
-async def actualizar_link_pago_en_deal_bitrix(id_deal: int, enlace_pago: str) -> Dict[str, Any]:
+async def actualizar_link_pago_en_deal_bitrix(
+    id_deal: int,
+    enlace_pago: str,
+    codigo_campo_link: str = "UF_CRM_1779835103174",
+) -> Dict[str, Any]:
     """
     Actualiza el campo personalizado Link de pago en el deal Bitrix.
     """
@@ -9595,7 +9640,7 @@ async def actualizar_link_pago_en_deal_bitrix(id_deal: int, enlace_pago: str) ->
         "entityTypeId": DEAL_ENTITY_TYPE_ID,
         "id": id_deal,
         "fields": {
-            "UF_CRM_1779835103174": enlace_pago,
+            codigo_campo_link: enlace_pago,
         },
         "useOriginalUfNames": "Y",
     }
@@ -9607,6 +9652,7 @@ async def actualizar_link_pago_en_deal_bitrix(id_deal: int, enlace_pago: str) ->
 async def actualizar_y_verificar_link_pago_en_deal_bitrix(
     id_deal: int,
     enlace_pago: str,
+    codigo_campo_link: str = "UF_CRM_1779835103174",
     max_intentos: int = 3,
 ) -> Dict[str, Any]:
     intentos = max(1, min(int(max_intentos or 3), 3))
@@ -9625,7 +9671,7 @@ async def actualizar_y_verificar_link_pago_en_deal_bitrix(
                 enlace_pago,
             )
             ultimo_deal = await obtener_deal_bitrix_por_id(id_deal)
-            ultimo_link = extraer_link_pago_de_deal(ultimo_deal)
+            ultimo_link = extraer_link_pago_de_deal(ultimo_deal, codigo_campo_link)
 
             if ultimo_link == enlace_pago:
                 logger.info(
@@ -9655,9 +9701,10 @@ async def actualizar_y_verificar_link_pago_en_deal_bitrix(
             ultimo_update = await actualizar_link_pago_en_deal_bitrix(
                 id_deal=id_deal,
                 enlace_pago=enlace_pago,
+                codigo_campo_link=codigo_campo_link,
             )
             ultimo_deal = await obtener_deal_bitrix_por_id(id_deal)
-            ultimo_link = extraer_link_pago_de_deal(ultimo_deal)
+            ultimo_link = extraer_link_pago_de_deal(ultimo_deal, codigo_campo_link)
 
             if ultimo_link == enlace_pago:
                 logger.info(
@@ -9746,8 +9793,11 @@ async def actualizar_correo_contacto_bitrix_si_falta(
     return datos.get("result") or datos
 
 
-def extraer_link_pago_de_deal(deal: Dict[str, Any]) -> Optional[str]:
-    return limpiar_texto(deal.get("UF_CRM_1779835103174"))
+def extraer_link_pago_de_deal(
+    deal: Dict[str, Any],
+    codigo_campo_link: str = "UF_CRM_1779835103174",
+) -> Optional[str]:
+    return limpiar_texto(deal.get(codigo_campo_link))
 
 
 def extraer_id_contacto_de_deal(deal: Dict[str, Any]) -> Optional[int]:
@@ -10094,6 +10144,250 @@ async def crear_orden_pago_desde_deal_confirmado(
         )
 
 
+async def obtener_etapas_embudo_bitrix(category_id: int) -> List[Dict[str, Any]]:
+    """Consulta y normaliza las etapas disponibles de un embudo Bitrix."""
+    datos = await llamar_bitrix(
+        "crm.dealcategory.stage.list",
+        {"ID": int(category_id)},
+    )
+    resultado = datos.get("result") if isinstance(datos, dict) else None
+    if not isinstance(resultado, list):
+        raise ErrorBitrixAPI(
+            mensaje="Bitrix no retorno una lista valida de etapas.",
+            metodo="crm.dealcategory.stage.list",
+            respuesta=datos,
+        )
+    return [
+        {
+            "category_id": int(category_id),
+            "stage_id": etapa.get("STATUS_ID"),
+            "nombre": etapa.get("NAME"),
+            "orden": etapa.get("SORT"),
+        }
+        for etapa in resultado
+        if isinstance(etapa, dict) and etapa.get("STATUS_ID")
+    ]
+
+
+@app.get("/bitrix/embudos/{category_id}/etapas")
+async def listar_etapas_embudo_bitrix(category_id: int):
+    try:
+        return {
+            "ok": True,
+            "category_id": category_id,
+            "etapas": await obtener_etapas_embudo_bitrix(category_id),
+        }
+    except ErrorBitrixAPI as exc:
+        raise convertir_error_bitrix_a_http(exc) from exc
+
+
+@app.put("/bitrix/configuracion/procesos/{codigo_proceso}")
+async def configurar_destino_proceso_bitrix(
+    codigo_proceso: str,
+    payload: BitrixProcessDestinationRequest,
+):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    if not codigo:
+        raise HTTPException(status_code=422, detail={"tipo_error": "codigo_proceso_vacio"})
+
+    try:
+        etapas = await obtener_etapas_embudo_bitrix(payload.category_id)
+        etapa = next(
+            (item for item in etapas if item["stage_id"] == payload.stage_id),
+            None,
+        )
+        if etapa is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "tipo_error": "etapa_no_pertenece_al_embudo",
+                    "codigo_proceso": codigo,
+                    "category_id": payload.category_id,
+                    "stage_id": payload.stage_id,
+                },
+            )
+        guardado = await asignar_destino_bitrix_proceso(
+            codigo_proceso=codigo,
+            nombre_proceso=payload.nombre_proceso,
+            category_id=payload.category_id,
+            stage_id=payload.stage_id,
+            nombre_etapa=etapa.get("nombre"),
+            activo=payload.activo,
+        )
+        return {"ok": True, "action": "process_destination_upserted", "configuracion": guardado}
+    except HTTPException:
+        raise
+    except ErrorBitrixAPI as exc:
+        raise convertir_error_bitrix_a_http(exc) from exc
+    except Exception as exc:
+        logger.error("Error guardando destino Bitrix | proceso=%s | error=%s", codigo, str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+
+
+@app.get("/bitrix/configuracion/procesos")
+async def obtener_destinos_procesos_bitrix(activo: Optional[bool] = Query(default=None)):
+    try:
+        configuraciones = await listar_destinos_bitrix_procesos(activo)
+        return {"ok": True, "configuraciones": configuraciones}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+
+
+@app.get("/bitrix/configuracion/procesos/{codigo_proceso}")
+async def obtener_destino_proceso_bitrix(codigo_proceso: str):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    try:
+        configuracion = await obtener_destino_bitrix_proceso(codigo, solo_activo=False)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+    if configuracion is None:
+        raise HTTPException(status_code=404, detail={"tipo_error": "proceso_no_configurado"})
+    return {"ok": True, "configuracion": configuracion}
+
+
+@app.patch("/bitrix/configuracion/procesos/{codigo_proceso}/desactivar")
+async def desactivar_destino_proceso_bitrix(codigo_proceso: str):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    try:
+        actualizado = await desactivar_destino_bitrix_proceso(codigo)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+    if not actualizado:
+        raise HTTPException(status_code=404, detail={"tipo_error": "proceso_no_configurado"})
+    return {"ok": True, "action": "process_destination_disabled", "codigo_proceso": codigo}
+
+
+@app.put("/bitrix/configuracion/procesos/{codigo_proceso}/campos/{campo_logico}")
+async def configurar_campo_proceso_bitrix(
+    codigo_proceso: str,
+    campo_logico: str,
+    payload: BitrixProcessFieldMappingRequest,
+):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    campo = normalizar_clave(campo_logico)
+    predeterminado = MAPEOS_CAMPOS_PREDETERMINADOS.get(codigo, {}).get(campo)
+    if predeterminado is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "campo_logico_no_soportado",
+                "campos_soportados": campos_logicos_soportados(codigo),
+            },
+        )
+    try:
+        existente = await obtener_mapeo_campo_configurado(codigo, campo)
+        base = existente or predeterminado
+        guardado = await asignar_mapeo_campo_proceso(
+            codigo_proceso=codigo,
+            campo_logico=campo,
+            codigo_campo_bitrix=payload.codigo_campo_bitrix,
+            tipo_campo=payload.tipo_campo or base.get("tipo_campo") or "texto",
+            valor_positivo=(
+                payload.valor_positivo
+                if payload.valor_positivo is not None
+                else base.get("valor_positivo")
+            ),
+            valor_negativo=(
+                payload.valor_negativo
+                if payload.valor_negativo is not None
+                else base.get("valor_negativo")
+            ),
+            activo=payload.activo,
+        )
+        return {"ok": True, "action": "process_field_upserted", "mapeo": guardado}
+    except Exception as exc:
+        logger.error(
+            "Error guardando campo Bitrix | proceso=%s | campo=%s | error=%s",
+            codigo,
+            campo,
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+
+
+@app.get("/bitrix/configuracion/procesos/{codigo_proceso}/campos")
+async def obtener_campos_proceso_bitrix(
+    codigo_proceso: str,
+    activo: Optional[bool] = Query(default=None),
+):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    try:
+        configurados = await listar_mapeos_campos_configurados(codigo, activo)
+        resueltos = await resolver_mapeos_campos_proceso(codigo)
+        return {
+            "ok": True,
+            "codigo_proceso": codigo,
+            "configurados": configurados,
+            "resueltos": resueltos,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+
+
+@app.get("/bitrix/configuracion/procesos/{codigo_proceso}/campos/{campo_logico}")
+async def obtener_campo_proceso_bitrix(codigo_proceso: str, campo_logico: str):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    campo = normalizar_clave(campo_logico)
+    if campo not in MAPEOS_CAMPOS_PREDETERMINADOS.get(codigo, {}):
+        raise HTTPException(status_code=404, detail={"tipo_error": "campo_logico_no_soportado"})
+    try:
+        configurado = await obtener_mapeo_campo_configurado(codigo, campo)
+        efectivo = (await resolver_mapeos_campos_proceso(codigo)).get(campo)
+        return {
+            "ok": True,
+            "codigo_proceso": codigo,
+            "campo_logico": campo,
+            "configurado": configurado,
+            "efectivo": efectivo,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+
+
+@app.patch("/bitrix/configuracion/procesos/{codigo_proceso}/campos/{campo_logico}/desactivar")
+async def desactivar_campo_proceso_bitrix(codigo_proceso: str, campo_logico: str):
+    codigo = normalizar_codigo_proceso(codigo_proceso)
+    campo = normalizar_clave(campo_logico)
+    try:
+        actualizado = await desactivar_mapeo_campo_proceso(codigo, campo)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "tipo_error": "error_configuracion_bitrix_db"},
+        ) from exc
+    if not actualizado:
+        raise HTTPException(status_code=404, detail={"tipo_error": "campo_no_configurado"})
+    return {
+        "ok": True,
+        "action": "process_field_disabled",
+        "codigo_proceso": codigo,
+        "campo_logico": campo,
+    }
+
+
 @app.post("/bitrix/debug/search-client")
 async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
     """
@@ -10153,8 +10447,6 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
                 mensaje=exc.mensaje,
                 status_code=502,
                 input_variables=input_variables,
-                output_vars=output_vars,
-                contexto_agente=contexto_agente,
                 criteria=criteria,
                 validation=locals().get("validation"),
                 contact=locals().get("contact"),
@@ -10185,8 +10477,6 @@ async def bitrix_debug_search_client(payload: BitrixDebugSearchClientRequest):
                 mensaje=str(exc),
                 status_code=500,
                 input_variables=input_variables,
-                output_vars=output_vars,
-                contexto_agente=contexto_agente,
                 criteria=criteria,
                 validation=locals().get("validation"),
                 contact=locals().get("contact"),
@@ -10217,17 +10507,23 @@ async def call_completed_bitrix(request: Request):
     raw_body = await request.body()
     body_text = raw_body.decode("utf-8", errors="replace")
 
-    logger.info(
-        "JSON entrante (raw) | bytes=%s | body=%s",
-        len(raw_body),
-        body_text,
-    )
+    logger.info("JSON entrante recibido | bytes=%s", len(raw_body))
 
     try:
         incoming_json = json.loads(body_text) if body_text.strip() else {}
+        input_recibido = incoming_json.get("input_variables", {}) if isinstance(incoming_json, dict) else {}
+        extraidas_recibidas = incoming_json.get("extracted_variables", {}) if isinstance(incoming_json, dict) else {}
+        cantidad_extraidas = (
+            len(extraidas_recibidas)
+            if isinstance(extraidas_recibidas, (dict, list))
+            else 0
+        )
         logger.info(
-            "JSON entrante (parseado) | %s",
-            json.dumps(incoming_json, ensure_ascii=False, indent=2, default=str),
+            "JSON entrante parseado | id=%s | status=%s | input_keys=%s | extracted_count=%s",
+            incoming_json.get("id") if isinstance(incoming_json, dict) else None,
+            incoming_json.get("status") if isinstance(incoming_json, dict) else None,
+            sorted(input_recibido.keys()) if isinstance(input_recibido, dict) else [],
+            cantidad_extraidas,
         )
     except json.JSONDecodeError as exc:
         logger.error("JSON entrante invalido | %s", exc)
@@ -10305,7 +10601,22 @@ async def call_completed_bitrix(request: Request):
     ]
 
     output_vars = construir_mapa_variables_salida(extracted_variables)
-    contexto_agente = construir_contexto_agente_universal(input_variables, output_vars)
+    recording_url = limpiar_texto(
+        incoming_json.get("recording_url") or incoming_json.get("recordingUrl")
+    )
+    if recording_url:
+        output_vars["recording_url"] = recording_url
+    codigo_proceso = resolver_codigo_proceso(input_variables, output_vars)
+    if codigo_proceso == "cobranzas":
+        contexto_agente = construir_contexto_agente_universal(input_variables, output_vars)
+        contexto_agente["objetivo"] = codigo_proceso
+    else:
+        contexto_agente = {
+            "origen": limpiar_texto(obtener_variable_entrada(input_variables, "ORIGEN"))
+            or "agente_no_especificado",
+            "objetivo": codigo_proceso,
+            "requiere_bitrix": True,
+        }
     criteria = construir_criterios_busqueda_bitrix(input_variables)
 
     try:
@@ -10314,37 +10625,59 @@ async def call_completed_bitrix(request: Request):
             json.dumps(input_variables, ensure_ascii=False, default=str),
         )
 
+        if codigo_proceso not in PROCESOS_SOPORTADOS:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "action": "failed_call_completed",
+                    "tipo_error": "proceso_no_soportado",
+                    "mensaje": f"Proceso no soportado: {codigo_proceso or 'vacio'}.",
+                    "codigo_proceso": codigo_proceso,
+                    "procesos_soportados": sorted(PROCESOS_SOPORTADOS),
+                },
+            )
+
+        variables_trazabilidad = filtrar_variables_salida_proceso(
+            codigo_proceso,
+            output_vars,
+        )
         logger.info(
-            "Extracted variables validadas y normalizadas | %s",
-            json.dumps(output_vars, ensure_ascii=False, default=str),
+            "Variables del proceso validadas | proceso=%s | variables=%s",
+            codigo_proceso,
+            json.dumps(variables_trazabilidad, ensure_ascii=False, default=str),
         )
 
-        validation = (
-            evaluar_intencion_pago(output_vars)
-            if contexto_agente.get("usa_payvalida")
-            else evaluar_gestion_universal(output_vars, contexto_agente)
+        validation = evaluar_interes_proceso(codigo_proceso, output_vars)
+
+        logger.info(
+            "Contexto proceso | %s",
+            json.dumps(
+                {
+                    clave: valor
+                    for clave, valor in contexto_agente.items()
+                    if codigo_proceso == "cobranzas"
+                    or clave in {"origen", "objetivo", "requiere_bitrix"}
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
         )
 
         logger.info(
-            "Contexto universal agente | %s",
-            json.dumps(contexto_agente, ensure_ascii=False, default=str),
-        )
-
-        logger.info(
-            "Resultado validacion gestion/agente | %s",
+            "Resultado validacion interes/proceso | %s",
             json.dumps(validation, ensure_ascii=False, default=str),
         )
 
         if not validation.get("approved", validation.get("aprobado", False)):
             logger.info(
-                "Validación no aprobada. No se consulta Bitrix | blockers=%s",
+                "Proceso sin interes explicito. No se consulta configuracion ni Bitrix | blockers=%s",
                 json.dumps(validation.get("blockers", validation.get("bloqueadores", [])), ensure_ascii=False, default=str),
             )
 
             return {
                 "ok": True,
-                "action": "skipped_bitrix_lookup",
-                "reason": "La validación de intención de pago no aprobó.",
+                "action": "skipped_no_interest",
                 "validation": validation,
                 "lookup_criteria": criteria.__dict__,
                 "client_found": False,
@@ -10354,10 +10687,51 @@ async def call_completed_bitrix(request: Request):
                 "payment_order_created": False,
                 "payment_order": None,
                 "agent_context": contexto_agente,
+                "codigo_proceso": codigo_proceso,
+                "reason": "El proceso no contiene interes explicito.",
             }
 
+        try:
+            destino_bitrix = await obtener_destino_bitrix_proceso(codigo_proceso)
+            mapeos_campos_bitrix = (
+                await resolver_mapeos_campos_proceso(codigo_proceso)
+                if destino_bitrix is not None
+                else {}
+            )
+        except Exception as exc:
+            logger.error(
+                "Error consultando configuracion Bitrix del proceso | proceso=%s | error=%s",
+                codigo_proceso,
+                str(exc),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "ok": False,
+                    "action": "failed_call_completed",
+                    "tipo_error": "error_configuracion_bitrix_db",
+                    "mensaje": "No fue posible consultar la configuracion Bitrix del proceso.",
+                    "codigo_proceso": codigo_proceso,
+                },
+            ) from exc
+
+        if not destino_bitrix:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ok": False,
+                    "action": "failed_call_completed",
+                    "tipo_error": "ruta_bitrix_no_configurada",
+                    "mensaje": "El proceso no tiene un embudo y etapa activos configurados.",
+                    "codigo_proceso": codigo_proceso,
+                },
+            )
+
         logger.info(
-            "Validación aprobada. Iniciando consulta Bitrix | criteria=%s",
+            "Interes aprobado. Iniciando consulta Bitrix | proceso=%s | category_id=%s | stage_id=%s | criteria=%s",
+            codigo_proceso,
+            destino_bitrix.get("category_id"),
+            destino_bitrix.get("stage_id"),
             json.dumps(criteria.__dict__, ensure_ascii=False, default=str),
         )
 
@@ -10396,12 +10770,13 @@ async def call_completed_bitrix(request: Request):
 
         if CREATE_DEAL_ON_VALID_PAYMENT:
             logger.info(
-                "CREATE_DEAL_ON_VALID_PAYMENT=true. Se procesara gestion universal | contexto=%s",
+                "Creacion de deal habilitada | proceso=%s | contexto=%s",
+                codigo_proceso,
                 json.dumps(contexto_agente, ensure_ascii=False, default=str),
             )
 
             if not contacto_bitrix_valido(contact):
-                logger.error("No se crea orden/deal porque no hay contacto valido con id.")
+                logger.error("No se crea deal porque no hay contacto valido con id.")
                 raise HTTPException(
                     status_code=404,
                     detail=construir_error_webhook_debug(
@@ -10423,7 +10798,7 @@ async def call_completed_bitrix(request: Request):
             try:
                 enlace_pago = None
 
-                if contexto_agente.get("usa_payvalida"):
+                if codigo_proceso == "cobranzas" and contexto_agente.get("usa_payvalida"):
                     solicitud_pago = construir_solicitud_pago_desde_bitrix_sin_deal(
                         input_variables=input_variables,
                         output_vars=output_vars,
@@ -10449,7 +10824,7 @@ async def call_completed_bitrix(request: Request):
 
                     enlace_pago = payment_order_result.get("enlace_pago")
 
-                elif contexto_agente.get("requiere_link_pago"):
+                elif codigo_proceso == "cobranzas" and contexto_agente.get("requiere_link_pago"):
                     if contexto_agente.get("proveedor_pago") == "api_externa":
                         payment_order_result = await procesar_preconsulta_pago_one2credit_desde_evento(
                             variables_entrada=input_variables,
@@ -10484,20 +10859,30 @@ async def call_completed_bitrix(request: Request):
                     variables_entrada=input_variables,
                     variables_salida=output_vars,
                     contacto=contact,
+                    codigo_proceso=codigo_proceso,
+                    destino_bitrix=destino_bitrix,
+                    mapeos_campos=mapeos_campos_bitrix,
                     enlace_pago=enlace_pago,
-                )
-
-                logger.info(
-                    "Deal creado desde webhook con link de pago | %s",
-                    json.dumps(deal_result, ensure_ascii=False, default=str),
                 )
 
                 item_deal_creado = deal_result.get("item") if isinstance(deal_result, dict) else None
                 id_deal_creado = item_deal_creado.get("id") if isinstance(item_deal_creado, dict) else None
+                logger.info(
+                    "Deal creado desde webhook | proceso=%s | id_deal=%s | category_id=%s | stage_id=%s",
+                    codigo_proceso,
+                    id_deal_creado,
+                    destino_bitrix.get("category_id"),
+                    destino_bitrix.get("stage_id"),
+                )
                 if enlace_pago and id_deal_creado:
+                    codigo_campo_link = (
+                        mapeos_campos_bitrix.get("enlace_pago", {}).get("codigo_campo_bitrix")
+                        or "UF_CRM_1779835103174"
+                    )
                     bitrix_link_update = await actualizar_y_verificar_link_pago_en_deal_bitrix(
                         id_deal=int(id_deal_creado),
                         enlace_pago=enlace_pago,
+                        codigo_campo_link=codigo_campo_link,
                         max_intentos=3,
                     )
 
@@ -10517,7 +10902,7 @@ async def call_completed_bitrix(request: Request):
                         bitrix_link_update.get("link_en_bitrix"),
                         bitrix_link_update.get("verificado"),
                     )
-                elif id_deal_creado:
+                elif id_deal_creado and codigo_proceso == "cobranzas":
                     logger.info(
                         "Deal Bitrix creado sin verificacion de link porque no se genero enlace | id_deal=%s",
                         id_deal_creado,
@@ -10585,7 +10970,10 @@ async def call_completed_bitrix(request: Request):
                     ),
                 )
         else:
-            logger.info("CREATE_DEAL_ON_VALID_PAYMENT=false. No se crea deal.")
+            logger.info(
+                "Creacion de deal deshabilitada por configuracion | proceso=%s",
+                codigo_proceso,
+            )
 
         return {
             "ok": True,
@@ -10617,6 +11005,9 @@ async def call_completed_bitrix(request: Request):
             "bitrix_link_verified": bool(bitrix_link_update and bitrix_link_update.get("verificado")),
             "bitrix_link_update": bitrix_link_update,
             "agent_context": contexto_agente,
+            "codigo_proceso": codigo_proceso,
+            "destino_bitrix": destino_bitrix,
+            "mapeos_campos_bitrix": mapeos_campos_bitrix,
         }
 
         if CREATE_DEAL_ON_VALID_PAYMENT:

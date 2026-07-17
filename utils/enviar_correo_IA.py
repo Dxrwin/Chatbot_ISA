@@ -12,6 +12,94 @@ from utils.registrar_bitrix import registrar_en_bitrix
 from utils.whatsapp_service import enviar_whatsapp_renovacion
 from utils.linea_credito_links import obtener_link_por_linea_credito
 import os
+import re
+import unicodedata
+
+def normalizar_texto_correo(valor: Any) -> str:
+    texto = str(valor or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(char for char in texto if not unicodedata.combining(char))
+    return re.sub(r"[\s_-]+", " ", texto).strip()
+
+def normalizar_objetivo_correo(valor: Any) -> str:
+    texto = normalizar_texto_correo(valor)
+    aliases = {
+        "renovacion": "renovacion",
+        "renovaciones": "renovacion",
+        "renovacion credito": "renovacion",
+        "renovacion de credito": "renovacion",
+        "webinar": "webinar",
+        "cobranza": "cobranzas",
+        "cobranzas": "cobranzas",
+    }
+    return aliases.get(texto, texto)
+
+def correo_valido_envio(valor: Any) -> bool:
+    if valor is None:
+        return False
+    texto = str(valor).strip()
+    if not texto:
+        return False
+    patron = r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+    return re.fullmatch(patron, texto) is not None
+
+def _datos_modelo(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(exclude_none=True)
+    if isinstance(obj, dict):
+        return obj
+    return {
+        key: value
+        for key, value in vars(obj).items()
+        if not key.startswith("_") and value is not None
+    }
+
+def obtener_correo_desde_modelo(obj: Any, campos_preferidos: list[str]) -> tuple[str | None, str | None]:
+    datos = _datos_modelo(obj)
+
+    for campo in campos_preferidos:
+        valor = datos.get(campo)
+        if correo_valido_envio(valor):
+            return str(valor).strip(), campo
+
+    for campo, valor in datos.items():
+        nombre = str(campo).lower()
+        if ("correo" in nombre or "email" in nombre) and correo_valido_envio(valor):
+            return str(valor).strip(), str(campo)
+
+    return None, None
+
+def resolver_destinatario_correo(input_vars: Any, extracted_vars: Any) -> tuple[str | None, str]:
+    correo_cliente, fuente_cliente = obtener_correo_desde_modelo(
+        extracted_vars,
+        ["correo_cliente", "correoCliente", "correo", "email", "CORREO", "EMAIL"],
+    )
+    correo_guardado, fuente_guardado = obtener_correo_desde_modelo(
+        input_vars,
+        ["CORREO", "correo", "EMAIL", "email", "Email"],
+    )
+
+    if getattr(extracted_vars, "desicion_correo", None) is False:
+        if correo_cliente:
+            return correo_cliente, f"extracted_variables.{fuente_cliente}"
+        if correo_guardado:
+            return correo_guardado, f"input_variables.{fuente_guardado}"
+        return None, "sin_correo_valido"
+
+    if getattr(extracted_vars, "desicion_correo", None) is True:
+        if correo_guardado:
+            return correo_guardado, f"input_variables.{fuente_guardado}"
+        if correo_cliente:
+            return correo_cliente, f"extracted_variables.{fuente_cliente}"
+        return None, "sin_correo_valido"
+
+    if correo_cliente:
+        return correo_cliente, f"extracted_variables.{fuente_cliente}"
+    if correo_guardado:
+        return correo_guardado, f"input_variables.{fuente_guardado}"
+    return None, "sin_correo_valido"
 
 def obtener_base_url_bitrix_correo() -> str:
     """
@@ -249,30 +337,14 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
     logging.info(f"payloads recibidos: input_vars={input_vars},\n extracted_vars={extracted_vars}")
 
     # 1. DECIDIR DESTINATARIO PRIMERO (antes de validaciones)
-    destinatario = None
+    destinatario, fuente_destinatario = resolver_destinatario_correo(input_vars, extracted_vars)
     interes_renovar_str = None
-    
-    if extracted_vars.desicion_correo is True:
-        destinatario = input_vars.CORREO
-        logging.info(f"Usando correo guardado (desicion_correo=True): {destinatario}")
-    elif extracted_vars.desicion_correo is False:
-        # Si el cliente proporciono correo, usarlo; si no, usar el guardado
-        correo_cliente = getattr(extracted_vars, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
-            destinatario = correo_cliente
-            logging.info(f"Usando correo proporcionado por cliente (desicion_correo=False): {destinatario}")
-        else:
-            destinatario = input_vars.CORREO
-            logging.info(f"Correo cliente vacio, usando correo guardado por defecto: {destinatario}")
-    else:
-        # Si desicion_correo no se proporciona, intentar correo_cliente; si no, usar guardado
-        correo_cliente = getattr(extracted_vars, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
-            destinatario = correo_cliente
-            logging.info(f"desicion_correo no definido, usando correo_cliente: {destinatario}")
-        else:
-            destinatario = input_vars.CORREO
-            logging.info(f"desicion_correo no definido y correo_cliente vacio, usando correo guardado: {destinatario}")
+    logging.info(
+        "Destinatario resuelto para renovacion | correo=%s | fuente=%s | desicion_correo=%s",
+        destinatario,
+        fuente_destinatario,
+        extracted_vars.desicion_correo,
+    )
 
     if not destinatario:
         logging.warning("No hay destinatario disponible.")
@@ -295,6 +367,16 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
     intrsrenovarbool_value = extracted_vars.intrsrenovarbool
     ambiguedad_value = extracted_vars.ambiguedad
     interes_renovar_value = extracted_vars.interes_renovar
+    objetivo_value = normalizar_objetivo_correo(
+        getattr(extracted_vars, "objetivo", None)
+        or getattr(input_vars, "SEGMENTO_CAMPANA", None)
+        or ""
+    )
+    requseguimiento_value = normalizar_texto_correo(getattr(extracted_vars, "requseguimiento", ""))
+    aceptainfocorreo_value = getattr(extracted_vars, "aceptainfocorreo", None)
+    seguimiento_positivo = requseguimiento_value in {"si", "true", "1", "yes", "requiere", "requerido"}
+    seguimiento_negativo = requseguimiento_value in {"no", "false", "0", "not", "no requiere", "no requerido"}
+    no_autorizo_correo = aceptainfocorreo_value is False
     
     # Convertir interes_renovar a string para comparación
     if interes_renovar_value is not None:
@@ -318,9 +400,34 @@ async def procesar_webhook_renovacion(payload: WebhookPayload) -> Dict[str, Any]
     elif intrsrenovarbool_value is True:
         enviar_correo = True
         logging.info(f"Enviando correo: intrsrenovarbool=True")
+
+    elif objetivo_value == "renovacion" and seguimiento_positivo:
+        enviar_correo = True
+        logging.info("Enviando correo: objetivo=renovacion y requseguimiento positivo")
     
     else:
         # No se cumplen las condiciones para enviar correo
+        if no_autorizo_correo or seguimiento_negativo:
+            motivo_no_envio = (
+                "El cliente no autorizo envio de informacion por correo."
+                if no_autorizo_correo
+                else "La variable requseguimiento indica que no se requiere envio de correo."
+            )
+            logging.info(
+                "%s Cliente: %s, destinatario disponible: %s",
+                motivo_no_envio,
+                input_vars.NOMBRE_TITULAR,
+                bool(destinatario),
+            )
+            return {
+                "status": "success",
+                "message": motivo_no_envio,
+                "correo_enviado": False,
+                "destinatario": destinatario,
+                "intentos_correo": 0,
+                "motivo_no_envio": motivo_no_envio,
+            }
+
         if not destinatario:
             mensaje_error = "No se pudo enviar correo por falta de destinatario."
             logging.warning(f" {mensaje_error}")
@@ -558,36 +665,16 @@ async def procesar_webhook_webinar(payload: WebhookPayload) -> Dict[str, Any]:
     logging.info(f"variables extraidas : resumen{variables_extraidas.resumen} \n comentario_libre: {variables_extraidas.comentario_libre} \n contesto_llamada: {variables_extraidas.contesto_llamada} \n estado: {variables_extraidas.estado} \n desicion_correo: {variables_extraidas.desicion_correo} \n correo_cliente: {getattr(variables_extraidas, 'correo_cliente', None)} \n interes_corre {variables_extraidas.interes_correo} \n objetivo: {variables_extraidas.objetivo} \n primer_name: {variables_extraidas.primer_name} ")
 
     # 1. DECIDIR DESTINATARIO PRIMERO
-    destinatario = None
-    
-    if variables_extraidas.desicion_correo is True:
-        destinatario = variables_entrada.EMAIL
-        logging.info(f"Usando correo guardado (desicion_correo=True): {destinatario}")
-    elif variables_extraidas.desicion_correo is False:
-        # Si el cliente proporciono correo, usarlo; si no, usar el guardado
-        correo_cliente = getattr(variables_extraidas, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
-            destinatario = correo_cliente
-            logging.info(f"Usando correo proporcionado por cliente (desicion_correo=False): {destinatario}")
-        else:
-            destinatario = variables_entrada.EMAIL
-            logging.info(f"Correo cliente vacio, usando correo guardado por defecto: {destinatario}")
-            await insertar_log(
-                method_name="procesar_webhook_webinar",
-                client_id=variables_entrada.Nombre,
-                error_message=f"Correo cliente vacio, usando correo guardado por defecto: {destinatario}",
-                http_code=200,
-                tipo="info"
-            )
-    else:
-        # Si desicion_correo no se proporciona, intentar correo_cliente; si no, usar guardado
-        correo_cliente = getattr(variables_extraidas, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
-            destinatario = correo_cliente
-            logging.info(f"desicion_correo no definido, usando correo_cliente: {destinatario}")
-        else:
-            destinatario = variables_entrada.EMAIL
-            logging.info(f"desicion_correo no definido y correo_cliente vacio, usando correo guardado: {destinatario}")
+    destinatario, fuente_destinatario = resolver_destinatario_correo(
+        variables_entrada,
+        variables_extraidas,
+    )
+    logging.info(
+        "Destinatario resuelto para webinar | correo=%s | fuente=%s | desicion_correo=%s",
+        destinatario,
+        fuente_destinatario,
+        variables_extraidas.desicion_correo,
+    )
 
     if not destinatario:
         logging.warning("No hay destinatario disponible.")
@@ -791,7 +878,7 @@ async def procesar_llamada_renovacion_Y_refinanciamiento(payload: WebhookPayload
     
     # Preparar variables necesarias
     nombre_cliente = getattr(input_vars, "NOMBRE_TITULAR", None) or getattr(input_vars, "Nombre", None) or "Cliente"
-    destinatario = getattr(input_vars, "CORREO", None) or getattr(input_vars, "EMAIL", None)
+    destinatario, fuente_destinatario = resolver_destinatario_correo(input_vars, extracted_vars)
     numero_telefono = getattr(input_vars, "Celular", None) or getattr(input_vars, "Contacto", None)
     #linea_universitaria = getattr(input_vars, "LINEA_CREDITO", None) or getattr(extracted_vars, "objetivo", None)
     
@@ -801,14 +888,14 @@ async def procesar_llamada_renovacion_Y_refinanciamiento(payload: WebhookPayload
         logging.info(f"Usando correo guardado (desicion_correo=True): {destinatario}")
     elif extracted_vars.desicion_correo is False:
         correo_cliente = getattr(extracted_vars, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
+        if correo_valido_envio(correo_cliente):
             destinatario = correo_cliente
             logging.info(f"Usando correo cliente (desicion_correo=False): {destinatario}")
         else:
             logging.info(f"Correo cliente vacío, usando guardado por defecto")
     else:
         correo_cliente = getattr(extracted_vars, "correo_cliente", None)
-        if correo_cliente and str(correo_cliente).strip():
+        if correo_valido_envio(correo_cliente):
             destinatario = correo_cliente
             logging.info(f"Correo cliente: {destinatario}")
     
@@ -1250,7 +1337,7 @@ async def procesar_webhook_cobranzas(payload: WebhookPayload) -> Dict[str, Any]:
     """
     var_in = payload.input_variables
     var_ex = payload.extracted_variables
-    nombre_cliente = var_in.Nombre or "Cliente No Identificado"
+    nombre_cliente = var_in.Nombre or var_in.NOMBRE_TITULAR or "Cliente No Identificado"
     
     # [LOG] Trazamos el estado general para saber con qué estamos lidiando
     logging.info(f"[COBRANZAS] Iniciando análisis para {nombre_cliente}. Objetivo: {var_ex.objetivo}")
@@ -1280,15 +1367,13 @@ async def procesar_webhook_cobranzas(payload: WebhookPayload) -> Dict[str, Any]:
     # =======================================================
     # PASO 2: RESOLVER EL DESTINATARIO (Igual que antes, blindado)
     # =======================================================
-    destinatario = None
-    if var_ex.desicion_correo is True:
-        destinatario = var_in.EMAIL
-    elif var_ex.desicion_correo is False:
-        correo_cliente = getattr(var_ex, "correo_cliente", None)
-        destinatario = correo_cliente if correo_cliente and str(correo_cliente).strip() else var_in.EMAIL
-    else:
-        correo_cliente = getattr(var_ex, "correo_cliente", None)
-        destinatario = correo_cliente if correo_cliente and str(correo_cliente).strip() else var_in.EMAIL
+    destinatario, fuente_destinatario = resolver_destinatario_correo(var_in, var_ex)
+    logging.info(
+        "[COBRANZAS] Destinatario resuelto | correo=%s | fuente=%s | desicion_correo=%s",
+        destinatario,
+        fuente_destinatario,
+        var_ex.desicion_correo,
+    )
 
     if not destinatario:
         logging.error(f"[COBRANZAS] Sin destinatario para {nombre_cliente}. Abortando.")

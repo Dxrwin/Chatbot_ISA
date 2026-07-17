@@ -9,11 +9,16 @@ package.json
 dist/
 __pycache__/
 
+documentacion/
+tests/
+sql/
+
 # Compiled Java class files
 *.class
 
 # Compiled Python bytecode
 *.py[cod]
+*.pyc
 
 # Log files
 *.log
