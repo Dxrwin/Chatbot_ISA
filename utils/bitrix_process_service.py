@@ -14,6 +14,22 @@ from utils.config import settings
 
 PROCESOS_SOPORTADOS = frozenset({"renovaciones", "cobranzas"})
 
+LINKS_RENOVACION_POR_UNIVERSIDAD = {
+    "cuc": "https://one2credit-app.kuenta.co/product/f1310155-624b-4e6f-9055-b50394b1e457",
+    "unibarranquilla": "https://one2credit-app.kuenta.co/product/55b65c52-109d-4507-840e-6eff589b6293",
+    "uninorte": "https://one2credit-app.kuenta.co/product/85dee14a-cf4c-4303-910b-458604573411",
+    "areandina": "https://www.one2credit.com/solicitar-credito/",
+    "america": "https://one2credit-app.kuenta.co/product/8e811fa4-0c54-47d6-8f75-9d26d1c7966c",
+    "eafit": "https://one2credit-app.kuenta.co/product/97c29b7d-08a6-4d8b-951b-9bfbb519eda6",
+    "ean": "https://one2credit-app.kuenta.co/product/85044138-6a7c-4909-bbca-27614393a30d",
+    "rafael_nunez": "https://www.one2credit.com/solicitar-credito/",
+    "reformada": "https://one2credit-app.kuenta.co/product/9be0fd2c-50d7-4056-9bb3-904dc1abd7e8",
+    "usb_bogota": "https://one2credit-app.kuenta.co/product/7057ee14-1171-453d-81b9-a83c66013205",
+    "usb_cali": "https://one2credit-app.kuenta.co/product/afb4d6c7-7e72-4823-bfcf-d96e70b24361",
+    "usb_cartagena": "https://one2credit-app.kuenta.co/product/52040a4b-ae61-4b90-b8a6-8ad3989eff10",
+    "utb": "https://one2credit-app.kuenta.co/product/38c6fb6f-ea0f-4902-a157-4f2d23a94e55",
+}
+
 VARIABLES_SALIDA_POR_PROCESO = {
     "renovaciones": frozenset(
         {
@@ -102,6 +118,18 @@ MAPEOS_CAMPOS_PREDETERMINADOS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "valor_positivo": None,
             "valor_negativo": None,
         },
+        "universidad": {
+            "codigo_campo_bitrix": "UF_CRM_1784320678053",
+            "tipo_campo": "texto",
+            "valor_positivo": None,
+            "valor_negativo": None,
+        },
+        "link_universidad": {
+            "codigo_campo_bitrix": "UF_CRM_1784320735188",
+            "tipo_campo": "texto",
+            "valor_positivo": None,
+            "valor_negativo": None,
+        },
     },
     "cobranzas": {
         "pagaduria": {"codigo_campo_bitrix": "UF_CRM_1773780818920", "tipo_campo": "texto"},
@@ -140,6 +168,24 @@ def _normalizar_texto(valor: Any) -> str:
     if isinstance(valor, bool):
         return "true" if valor else "false"
     return _normalizar_clave(valor)
+
+
+def obtener_link_renovacion_universidad(universidad: Any) -> Optional[str]:
+    """Resuelve el enlace de renovacion tolerando prefijos, tildes y mayusculas."""
+    normalizada = _normalizar_clave(universidad)
+    if not normalizada:
+        return None
+
+    candidatas = [normalizada]
+    for prefijo in ("universidad_de_", "universidad_"):
+        if normalizada.startswith(prefijo):
+            candidatas.append(normalizada[len(prefijo):])
+
+    for candidata in candidatas:
+        enlace = LINKS_RENOVACION_POR_UNIVERSIDAD.get(candidata)
+        if enlace:
+            return enlace
+    return None
 
 
 def _texto(valor: Any) -> Optional[str]:
@@ -685,6 +731,8 @@ def construir_campos_deal_renovaciones(
     whatsapp = _obtener(variables_salida, "whasapinformado", "whatsappinformado", "whatsapp_informado")
     acepta_correo = _obtener(variables_salida, "aceptainfocorreo", "aceptoinfocorreo", "acepta_info_correo")
     recording_url = _texto(_obtener(variables_salida, "recording_url"))
+    universidad = _texto(_obtener(variables_entrada, "UNIVERSIDAD"))
+    link_universidad = obtener_link_renovacion_universidad(universidad)
     comentarios = "\n".join(
         [
             "PROCESO: renovaciones",
@@ -729,6 +777,8 @@ def construir_campos_deal_renovaciones(
     _aplicar_campo_configurado(campos, mapeos, "identificacion_cliente", identificacion)
     _aplicar_campo_configurado(campos, mapeos, "interes_texto", interes, booleano=True)
     _aplicar_campo_configurado(campos, mapeos, "recording_url", recording_url)
+    _aplicar_campo_configurado(campos, mapeos, "universidad", universidad)
+    _aplicar_campo_configurado(campos, mapeos, "link_universidad", link_universidad)
     return campos
 
 
