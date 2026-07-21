@@ -49,6 +49,7 @@ from utils.bitrix_payvalida_mapper import (
     construir_solicitud_pago_desde_bitrix_sin_deal,
 )
 from utils.bitrix_process_service import (
+    CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES_DEPRECADO,
     MAPEOS_CAMPOS_PREDETERMINADOS,
     PROCESOS_SOPORTADOS,
     asignar_destino_bitrix_proceso,
@@ -10286,6 +10287,21 @@ async def configurar_campo_proceso_bitrix(
                 "ok": False,
                 "tipo_error": "campo_logico_no_soportado",
                 "campos_soportados": campos_logicos_soportados(codigo),
+            },
+        )
+    if (
+        codigo == "renovaciones"
+        and campo == "universidad"
+        and payload.codigo_campo_bitrix
+        == CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES_DEPRECADO
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "campo_bitrix_deprecado",
+                "mensaje": "El campo de texto anterior para universidad ya no puede utilizarse.",
+                "codigo_campo_bitrix": payload.codigo_campo_bitrix,
             },
         )
     try:

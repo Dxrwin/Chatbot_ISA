@@ -14,6 +14,9 @@ from utils.config import settings
 
 PROCESOS_SOPORTADOS = frozenset({"renovaciones", "cobranzas"})
 
+CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES = "UF_CRM_65B80ADCB9303"
+CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES_DEPRECADO = "UF_CRM_1784320678053"
+
 LINKS_RENOVACION_POR_UNIVERSIDAD = {
     "cuc": "https://one2credit-app.kuenta.co/product/f1310155-624b-4e6f-9055-b50394b1e457",
     "unibarranquilla": "https://one2credit-app.kuenta.co/product/55b65c52-109d-4507-840e-6eff589b6293",
@@ -28,6 +31,36 @@ LINKS_RENOVACION_POR_UNIVERSIDAD = {
     "usb_cali": "https://one2credit-app.kuenta.co/product/afb4d6c7-7e72-4823-bfcf-d96e70b24361",
     "usb_cartagena": "https://one2credit-app.kuenta.co/product/52040a4b-ae61-4b90-b8a6-8ad3989eff10",
     "utb": "https://one2credit-app.kuenta.co/product/38c6fb6f-ea0f-4902-a157-4f2d23a94e55",
+}
+
+IDS_BITRIX_UNIVERSIDAD_RENOVACIONES = {
+    "unibarranquilla": 570,
+    "areandina": 572,
+    "eafit": 2182,
+    "ean": 574,
+    "rafael_nunez": 2184,
+    "reformada": 1738,
+    "cuc": 576,
+    "usb_cali": 578,
+    "usb_cartagena": 2186,
+    "usb_bogota": 584,
+    "usb_medellin": 590,
+    "utb": 2016,
+    "uninorte": 2188,
+    "america": 2190,
+    "mariana": 2192,
+    "lcn_idiomas": 3468,
+}
+
+ALIAS_UNIVERSIDAD_RENOVACIONES = {
+    "uni_reformada": "reformada",
+    "universidad_reformada": "reformada",
+    "universidad_rafael_nunez": "rafael_nunez",
+    "universidad_areandina": "areandina",
+    "universidad_eafit": "eafit",
+    "universidad_ean": "ean",
+    "universidad_mariana": "mariana",
+    "universidad_de_america": "america",
 }
 
 VARIABLES_SALIDA_POR_PROCESO = {
@@ -119,8 +152,8 @@ MAPEOS_CAMPOS_PREDETERMINADOS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "valor_negativo": None,
         },
         "universidad": {
-            "codigo_campo_bitrix": "UF_CRM_1784320678053",
-            "tipo_campo": "texto",
+            "codigo_campo_bitrix": CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES,
+            "tipo_campo": "lista",
             "valor_positivo": None,
             "valor_negativo": None,
         },
@@ -170,11 +203,11 @@ def _normalizar_texto(valor: Any) -> str:
     return _normalizar_clave(valor)
 
 
-def obtener_link_renovacion_universidad(universidad: Any) -> Optional[str]:
-    """Resuelve el enlace de renovacion tolerando prefijos, tildes y mayusculas."""
+def normalizar_codigo_universidad_renovaciones(universidad: Any) -> str:
+    """Normaliza nombres de universidad a una clave estable de negocio."""
     normalizada = _normalizar_clave(universidad)
     if not normalizada:
-        return None
+        return ""
 
     candidatas = [normalizada]
     for prefijo in ("universidad_de_", "universidad_"):
@@ -182,9 +215,26 @@ def obtener_link_renovacion_universidad(universidad: Any) -> Optional[str]:
             candidatas.append(normalizada[len(prefijo):])
 
     for candidata in candidatas:
-        enlace = LINKS_RENOVACION_POR_UNIVERSIDAD.get(candidata)
-        if enlace:
-            return enlace
+        canonica = ALIAS_UNIVERSIDAD_RENOVACIONES.get(candidata, candidata)
+        if (
+            canonica in IDS_BITRIX_UNIVERSIDAD_RENOVACIONES
+            or canonica in LINKS_RENOVACION_POR_UNIVERSIDAD
+        ):
+            return canonica
+    return ALIAS_UNIVERSIDAD_RENOVACIONES.get(normalizada, normalizada)
+
+
+def obtener_id_bitrix_universidad_renovaciones(universidad: Any) -> Optional[int]:
+    """Obtiene el ID de la opcion de lista Bitrix correspondiente."""
+    codigo = normalizar_codigo_universidad_renovaciones(universidad)
+    return IDS_BITRIX_UNIVERSIDAD_RENOVACIONES.get(codigo)
+
+
+def obtener_link_renovacion_universidad(universidad: Any) -> Optional[str]:
+    """Resuelve el enlace de renovacion a partir de la misma clave canonica."""
+    codigo = normalizar_codigo_universidad_renovaciones(universidad)
+    if codigo:
+        return LINKS_RENOVACION_POR_UNIVERSIDAD.get(codigo)
     return None
 
 
@@ -618,8 +668,16 @@ async def resolver_mapeos_campos_proceso(
         if not bool(fila.get("activo")):
             resueltos.pop(campo, None)
             continue
+        codigo_campo = str(fila.get("codigo_campo_bitrix") or "").strip().upper()
+        if (
+            codigo == "renovaciones"
+            and campo == "universidad"
+            and codigo_campo == CAMPO_BITRIX_UNIVERSIDAD_RENOVACIONES_DEPRECADO
+        ):
+            # Una configuracion antigua no puede reactivar el campo de texto retirado.
+            continue
         resueltos[campo] = {
-            "codigo_campo_bitrix": fila.get("codigo_campo_bitrix"),
+            "codigo_campo_bitrix": codigo_campo,
             "tipo_campo": fila.get("tipo_campo"),
             "valor_positivo": fila.get("valor_positivo"),
             "valor_negativo": fila.get("valor_negativo"),
@@ -732,6 +790,7 @@ def construir_campos_deal_renovaciones(
     acepta_correo = _obtener(variables_salida, "aceptainfocorreo", "aceptoinfocorreo", "acepta_info_correo")
     recording_url = _texto(_obtener(variables_salida, "recording_url"))
     universidad = _texto(_obtener(variables_entrada, "UNIVERSIDAD"))
+    universidad_id_bitrix = obtener_id_bitrix_universidad_renovaciones(universidad)
     link_universidad = obtener_link_renovacion_universidad(universidad)
     comentarios = "\n".join(
         [
@@ -777,7 +836,7 @@ def construir_campos_deal_renovaciones(
     _aplicar_campo_configurado(campos, mapeos, "identificacion_cliente", identificacion)
     _aplicar_campo_configurado(campos, mapeos, "interes_texto", interes, booleano=True)
     _aplicar_campo_configurado(campos, mapeos, "recording_url", recording_url)
-    _aplicar_campo_configurado(campos, mapeos, "universidad", universidad)
+    _aplicar_campo_configurado(campos, mapeos, "universidad", universidad_id_bitrix)
     _aplicar_campo_configurado(campos, mapeos, "link_universidad", link_universidad)
     return campos
 
