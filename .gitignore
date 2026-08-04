@@ -11,7 +11,11 @@ __pycache__/
 
 documentacion/
 tests/
+!tests/
+tests/*
+!tests/test_pagos_mora_cuota_inicial.py
 sql/
+tests*
 
 # Compiled Java class files
 *.class

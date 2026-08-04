@@ -263,6 +263,7 @@ class InstallmentOrderCreateRequest(BaseModel):
     amount: int | float
     provider: str
     collectionCosts: int | float = 0
+    key: Optional[str] = None
 
 
 # Modelos para las solicitudes
@@ -2325,6 +2326,8 @@ async def create_installment_order(
         "date": obtener_fecha_iso_bogota(),
         "collectionCosts": payload.collectionCosts,
     }
+    if payload.key:
+        outbound_payload["key"] = payload.key
 
     logger.info(
         f"Creando orden de cuota. credit_id={id_credito_mora}, "
@@ -5614,6 +5617,104 @@ def numero_cuota_int(installment: Dict[str, Any]) -> int:
     return to_int(installment.get("number"))
 
 
+def buscar_flow_payment_cuota_inicial(credito: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    flow_payments = credito.get("flowPayments") if isinstance(credito.get("flowPayments"), list) else []
+    for flow_payment in flow_payments:
+        if not isinstance(flow_payment, dict):
+            continue
+        key = str(flow_payment.get("key") or "").strip().lower()
+        payment_type = str(flow_payment.get("type") or "").strip().lower()
+        if key == "cuota_inicial" or payment_type == "initial_fee":
+            return flow_payment
+    return None
+
+
+def evaluar_cuota_inicial_mora(
+    credito: Dict[str, Any],
+    installments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    alertas: List[str] = []
+    estados = [status_cuota_int(installment) for installment in installments]
+    cuotas_inactivas = sum(1 for estado in estados if estado == 0)
+    todas_las_cuotas_inactivas = bool(installments) and cuotas_inactivas == len(installments)
+
+    flow_payment = buscar_flow_payment_cuota_inicial(credito)
+    registro_encontrado = isinstance(flow_payment, dict)
+    flow_payment = flow_payment or {}
+    valor_flow_presente = registro_encontrado and "amount" in flow_payment
+    valor_flow_decimal = convertir_decimal_cuota(flow_payment.get("amount")) if registro_encontrado else None
+    valor_flow_invalido = valor_flow_presente and valor_flow_decimal is None
+    valor_initial_fee_decimal = convertir_decimal_cuota(credito.get("initialFee"))
+    valor_decimal = valor_flow_decimal if valor_flow_decimal is not None else valor_initial_fee_decimal
+    valor_original = normalizar_valor_original_cuota(valor_decimal)
+    valor_redondeado = redondear_valor_cuota(valor_decimal)
+    approved_original = flow_payment.get("approved") if registro_encontrado else None
+    approved = approved_original is True
+
+    if not registro_encontrado:
+        estado = "sin_registro"
+    elif approved:
+        estado = "pagada"
+    else:
+        estado = "pendiente"
+
+    valores_difieren = bool(
+        valor_flow_decimal is not None
+        and valor_initial_fee_decimal is not None
+        and valor_flow_decimal != valor_initial_fee_decimal
+    )
+    if valores_difieren:
+        alertas.append("flowPayments.cuota_inicial.amount difiere de initialFee")
+    if valor_flow_invalido:
+        alertas.append("flowPayments.cuota_inicial.amount no es un importe valido")
+
+    if todas_las_cuotas_inactivas:
+        if not registro_encontrado:
+            alertas.append("cuotas inactivas sin registro flowPayments para cuota inicial")
+        elif approved:
+            alertas.append("cuota inicial pagada; cuotas pendientes de activacion")
+        elif valor_decimal is None or valor_decimal <= 0:
+            alertas.append("cuota inicial pendiente sin importe valido para crear orden")
+
+    orden_habilitada = bool(
+        todas_las_cuotas_inactivas
+        and registro_encontrado
+        and not approved
+        and valor_decimal is not None
+        and valor_decimal > 0
+        and not valores_difieren
+        and not valor_flow_invalido
+    )
+    evidencia = []
+    if registro_encontrado:
+        evidencia.append("data.credit.flowPayments[key=cuota_inicial|type=initial_fee]")
+    if valor_flow_decimal is None and valor_initial_fee_decimal is not None:
+        evidencia.append("data.credit.initialFee como fallback")
+
+    return {
+        "aplica": bool(registro_encontrado or valor_initial_fee_decimal is not None),
+        "registro_encontrado": registro_encontrado,
+        "key": flow_payment.get("key") or "cuota_inicial",
+        "type": flow_payment.get("type") or "initial_fee",
+        "estado": estado,
+        "approved": approved,
+        "approved_original": approved_original,
+        "approvedAt": flow_payment.get("approvedAt"),
+        "orderId": flow_payment.get("orderId"),
+        "amount": valor_original,
+        "amount_redondeado": valor_redondeado,
+        "amount_legible": money(valor_redondeado),
+        "fuente_amount": "flowPayments.amount" if valor_flow_decimal is not None else "initialFee",
+        "cuotas_inactivas_estado_0": cuotas_inactivas,
+        "todas_las_cuotas_inactivas": todas_las_cuotas_inactivas,
+        "orden_habilitada": orden_habilitada,
+        "id_cuota_orden": "zero" if orden_habilitada else None,
+        "key_orden": "cuota_inicial" if orden_habilitada else None,
+        "evidencia_utilizada": evidencia,
+        "alertas_integridad": alertas,
+    }
+
+
 def valor_original_para_json(value: Any) -> Any:
     return normalizar_valor_original_cuota(value)
 
@@ -5762,6 +5863,8 @@ def construir_data_pagos_mora_oficial(
     )
     resumen_kuenta = credito.get("summary") if isinstance(credito.get("summary"), dict) else {}
     credito_id = credito.get("ID") or credito.get("id") or ""
+    cuota_inicial = evaluar_cuota_inicial_mora(credito, installments)
+    alertas_integridad.extend(cuota_inicial.get("alertas_integridad") or [])
     if not installments:
         alertas_integridad.append("installments vacio")
     if credito_id and not consulta_por_cedula and str(credito_id) != str(id_credito_solicitado):
@@ -5774,11 +5877,46 @@ def construir_data_pagos_mora_oficial(
     cuotas_pendientes_raw = [i for i in installments if status_cuota_int(i) == 3]
     cuotas_vencidas_raw = [i for i in installments if status_cuota_int(i) == 4]
     cuota_pendiente_raw = cuotas_pendientes_raw[0] if cuotas_pendientes_raw else None
-    if not cuota_pendiente_raw:
+    if not cuota_pendiente_raw and not cuota_inicial.get("todas_las_cuotas_inactivas"):
         alertas_integridad.append("cuota_pendiente no encontrada")
 
     dias_atraso = calcular_dias_atraso_oficial(installments, resumen_kuenta)
     pago_pendiente = construir_pago_pendiente_oficial(cuota_pendiente_raw, dias_atraso)
+    pago_prioritario = None
+    if (
+        cuota_inicial.get("todas_las_cuotas_inactivas")
+        and cuota_inicial.get("registro_encontrado")
+        and not cuota_inicial.get("approved")
+    ):
+        pago_prioritario = {
+            "tipo": "cuota_inicial",
+            "estado": "pendiente",
+            "key": "cuota_inicial",
+            "id_credito": credito_id,
+            "id_cuota_orden": cuota_inicial.get("id_cuota_orden"),
+            "key_orden": cuota_inicial.get("key_orden"),
+            "orden_habilitada": bool(cuota_inicial.get("orden_habilitada")),
+            "valor_total_pagar": cuota_inicial.get("amount"),
+            "valor_total_redondeado": cuota_inicial.get("amount_redondeado"),
+            "valor_total_legible": cuota_inicial.get("amount_legible"),
+            "motivo": "Las cuotas estan inactivas hasta registrar el pago de la cuota inicial.",
+        }
+    elif pago_pendiente:
+        pago_prioritario = {
+            "tipo": "cuota",
+            "estado": pago_pendiente.get("estado_cuota"),
+            "id_credito": credito_id,
+            "id_cuota_orden": pago_pendiente.get("id"),
+            "key_orden": None,
+            "orden_habilitada": bool(pago_pendiente.get("id")),
+            "numero_de_cuota": pago_pendiente.get("numero_de_cuota"),
+            "fecha_pago": pago_pendiente.get("fecha_pago"),
+            "fecha_pago_legible": pago_pendiente.get("fecha_pago_legible"),
+            "valor_total_pagar": pago_pendiente.get("valor_total_pagar"),
+            "valor_total_redondeado": pago_pendiente.get("valor_total_redondeado"),
+            "valor_total_legible": pago_pendiente.get("valor_total_legible"),
+            "motivo": "Primera cuota en estado pendiente disponible para pago.",
+        }
     detalle_cuotas = [construir_detalle_cuota_oficial(i) for i in installments]
     cuotas_vencidas = [construir_detalle_cuota_oficial(i) for i in cuotas_vencidas_raw]
 
@@ -5828,10 +5966,13 @@ def construir_data_pagos_mora_oficial(
             "total_cuotas": total_cuotas,
             "cuotas_pagadas": len(cuotas_pagadas_raw),
             "cuotas_pendientes_total": len(cuotas_pendientes_raw) + len(cuotas_vencidas_raw),
+            "inactivas_estado_0": cuota_inicial.get("cuotas_inactivas_estado_0", 0),
             "pendientes_estado_3": len(cuotas_pendientes_raw),
             "vencidos_estado_4": len(cuotas_vencidas_raw),
             "dias_de_atraso": dias_atraso,
         },
+        "cuota_inicial": cuota_inicial,
+        "pago_prioritario": pago_prioritario,
         "pago_pendiente": pago_pendiente,
         "cuotas_vencidas": cuotas_vencidas,
         "detalle_cuotas": detalle_cuotas,
@@ -5853,12 +5994,13 @@ def construir_data_pagos_mora_oficial(
         "total_cuotas": total_cuotas,
         "cuotas_pagadas": len(cuotas_pagadas_raw),
         "cuotas_pendientes_total": len(cuotas_pendientes_raw) + len(cuotas_vencidas_raw),
+        "inactivas_estado_0": cuota_inicial.get("cuotas_inactivas_estado_0", 0),
         "dias_de_atraso": dias_atraso,
         "pendientes_estado_3": len(cuotas_pendientes_raw),
         "vencidos_estado_4": len(cuotas_vencidas_raw),
     }
     return {
-        "source_of_truth": "data.credit.installments",
+        "source_of_truth": "data.credit.flowPayments + data.credit.installments",
         "alertas_integridad": alertas_integridad,
         "data": data,
     }
@@ -5909,6 +6051,8 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
     data = payload_oficial.get("data") if isinstance(payload_oficial.get("data"), dict) else {}
     credito = data.get("credito") if isinstance(data.get("credito"), dict) else {}
     resumen = data.get("resumen") if isinstance(data.get("resumen"), dict) else {}
+    cuota_inicial = data.get("cuota_inicial") if isinstance(data.get("cuota_inicial"), dict) else {}
+    pago_prioritario = data.get("pago_prioritario") if isinstance(data.get("pago_prioritario"), dict) else {}
     pago_pendiente = data.get("pago_pendiente") if isinstance(data.get("pago_pendiente"), dict) else {}
     detalle_cuotas = data.get("detalle_cuotas") if isinstance(data.get("detalle_cuotas"), list) else []
     cuotas_vencidas = data.get("cuotas_vencidas") if isinstance(data.get("cuotas_vencidas"), list) else []
@@ -5940,7 +6084,7 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
     )
     contexto_ia = (
         "Resumen de pagos One2Credit\n\n"
-        "Fuente oficial: data.credit.installments\n"
+        "Fuente oficial: data.credit.flowPayments + data.credit.installments\n"
         f"Credito consultado: {text_value(credito.get('id'), 'N/A')}\n"
         f"Linea: {text_value(credito.get('linea'), 'N/A')}\n\n"
         "Seleccion de credito:\n"
@@ -5954,9 +6098,19 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         f"Total cuotas: {text_value(resumen.get('total_cuotas'), '0')}\n"
         f"Cuotas pagadas: {text_value(resumen.get('cuotas_pagadas'), '0')}\n"
         f"Cuotas pendientes o vencidas: {text_value(resumen.get('cuotas_pendientes_total'), '0')}\n"
+        f"Cuotas inactivas estado 0: {text_value(resumen.get('inactivas_estado_0'), '0')}\n"
         f"Cuotas pendientes estado 3: {text_value(resumen.get('pendientes_estado_3'), '0')}\n"
         f"Cuotas vencidas estado 4: {text_value(resumen.get('vencidos_estado_4'), '0')}\n"
         f"Dias de atraso: {text_value(resumen.get('dias_de_atraso'), '0')}\n\n"
+        "Cuota inicial:\n"
+        f"Estado: {text_value(cuota_inicial.get('estado'), 'N/A')}\n"
+        f"Pago aprobado: {text_value(cuota_inicial.get('approved'), 'False')}\n"
+        f"Valor: {text_value(cuota_inicial.get('amount_legible'), '$0')}\n"
+        f"Orden habilitada: {text_value(cuota_inicial.get('orden_habilitada'), 'False')}\n\n"
+        "Pago prioritario:\n"
+        f"Tipo: {text_value(pago_prioritario.get('tipo'), 'N/A')}\n"
+        f"Valor: {text_value(pago_prioritario.get('valor_total_legible'), '$0')}\n"
+        f"Motivo: {text_value(pago_prioritario.get('motivo'), 'N/A')}\n\n"
         "Cuota pendiente a gestionar:\n"
         f"Numero cuota: {text_value(pago_pendiente.get('numero_de_cuota'), 'N/A')}\n"
         f"Estado cuota: {text_value(pago_pendiente.get('estado_cuota'), 'N/A')}\n"
@@ -5971,23 +6125,28 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "Regla para ISA:\n"
         f"No inventar cuotas. No mencionar cuotas mayores a {text_value(credito.get('max_numero_cuota'), '0')}. "
         "No usar datos de otros creditos. "
+        "Si pago_prioritario es cuota_inicial, informar primero su valor y que las cuotas siguen inactivas. "
         f"Si el cliente pregunta por cuotas vencidas, usar solo: {cuotas_vencidas_texto}. "
         f"Si pregunta por cuota pendiente, usar solo: {cuotas_pendientes_texto}."
     )
     debug_texto = (
         "Debug pagos-mora\n"
         "Estado API: success\n"
-        "Fuente oficial: data.credit.installments\n"
+        "Fuente oficial: data.credit.flowPayments + data.credit.installments\n"
         f"Credito ID: {text_value(credito.get('id'), 'N/A')}\n"
         f"Linea: {text_value(credito.get('linea'), 'N/A')}\n"
         f"Total cuotas detectadas: {text_value(resumen.get('total_cuotas'), '0')}\n"
         f"Max numero cuota: {text_value(credito.get('max_numero_cuota'), '0')}\n"
         f"Cuotas pagadas: {text_value(resumen.get('cuotas_pagadas'), '0')}\n"
+        f"Cuotas inactivas: {text_value(resumen.get('inactivas_estado_0'), '0')}\n"
         f"Cuotas vencidas: {text_value(resumen.get('vencidos_estado_4'), '0')}\n"
         f"Cuotas pendientes: {text_value(resumen.get('pendientes_estado_3'), '0')}\n"
         f"Dias de atraso: {text_value(resumen.get('dias_de_atraso'), '0')}\n"
         f"Cuota pendiente detectada: {text_value(pago_pendiente.get('numero_de_cuota'), 'N/A')}\n"
         f"Valor cuota pendiente: {text_value(pago_pendiente.get('valor_total_legible'), '$0')}\n"
+        f"Estado cuota inicial: {text_value(cuota_inicial.get('estado'), 'N/A')}\n"
+        f"Valor cuota inicial: {text_value(cuota_inicial.get('amount_legible'), '$0')}\n"
+        f"Tipo pago prioritario: {text_value(pago_prioritario.get('tipo'), 'N/A')}\n"
         f"Cuota vencida detectada: {text_value(cuota_vencida.get('numero_de_cuota'), 'N/A')}\n"
         f"Valor cuota vencida: {text_value(cuota_vencida.get('valor_total_legible'), '$0')}\n"
         f"Total pagado: {money(totales.get('total_pagado'))}\n"
@@ -6015,6 +6174,7 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "pago_total_cuotas_texto": text_value(resumen.get("total_cuotas"), "0"),
         "pago_cuotas_pagadas_texto": text_value(resumen.get("cuotas_pagadas"), "0"),
         "pago_cuotas_pendientes_total_texto": text_value(resumen.get("cuotas_pendientes_total"), "0"),
+        "pago_inactivas_estado_0_texto": text_value(resumen.get("inactivas_estado_0"), "0"),
         "pago_pendientes_estado_3_texto": text_value(resumen.get("pendientes_estado_3"), "0"),
         "pago_vencidos_estado_4_texto": text_value(resumen.get("vencidos_estado_4"), "0"),
         "pago_dias_de_atraso_texto": text_value(resumen.get("dias_de_atraso"), "0"),
@@ -6022,6 +6182,15 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "pago_cuotas_pagadas_detalle_texto": cuotas_pagadas_texto,
         "pago_cuotas_vencidas_detalle_texto": cuotas_vencidas_texto,
         "pago_cuotas_pendientes_detalle_texto": cuotas_pendientes_texto,
+        "pago_cuota_inicial_estado_texto": text_value(cuota_inicial.get("estado")),
+        "pago_cuota_inicial_approved_texto": text_value(cuota_inicial.get("approved"), "False"),
+        "pago_cuota_inicial_valor_numero_texto": text_value(cuota_inicial.get("amount_redondeado"), "0"),
+        "pago_cuota_inicial_valor_legible_texto": text_value(cuota_inicial.get("amount_legible"), "$0"),
+        "pago_cuota_inicial_orden_habilitada_texto": text_value(cuota_inicial.get("orden_habilitada"), "False"),
+        "pago_prioritario_tipo_texto": text_value(pago_prioritario.get("tipo")),
+        "pago_prioritario_valor_numero_texto": text_value(pago_prioritario.get("valor_total_redondeado"), "0"),
+        "pago_prioritario_valor_legible_texto": text_value(pago_prioritario.get("valor_total_legible"), "$0"),
+        "pago_prioritario_motivo_texto": text_value(pago_prioritario.get("motivo")),
         "pago_cuota_pendiente_id_texto": text_value(pago_pendiente.get("id")),
         "pago_cuota_pendiente_numero_texto": text_value(pago_pendiente.get("numero_de_cuota")),
         "pago_cuota_pendiente_estado_texto": text_value(pago_pendiente.get("estado_cuota")),
@@ -6073,13 +6242,18 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "Cuotas_pendientes": text_value(resumen.get("pendientes_estado_3"), "0"),
         "Cuotas_vencidas": text_value(resumen.get("vencidos_estado_4"), "0"),
         "dias_atraso": text_value(resumen.get("dias_de_atraso"), "0"),
-        "valor_pagar_legible": text_value(pago_pendiente.get("valor_total_legible"), "$0"),
-        "fecha_pago": text_value(pago_pendiente.get("fecha_pago_legible")),
+        "valor_pagar_legible": text_value(
+            pago_prioritario.get("valor_total_legible") or pago_pendiente.get("valor_total_legible"),
+            "$0",
+        ),
+        "fecha_pago": text_value(
+            pago_prioritario.get("fecha_pago_legible") or pago_pendiente.get("fecha_pago_legible")
+        ),
     }
     fields.update(
         {
             "pago_cuota_principal_numero_texto": fields["pago_cuota_pendiente_numero_texto"],
-            "pago_cuota_principal_valor_legible_texto": fields["pago_cuota_pendiente_total_general_texto"],
+            "pago_cuota_principal_valor_legible_texto": fields["valor_pagar_legible"],
         }
     )
     return fields
@@ -8516,14 +8690,25 @@ async def consultar_pagos_mora_interno_one2credit(id_credito: str) -> Dict[str, 
 def extraer_datos_pagos_mora_one2credit(respuesta_pagos_mora: Dict[str, Any]) -> Dict[str, Any]:
     data = respuesta_pagos_mora.get("data") if isinstance(respuesta_pagos_mora, dict) else {}
     data = data if isinstance(data, dict) else {}
+    cuota_inicial = data.get("cuota_inicial") if isinstance(data.get("cuota_inicial"), dict) else {}
+    pago_prioritario = data.get("pago_prioritario") if isinstance(data.get("pago_prioritario"), dict) else {}
     pago_pendiente = data.get("pago_pendiente") if isinstance(data.get("pago_pendiente"), dict) else {}
+    valor_prioritario = pago_prioritario.get("valor_total_legible") or pago_pendiente.get("valor_total_legible")
+    fecha_prioritaria = pago_prioritario.get("fecha_pago_legible") or pago_pendiente.get("fecha_pago_legible")
+    id_cuota_orden = pago_prioritario.get("id_cuota_orden") or pago_pendiente.get("id")
 
     return {
         "C_pendiente_mas_Cvencida": data.get("cuotas_pendientes_total"),
         "dias_atraso": data.get("dias_de_atraso"),
-        "valor_pagar_legible": pago_pendiente.get("valor_total_legible"),
-        "fecha_pago": pago_pendiente.get("fecha_pago_legible"),
-        "id_cuota_pendiente": pago_pendiente.get("id"),
+        "valor_pagar_legible": valor_prioritario,
+        "valor_pagar": pago_prioritario.get("valor_total_redondeado") or pago_pendiente.get("valor_total_redondeado"),
+        "fecha_pago": fecha_prioritaria,
+        "id_cuota_pendiente": id_cuota_orden,
+        "pago_prioritario_tipo": pago_prioritario.get("tipo"),
+        "pago_prioritario": pago_prioritario,
+        "cuota_inicial": cuota_inicial,
+        "orden_habilitada": bool(pago_prioritario.get("orden_habilitada")),
+        "key_orden": pago_prioritario.get("key_orden"),
         "cuotas_total": data.get("total_cuotas"),
         "cuota_atraso": pago_pendiente.get("retrasado"),
         "label_cuota_atraso": pago_pendiente.get("label_fecha"),
@@ -8533,6 +8718,20 @@ def extraer_datos_pagos_mora_one2credit(respuesta_pagos_mora: Dict[str, Any]) ->
 
 
 def construir_mensaje_pagos_mora_one2credit(datos_mora: Dict[str, Any]) -> str:
+    if datos_mora.get("pago_prioritario_tipo") == "cuota_inicial":
+        cuota_inicial = datos_mora.get("cuota_inicial") if isinstance(datos_mora.get("cuota_inicial"), dict) else {}
+        mensaje = (
+            "*CUOTA INICIAL PENDIENTE*\n"
+            "----------------------------------------\n"
+            f"*VALOR A PAGAR:* {datos_mora.get('valor_pagar_legible') or '$0'}\n"
+            "----------------------------------------\n"
+            "Las cuotas del credito se encuentran inactivas hasta registrar este pago."
+        )
+        if not cuota_inicial.get("orden_habilitada"):
+            mensaje += "\nNo fue posible habilitar la orden por inconsistencias en la informacion recibida."
+        logger.info("Mensaje cuota inicial One2Credit construido | %s", mensaje)
+        return mensaje
+
     cuota_atraso = bool(datos_mora.get("cuota_atraso"))
     cuotas_pendientes = datos_mora.get("Cuotas_pendientes")
     dias_atraso = datos_mora.get("dias_atraso")
@@ -8742,6 +8941,7 @@ async def crear_orden_pago_one2credit_con_reintentos(
     id_cuota_pendiente: str,
     amount: int | float,
     max_intentos: int = 3,
+    key: Optional[str] = None,
 ) -> Dict[str, Any]:
     intentos = max(1, min(int(max_intentos or 3), 3))
     ultimo_error = None
@@ -8749,16 +8949,18 @@ async def crear_orden_pago_one2credit_con_reintentos(
         amount=amount,
         provider="payvalida",
         collectionCosts=0,
+        key=key,
     )
 
     for intento in range(1, intentos + 1):
         logger.info(
-            "Creando orden One2Credit | intento=%s/%s | id_credito=%s | id_cuota=%s | amount=%s",
+            "Creando orden One2Credit | intento=%s/%s | id_credito=%s | id_cuota=%s | amount=%s | key=%s",
             intento,
             intentos,
             id_credito_mora,
             id_cuota_pendiente,
             amount,
+            key,
         )
         response = await create_installment_order(
             id_credito_mora=id_credito_mora,
@@ -8819,6 +9021,7 @@ async def resolver_orden_pago_one2credit(
 ) -> Optional[Dict[str, Any]]:
     id_credito_mora = limpiar_texto(datos_credito.get("id_credito_mora"))
     id_cuota_pendiente = limpiar_texto(datos_mora.get("id_cuota_pendiente"))
+    pago_prioritario_tipo = limpiar_texto(datos_mora.get("pago_prioritario_tipo"))
 
     if not opcion_pago:
         return None
@@ -8827,6 +9030,47 @@ async def resolver_orden_pago_one2credit(
         return {
             "estado": "PENDIENTE_FLUJO_ACUERDO_PAGO",
             "mensaje": "Opcion Acuerdo de Pago tipificada; faltan las peticiones de este flujo.",
+        }
+
+    if pago_prioritario_tipo == "cuota_inicial" and opcion_pago in ("pago_total", "abono_deuda"):
+        monto_cuota_inicial = convertir_a_entero_o_none(datos_mora.get("valor_pagar"))
+        orden_habilitada = bool(datos_mora.get("orden_habilitada"))
+        if (
+            not id_credito_mora
+            or id_cuota_pendiente != "zero"
+            or monto_cuota_inicial is None
+            or monto_cuota_inicial <= 0
+            or not orden_habilitada
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "tipo_error": "datos_orden_cuota_inicial_incompletos",
+                    "mensaje": "La cuota inicial esta pendiente, pero sus datos no permiten crear una orden segura.",
+                    "datos_credito": datos_credito,
+                    "datos_mora": datos_mora,
+                },
+            )
+
+        orden = await crear_orden_pago_one2credit_con_reintentos(
+            id_credito_mora=id_credito_mora,
+            id_cuota_pendiente="zero",
+            amount=monto_cuota_inicial,
+            key="cuota_inicial",
+        )
+        valor_legible = datos_mora.get("valor_pagar_legible") or formatear_valor_moneda(monto_cuota_inicial)
+        return {
+            "opcion_pago": "cuota_inicial",
+            "opcion_pago_solicitada": opcion_pago,
+            "pago_prioritario_tipo": "cuota_inicial",
+            "monto_cuota_inicial": monto_cuota_inicial,
+            "valor_pagar_legible": valor_legible,
+            "mensaje_link_pago": construir_mensaje_link_pago_one2credit(
+                valor_pagar_legible=valor_legible,
+                link_pago=orden["link_pago"],
+            ),
+            **orden,
         }
 
     if not id_credito_mora or not id_cuota_pendiente:
