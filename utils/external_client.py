@@ -221,6 +221,7 @@ class ExternalClient:
         Returns:
             Dict con estructura: {"status": 200, "data": {...}}
         """
+        final_body = {}
         try:
             # Reemplazar variables en URL
             final_url = self._replace_variables(self.url)
@@ -296,6 +297,7 @@ class ExternalClient:
                         status=response.status_code,
                         error_message=f"Respuesta no exitosa: {response.status_code}",
                         response_text=response.text,
+                        payload_enviado=final_body,
                     )
 
                 return {
@@ -307,7 +309,8 @@ class ExternalClient:
             await self._log_error(
                 status=504,
                 error_message="Timeout en solicitud HTTP",
-                response_text="Timeout"
+                response_text="Timeout",
+                payload_enviado=final_body,
             )
             return {
                 "status": 504,
@@ -318,7 +321,8 @@ class ExternalClient:
             await self._log_error(
                 status=502,
                 error_message=f"Error de conexión: {str(e)}",
-                response_text=str(e)
+                response_text=str(e),
+                payload_enviado=final_body,
             )
             return {
                 "status": 502,
@@ -329,14 +333,21 @@ class ExternalClient:
             await self._log_error(
                 status=500,
                 error_message=f"Error interno: {str(e)}",
-                response_text=str(e)
+                response_text=str(e),
+                payload_enviado=final_body,
             )
             return {
                 "status": 500,
                 "data": {"error": f"Error interno: {str(e)}"}
             }
 
-    async def _log_error(self, status: int, error_message: str, response_text: str):
+    async def _log_error(
+        self,
+        status: int,
+        error_message: str,
+        response_text: str,
+        payload_enviado: Optional[Dict[str, Any]] = None,
+    ):
         """Registra errores en la BD"""
         try:
             try:

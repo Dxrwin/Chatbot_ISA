@@ -16,6 +16,10 @@ tests/*
 !tests/test_pagos_mora_cuota_inicial.py
 sql/
 tests*
+!tests/
+tests/*
+!tests/test_payables_linea_producto.py
+tests
 
 # Compiled Java class files
 *.class
