@@ -1060,6 +1060,75 @@ async def _handle_totp_error(
     )
 
 
+def _valor_texto_linea_producto(valor: Any) -> str:
+    """Convierte valores opcionales de una linea a texto entendible para una IA."""
+    if valor is None or valor == "":
+        return "No informado"
+    if isinstance(valor, (list, tuple, set)):
+        return ", ".join(str(item) for item in valor) if valor else "No informado"
+    return str(valor)
+
+
+def _valor_cop_linea_producto(valor: Any) -> str:
+    """Formatea un limite monetario sin perder su valor numerico original."""
+    if valor is None or valor == "":
+        return "No informado"
+    try:
+        return formatear_valor_moneda(float(valor))
+    except (TypeError, ValueError):
+        return str(valor)
+
+
+def build_product_line_text_fields(
+    respuesta_base: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Genera variables de texto para que un agente de IA pueda entender y validar
+    los limites de una linea sin alterar el contrato estructurado existente.
+    """
+    principal_min = respuesta_base.get("principalMin")
+    principal_max = respuesta_base.get("principalMax")
+    time_min = respuesta_base.get("timeMin")
+    time_max = respuesta_base.get("timeMax")
+    time_default = respuesta_base.get("timeDefault")
+    payment_frequency = respuesta_base.get("paymentFrequency")
+
+    contexto_ia = (
+        "INFORMACIÓN DE LA LÍNEA DE CRÉDITO\n\n"
+        f"ID de la línea: {_valor_texto_linea_producto(respuesta_base.get('id'))}\n"
+        f"Nombre: {_valor_texto_linea_producto(respuesta_base.get('name'))}\n"
+        f"Título: {_valor_texto_linea_producto(respuesta_base.get('title'))}\n"
+        f"Parent ID: {_valor_texto_linea_producto(respuesta_base.get('parentId'))}\n"
+        f"Version: {_valor_texto_linea_producto(respuesta_base.get('version'))}\n"
+        f"Linea encontrada por: {_valor_texto_linea_producto(respuesta_base.get('matched_by'))}\n\n"
+        "LÍMITES PARA ARMAR EL PAYLOAD\n"
+        f"Principal mínimo: {_valor_texto_linea_producto(principal_min)} "
+        f"({_valor_cop_linea_producto(principal_min)} COP)\n"
+        f"Principal máximo: {_valor_texto_linea_producto(principal_max)} "
+        f"({_valor_cop_linea_producto(principal_max)} COP)\n"
+        f"Plazo mínimo: {_valor_texto_linea_producto(time_min)} días\n"
+        f"Plazo máximo: {_valor_texto_linea_producto(time_max)} días\n"
+        f"Plazo recomendado: {_valor_texto_linea_producto(time_default)} días\n"
+        f"Frecuencias de pago permitidas: {_valor_texto_linea_producto(payment_frequency)} días\n\n"
+        "REGLAS OBLIGATORIAS PARA EL AGENTE DE IA\n"
+        "1. El principal debe estar entre principalMin y principalMax, incluyendo ambos límites.\n"
+        "2. El plazo time debe estar entre timeMin y timeMax, incluyendo ambos límites.\n"
+        "3. paymentFrequency debe pertenecer a las frecuencias de pago permitidas.\n"
+        "4. Si algún valor está fuera de los límites, no armes ni envíes el payable; "
+        "solicita al usuario un valor válido.\n"
+        "5. Copia el campo id de esta respuesta en creditLineId del payload."
+    )
+
+    return {
+        "linea_producto_contexto_ia": contexto_ia,
+        "linea_producto_json_texto": json.dumps(
+            respuesta_base,
+            ensure_ascii=False,
+            default=str,
+        ),
+    }
+
+
 @app.get("/product-lines/{parent_id}")
 async def webhook_product_lines(
     parent_id: str,
@@ -1330,7 +1399,7 @@ async def webhook_product_lines(
             )
 
             # Este SÍ es un 200 OK legítimo
-            return {
+            respuesta_base = {
                 "id": line.get("id"),
                 "name": line.get("name"),
                 "title": line.get("title"),
@@ -1343,6 +1412,10 @@ async def webhook_product_lines(
                 "timeMax": line.get("timeMax"),
                 "timeDefault": line.get("timeDefault"),
                 "paymentFrequency": line.get("paymentFrequency"),
+            }
+            return {
+                **respuesta_base,
+                **build_product_line_text_fields(respuesta_base),
             }
 
     # MANEJO GLOBAL DE ERRORES PARA EL ENDPOINT
@@ -1531,6 +1604,239 @@ def extraer_campos_faltantes(kuenta_response: dict) -> dict:
     }
 
 
+def _numero_opcional(valor: Any) -> Optional[float]:
+    """Convierte configuraciones numericas de Kuenta sin asumir que siempre existen."""
+    if valor is None or valor == "":
+        return None
+    try:
+        if isinstance(valor, str):
+            valor = valor.replace(",", ".").strip()
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _frecuencias_permitidas(valor: Any) -> List[int]:
+    valores = valor if isinstance(valor, (list, tuple, set)) else [valor]
+    frecuencias = []
+    for item in valores:
+        numero = _numero_opcional(item)
+        if numero is not None and numero.is_integer():
+            frecuencias.append(int(numero))
+    return frecuencias
+
+
+def construir_restricciones_producto(producto: Dict[str, Any]) -> Dict[str, Any]:
+    """Extrae las reglas relevantes para respuestas de validacion y trazabilidad."""
+    return {
+        "creditLineId": producto.get("ID") or producto.get("id"),
+        "principalMin": producto.get("principalMin"),
+        "principalMax": producto.get("principalMax"),
+        "timeMin": producto.get("timeMin"),
+        "timeMax": producto.get("timeMax"),
+        "timeDefault": producto.get("timeDefault"),
+        "paymentFrequency": producto.get("paymentFrequency"),
+        "initialFee": producto.get("initialFee"),
+        "initialFeeMin": producto.get("initialFeeMin"),
+        "initialFeeMax": producto.get("initialFeeMax"),
+        "initialFeeMinRate": producto.get("initialFeeMinRate"),
+        "initialFeeMaxRate": producto.get("initialFeeMaxRate"),
+    }
+
+
+def _error_validacion_producto(
+    codigo: str,
+    detalles_usuario: str,
+    producto: Dict[str, Any],
+) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "estado": "error",
+            "codigo": codigo,
+            "detalles_usuario": detalles_usuario,
+            "restricciones": construir_restricciones_producto(producto),
+        },
+    )
+
+
+def validar_payable_con_producto(
+    payload: PayableRequest,
+    producto: Dict[str, Any],
+) -> None:
+    """Valida el payable contra la configuracion vigente de la linea en Kuenta."""
+    product_id = producto.get("ID") or producto.get("id")
+    if not product_id or product_id != payload.creditLineId or producto.get("archived") is True:
+        raise _error_validacion_producto(
+            "InvalidCreditLine",
+            "La linea de credito no existe, esta archivada o no coincide con la solicitada.",
+            producto,
+        )
+
+    time_min = _numero_opcional(producto.get("timeMin"))
+    time_max = _numero_opcional(producto.get("timeMax"))
+    if (time_min is not None and payload.time < time_min) or (
+        time_max is not None and payload.time > time_max
+    ):
+        raise _error_validacion_producto(
+            "InvalidDays",
+            f"El plazo {payload.time} dias no es valido para esta linea. "
+            f"Debe estar entre {_valor_texto_linea_producto(producto.get('timeMin'))} y "
+            f"{_valor_texto_linea_producto(producto.get('timeMax'))} dias.",
+            producto,
+        )
+
+    principal_min = _numero_opcional(producto.get("principalMin"))
+    principal_max = _numero_opcional(producto.get("principalMax"))
+    if (principal_min is not None and payload.principal < principal_min) or (
+        principal_max is not None and payload.principal > principal_max
+    ):
+        raise _error_validacion_producto(
+            "InvalidPrincipal",
+            f"El principal {payload.principal:g} no es valido para esta linea. "
+            f"Debe estar entre {_valor_texto_linea_producto(producto.get('principalMin'))} y "
+            f"{_valor_texto_linea_producto(producto.get('principalMax'))}.",
+            producto,
+        )
+
+    frecuencias = _frecuencias_permitidas(producto.get("paymentFrequency"))
+    if frecuencias and payload.paymentFrequency not in frecuencias:
+        raise _error_validacion_producto(
+            "InvalidPaymentFrequency",
+            f"La frecuencia {payload.paymentFrequency} no esta permitida. "
+            f"Frecuencias validas: {', '.join(str(item) for item in frecuencias)}.",
+            producto,
+        )
+
+    if payload.initialFee < 0:
+        raise _error_validacion_producto(
+            "InvalidInitialFee",
+            "La cuota inicial no puede ser negativa.",
+            producto,
+        )
+
+    initial_fee_enabled = producto.get("initialFee")
+    if initial_fee_enabled is False and payload.initialFee > 0:
+        raise _error_validacion_producto(
+            "InitialFeeNotAllowed",
+            "La linea seleccionada no permite cuota inicial; initialFee debe ser 0.",
+            producto,
+        )
+
+    if initial_fee_enabled is True:
+        fee_min = _numero_opcional(producto.get("initialFeeMin"))
+        fee_max = _numero_opcional(producto.get("initialFeeMax"))
+        fee_min_rate = _numero_opcional(producto.get("initialFeeMinRate"))
+        fee_max_rate = _numero_opcional(producto.get("initialFeeMaxRate"))
+        fee_rate = payload.initialFee / payload.principal if payload.principal > 0 else 0
+
+        fee_out_of_range = (
+            (fee_min is not None and fee_min > 0 and payload.initialFee < fee_min)
+            or (fee_max is not None and fee_max > 0 and payload.initialFee > fee_max)
+            or (fee_min_rate is not None and fee_min_rate > 0 and fee_rate < fee_min_rate)
+            or (fee_max_rate is not None and fee_max_rate > 0 and fee_rate > fee_max_rate)
+        )
+        if fee_out_of_range:
+            raise _error_validacion_producto(
+                "InvalidInitialFee",
+                "La cuota inicial esta fuera de los limites permitidos para esta linea.",
+                producto,
+            )
+
+
+def _construir_url_producto_kuenta(base_url: Optional[str], credit_line_id: str) -> str:
+    base = (base_url or API_URL or "https://api.kuenta.co/v1").rstrip("/")
+    for placeholder in ("{linea_producto}", "{creditLineId}", "{credit_line_id}"):
+        if placeholder in base:
+            return base.replace(placeholder, credit_line_id)
+    if base.endswith("/product-lines"):
+        base = base.rsplit("/", 1)[0]
+    if base.endswith("/products"):
+        return f"{base}/{credit_line_id}"
+    return f"{base}/products/{credit_line_id}"
+
+
+async def obtener_producto_kuenta_para_validacion(
+    client: httpx.AsyncClient,
+    token: str,
+    credit_line_id: str,
+    client_id: str,
+) -> Dict[str, Any]:
+    """Obtiene la linea vigente antes de crear un payable y normaliza su respuesta."""
+    headers = {
+        "Config-Organization-ID": ORG_ID,
+        "Organization-ID": ORG_ID,
+        "Authorization": token,
+    }
+    ext_client_product = None
+    try:
+        ext_client_product = await ExternalClient.from_code(
+            "KUENTA_PRODUCT_GET",
+            client_id=client_id,
+        )
+    except ValueError:
+        pass
+
+    product_url = _construir_url_producto_kuenta(
+        ext_client_product.url if ext_client_product else API_URL,
+        credit_line_id,
+    )
+
+    if ext_client_product:
+        ext_client_product.set_dynamic_values(
+            {
+                "ORG_ID": ORG_ID,
+                "access_token": token,
+                "linea_producto": credit_line_id,
+                "creditLineId": credit_line_id,
+            }
+        )
+        ext_client_product.set_headers(headers)
+        ext_client_product.set_url(product_url)
+        ext_client_product.set_body({})
+        external_response = await ext_client_product.run()
+        if not isinstance(external_response, dict):
+            raise HTTPException(status_code=502, detail={
+                "estado": "error",
+                "codigo": "InvalidProductResponse",
+                "detalles_usuario": "Kuenta devolvio una respuesta invalida al consultar la linea.",
+            })
+        status_code = external_response.get("status", 500)
+        response_data = external_response.get("data") or {}
+    else:
+        response = await client.get(product_url, headers=headers)
+        status_code = response.status_code
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = {}
+
+    if status_code == 404:
+        raise HTTPException(status_code=400, detail={
+            "estado": "error",
+            "codigo": "InvalidCreditLine",
+            "detalles_usuario": "La linea de credito indicada no existe en Kuenta.",
+        })
+    if status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail={
+            "estado": "error",
+            "codigo": "ProductServiceUnavailable",
+            "detalles_usuario": "No fue posible validar los limites de la linea de credito.",
+        })
+
+    nested_data = response_data.get("data") if isinstance(response_data, dict) else None
+    producto = nested_data.get("product") if isinstance(nested_data, dict) else None
+    if not isinstance(producto, dict) and isinstance(response_data, dict):
+        producto = response_data.get("product")
+    if not isinstance(producto, dict):
+        raise HTTPException(status_code=502, detail={
+            "estado": "error",
+            "codigo": "InvalidProductResponse",
+            "detalles_usuario": "Kuenta no devolvio la configuracion esperada de la linea.",
+        })
+    return producto
+
+
 @app.post("/payables/{client_id}")
 async def create_payable(client_id: str, payload: PayableRequest):
     """
@@ -1555,6 +1861,23 @@ async def create_payable(client_id: str, payload: PayableRequest):
             initial_fee = payload.initialFee
 
             token = await obtener_token(client)
+            if not token:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "estado": "error",
+                        "codigo": "AuthenticationError",
+                        "detalles_usuario": "No fue posible obtener autorizacion para validar y crear el payable.",
+                    },
+                )
+
+            producto = await obtener_producto_kuenta_para_validacion(
+                client=client,
+                token=token,
+                credit_line_id=payload.creditLineId,
+                client_id=client_id,
+            )
+            validar_payable_con_producto(payload, producto)
 
             # Construir payload para Kuenta
             new_payload = {
@@ -1594,7 +1917,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
-            # last_error_response = None
+            status_code = 500
+            error_code = "Unknown"
+            error_message = "No fue posible crear el payable"
 
             for attempt in range(max_retries):
                 try:
@@ -1622,6 +1947,8 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                         logger.info(f"Variables dinámicas a inyectar: {dynamic_vars}")
                         ext_client_post.set_dynamic_values(dynamic_vars)
+                        # Evita diferencias entre el body configurado en BD y el fallback.
+                        ext_client_post.set_body(new_payload)
 
                         # header dinámicos
                         ext_client_post.set_headers(headers)
@@ -1710,17 +2037,16 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                 },
                             )
 
-                        # # FAIL FAST: NO TIENE SENTIDO REINTENTAR ESTO.
-                        # # Lanzamos la excepción de una vez para que el usuario corrija los datos.
-                        # raise HTTPException(
-                        #     status_code=400,
-                        #     detail={
-                        #         "estado": "error",
-                        #         "codigo_tecnico": error_code,
-                        #         "mensaje": mensaje_amigable,
-                        #         "detalles_usuario": detalles_usuario
-                        #     }
-                        # )
+                        raise HTTPException(
+                            status_code=status_code,
+                            detail={
+                                "estado": "error",
+                                "codigo": error_code,
+                                "mensaje": mensaje_amigable,
+                                "detalles_usuario": detalles_usuario,
+                                "restricciones": construir_restricciones_producto(producto),
+                            },
+                        )
 
                     # ===== CASO 3: ERROR DE AUTENTICACIÓN (401) =====
                     elif status_code in (401, 403):
@@ -5592,9 +5918,112 @@ def construir_detalle_cuota_oficial(installment: Dict[str, Any]) -> Dict[str, An
     return detalle
 
 
+COMPONENTES_PAGO_CUOTA = (
+    ("impuestos", "taxesPaid", "Impuestos"),
+    ("costos", "costsPaid", "Costos"),
+    ("cargos_cobranza", "penaltyPaid", "Cargos de cobranza"),
+    ("intereses_mora", "debtInterestPaid", "Intereses de mora"),
+    ("intereses_corrientes", "interestPaid", "Intereses corrientes"),
+    ("intereses_adicionales", "additionalInterestPaid", "Intereses adicionales"),
+    ("capital", "capitalPaid", "Capital"),
+)
+
+
+def construir_importe_pago(valor: Any, fuente: str) -> Dict[str, Any]:
+    """Conserva el importe original y agrega representaciones de negocio."""
+    return {
+        "fuente": fuente,
+        "valor_original": normalizar_valor_original_cuota(valor),
+        "valor_redondeado": to_int(valor),
+        "valor_legible": money(valor),
+    }
+
+
+def formatear_fecha_hora_pago_legible(fecha_iso: Any) -> str:
+    """Convierte la fecha UTC de Kuenta a hora local de Colombia."""
+    if not fecha_iso:
+        return "N/A"
+    try:
+        fecha_obj = datetime.fromisoformat(str(fecha_iso).replace("Z", "+00:00"))
+        if fecha_obj.tzinfo is None:
+            fecha_obj = fecha_obj.replace(tzinfo=timezone.utc)
+        fecha_bogota = fecha_obj.astimezone(ZoneInfo("America/Bogota"))
+        hora_12 = fecha_bogota.hour % 12 or 12
+        periodo = "a. m." if fecha_bogota.hour < 12 else "p. m."
+        return (
+            f"{fecha_bogota.day:02d}/{fecha_bogota.month:02d}/{fecha_bogota.year} "
+            f"{hora_12}:{fecha_bogota.minute:02d} {periodo}"
+        )
+    except (TypeError, ValueError):
+        return str(fecha_iso)
+
+
+def construir_desglose_pago(
+    source: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        clave: construir_importe_pago(source.get(campo, 0), campo)
+        for clave, campo, _ in COMPONENTES_PAGO_CUOTA
+    }
+
+
+def construir_pago_pendiente_detallado(payment: Dict[str, Any]) -> Dict[str, Any]:
+    fecha_registro = payment.get("registeredAt")
+    return {
+        "fecha_registro": {
+            "valor_original": fecha_registro,
+            "valor_legible": formatear_fecha_hora_pago_legible(fecha_registro),
+            "zona_horaria": "America/Bogota",
+        },
+        "id_orden": payment.get("orderId"),
+        "aplicacion": "En esta cuota",
+        "valor_registrado": construir_importe_pago(payment.get("amount", 0), "amount"),
+        "valor_pagado_en_esta_cuota": construir_importe_pago(
+            payment.get("valuePaid", 0),
+            "valuePaid",
+        ),
+        "desglose_pagado_en_esta_cuota": construir_desglose_pago(payment),
+        "datos_fuente": convertir_a_json_seguro(dict(payment)),
+    }
+
+
+def decimal_pago_o_cero(valor: Any) -> Decimal:
+    numero = convertir_decimal_cuota(valor)
+    return numero if numero is not None else Decimal("0")
+
+
+def agregar_alertas_conciliacion_pagos(
+    cuota_pendiente: Dict[str, Any],
+    pagos: List[Dict[str, Any]],
+    alertas_integridad: List[str],
+) -> None:
+    valor_pagado_cuota = decimal_pago_o_cero(cuota_pendiente.get("valuePaid"))
+    suma_transacciones = sum(
+        (decimal_pago_o_cero(pago.get("valuePaid")) for pago in pagos),
+        Decimal("0"),
+    )
+    suma_desglose = sum(
+        (
+            decimal_pago_o_cero(cuota_pendiente.get(campo))
+            for _, campo, _ in COMPONENTES_PAGO_CUOTA
+        ),
+        Decimal("0"),
+    )
+
+    if abs(suma_transacciones - valor_pagado_cuota) > Decimal("5"):
+        alertas_integridad.append(
+            "suma de payments[].valuePaid difiere de installment.valuePaid por mas de 5 pesos"
+        )
+    if abs(suma_desglose - valor_pagado_cuota) > Decimal("5"):
+        alertas_integridad.append(
+            "desglose pagado acumulado difiere de installment.valuePaid por mas de 5 pesos"
+        )
+
+
 def construir_pago_pendiente_oficial(
     cuota_pendiente: Optional[Dict[str, Any]],
     dias_atraso_general: int,
+    alertas_integridad: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(cuota_pendiente, dict):
         return None
@@ -5602,6 +6031,26 @@ def construir_pago_pendiente_oficial(
     retrasado = calcular_retraso_cuota(fecha_pago)
     desglose = build_desglose_cuota_pendiente(cuota_pendiente)
     total = to_int(cuota_pendiente.get("payment"))
+    payments_raw = cuota_pendiente.get("payments")
+    if payments_raw is not None and not isinstance(payments_raw, list):
+        if alertas_integridad is not None:
+            alertas_integridad.append("payments de cuota pendiente no es una lista valida")
+        payments_raw = []
+    payments_raw = payments_raw or []
+    pagos_validos = [payment for payment in payments_raw if isinstance(payment, dict)]
+    if len(pagos_validos) != len(payments_raw) and alertas_integridad is not None:
+        alertas_integridad.append("payments de cuota pendiente contiene registros invalidos")
+
+    valor_pagado_original = cuota_pendiente.get("valuePaid", 0)
+    valor_pendiente = decimal_pago_o_cero(cuota_pendiente.get("payment")) - decimal_pago_o_cero(
+        valor_pagado_original
+    )
+    if alertas_integridad is not None:
+        agregar_alertas_conciliacion_pagos(
+            cuota_pendiente,
+            pagos_validos,
+            alertas_integridad,
+        )
     return {
         "id": cuota_pendiente.get("id"),
         "numero_de_cuota": cuota_pendiente.get("number"),
@@ -5617,6 +6066,17 @@ def construir_pago_pendiente_oficial(
         "retrasado": retrasado,
         "label_fecha": "FECHA VENCIDA" if retrasado else "PROXIMA FECHA DE PAGO",
         "desglose_completo": desglose,
+        "pagos_registrados_cantidad": len(pagos_validos),
+        "valor_pagado_registrado": construir_importe_pago(
+            valor_pagado_original,
+            "valuePaid",
+        ),
+        "valor_pendiente_a_la_fecha": construir_importe_pago(
+            valor_pendiente,
+            "payment-valuePaid",
+        ),
+        "desglose_pagado_acumulado": construir_desglose_pago(cuota_pendiente),
+        "pagos": [construir_pago_pendiente_detallado(payment) for payment in pagos_validos],
         "explicacion_consolidacion": (
             "La cuota pendiente puede incluir valores propios de la cuota actual y valores heredados "
             "o asignados por cuotas vencidas anteriores, como mora heredada, cargos de cobranza, "
@@ -5656,7 +6116,11 @@ def construir_data_pagos_mora_oficial(
         alertas_integridad.append("cuota_pendiente no encontrada")
 
     dias_atraso = calcular_dias_atraso_oficial(installments, resumen_kuenta)
-    pago_pendiente = construir_pago_pendiente_oficial(cuota_pendiente_raw, dias_atraso)
+    pago_pendiente = construir_pago_pendiente_oficial(
+        cuota_pendiente_raw,
+        dias_atraso,
+        alertas_integridad,
+    )
     pago_prioritario = None
     if (
         cuota_inicial.get("todas_las_cuotas_inactivas")
@@ -5822,6 +6286,56 @@ def linea_detalle_cuota_oficial_texto(cuota: Dict[str, Any]) -> str:
     )
 
 
+def importe_pago_legible(importe: Any, fallback: str = "$0") -> str:
+    if not isinstance(importe, dict):
+        return fallback
+    return text_value(importe.get("valor_legible"), fallback)
+
+
+def desglose_pago_texto(desglose: Any) -> str:
+    if not isinstance(desglose, dict):
+        return "Sin desglose aplicado"
+    componentes = []
+    for clave, _, label in COMPONENTES_PAGO_CUOTA:
+        importe = desglose.get(clave) if isinstance(desglose.get(clave), dict) else {}
+        if to_int(importe.get("valor_redondeado")) != 0:
+            componentes.append(f"{label}: {importe_pago_legible(importe)}")
+    return " | ".join(componentes) if componentes else "Sin desglose aplicado"
+
+
+def build_pagos_cuota_pendiente_texto(pago_pendiente: Dict[str, Any]) -> str:
+    if not isinstance(pago_pendiente, dict) or not pago_pendiente:
+        return "No se recibio una cuota pendiente para consultar pagos registrados."
+
+    pagos = pago_pendiente.get("pagos") if isinstance(pago_pendiente.get("pagos"), list) else []
+    desglose_acumulado = pago_pendiente.get("desglose_pagado_acumulado")
+    lineas_pagos = []
+    for indice, pago in enumerate(pagos, 1):
+        if not isinstance(pago, dict):
+            continue
+        fecha = pago.get("fecha_registro") if isinstance(pago.get("fecha_registro"), dict) else {}
+        lineas_pagos.append(
+            f"Pago {indice} | "
+            f"Fecha: {text_value(fecha.get('valor_legible'), 'N/A')} | "
+            f"ID de orden: {text_value(pago.get('id_orden'), 'N/A')} | "
+            f"Valor registrado: {importe_pago_legible(pago.get('valor_registrado'))} | "
+            f"Valor pagado en esta cuota: {importe_pago_legible(pago.get('valor_pagado_en_esta_cuota'))}\n"
+            f"Aplicacion: {text_value(pago.get('aplicacion'), 'En esta cuota')} | "
+            f"{desglose_pago_texto(pago.get('desglose_pagado_en_esta_cuota'))}"
+        )
+
+    detalle_transacciones = "\n".join(lineas_pagos) if lineas_pagos else "No hay pagos registrados en esta cuota."
+    return (
+        "Pagos registrados en la cuota pendiente\n"
+        f"Cantidad: {text_value(pago_pendiente.get('pagos_registrados_cantidad'), '0')}\n"
+        f"Valor pagado registrado: {importe_pago_legible(pago_pendiente.get('valor_pagado_registrado'))}\n"
+        f"Valor pendiente a la fecha: {importe_pago_legible(pago_pendiente.get('valor_pendiente_a_la_fecha'))}\n"
+        f"Desglose pagado acumulado: {desglose_pago_texto(desglose_acumulado)}\n"
+        "Transacciones:\n"
+        f"{detalle_transacciones}"
+    )
+
+
 def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str, str]:
     data = payload_oficial.get("data") if isinstance(payload_oficial.get("data"), dict) else {}
     credito = data.get("credito") if isinstance(data.get("credito"), dict) else {}
@@ -5853,6 +6367,8 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
     cuota_vencida = cuotas_vencidas[0] if cuotas_vencidas else {}
 
     cuota_desglose_texto = build_cuota_pendiente_desglose_texto(pago_pendiente)
+    pagos_cuota_pendiente_texto = build_pagos_cuota_pendiente_texto(pago_pendiente)
+    detalle_cuotas_texto = f"{detalle_cuotas_texto}\n\n{pagos_cuota_pendiente_texto}"
     explicacion = text_value(
         pago_pendiente.get("explicacion_consolidacion"),
         "La cuota pendiente puede incluir valores propios de la cuota actual y valores heredados o asignados por cuotas vencidas anteriores, como mora heredada, cargos de cobranza, costos pendientes, impuestos pendientes e intereses de mora. Por eso el valor de la cuota pendiente puede ser mayor al valor corriente normal de una cuota.",
@@ -5891,6 +6407,7 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         f"Estado cuota: {text_value(pago_pendiente.get('estado_cuota'), 'N/A')}\n"
         f"Fecha pago: {text_value(pago_pendiente.get('fecha_pago_legible'), 'N/A')}\n"
         f"Valor total: {text_value(pago_pendiente.get('valor_total_legible'), '$0')}\n\n"
+        f"{pagos_cuota_pendiente_texto}\n\n"
         "Cuotas reales del credito:\n"
         f"{cuotas_reales_texto}\n\n"
         "Desglose completo de la cuota pendiente:\n"
@@ -5900,6 +6417,8 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "Regla para ISA:\n"
         f"No inventar cuotas. No mencionar cuotas mayores a {text_value(credito.get('max_numero_cuota'), '0')}. "
         "No usar datos de otros creditos. "
+        "No confundir amount con valuePaid: amount es el valor registrado en la orden y "
+        "valuePaid es el valor aplicado especificamente a la cuota pendiente. "
         "Si pago_prioritario es cuota_inicial, informar primero su valor y que las cuotas siguen inactivas. "
         f"Si el cliente pregunta por cuotas vencidas, usar solo: {cuotas_vencidas_texto}. "
         f"Si pregunta por cuota pendiente, usar solo: {cuotas_pendientes_texto}."
@@ -5919,6 +6438,9 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         f"Dias de atraso: {text_value(resumen.get('dias_de_atraso'), '0')}\n"
         f"Cuota pendiente detectada: {text_value(pago_pendiente.get('numero_de_cuota'), 'N/A')}\n"
         f"Valor cuota pendiente: {text_value(pago_pendiente.get('valor_total_legible'), '$0')}\n"
+        f"Pagos registrados cuota pendiente: {text_value(pago_pendiente.get('pagos_registrados_cantidad'), '0')}\n"
+        f"Valor pagado registrado cuota pendiente: {importe_pago_legible(pago_pendiente.get('valor_pagado_registrado'))}\n"
+        f"Valor pendiente a la fecha: {importe_pago_legible(pago_pendiente.get('valor_pendiente_a_la_fecha'))}\n"
         f"Estado cuota inicial: {text_value(cuota_inicial.get('estado'), 'N/A')}\n"
         f"Valor cuota inicial: {text_value(cuota_inicial.get('amount_legible'), '$0')}\n"
         f"Tipo pago prioritario: {text_value(pago_prioritario.get('tipo'), 'N/A')}\n"
@@ -5931,7 +6453,8 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         f"Criterio seleccion credito: {text_value(seleccion_credito.get('criterio'), 'consulta directa por id_credito')}\n"
         f"Creditos elegibles: {text_value(seleccion_credito.get('creditos_elegibles_count'), '0')}\n"
         f"Creditos mismo estado: {text_value(seleccion_credito.get('creditos_mismo_estado_count'), '0')}\n"
-        f"Validacion: no existen cuotas mayores a {text_value(credito.get('max_numero_cuota'), '0')}"
+        f"Validacion: no existen cuotas mayores a {text_value(credito.get('max_numero_cuota'), '0')}\n\n"
+        f"{pagos_cuota_pendiente_texto}"
     )
 
     fields = {
@@ -6009,6 +6532,7 @@ def build_pago_text_fields_oficial(payload_oficial: Dict[str, Any]) -> Dict[str,
         "pago_cuota_vencida_total_texto": text_value(cuota_vencida.get("valor_total_legible")),
         "pago_cuota_vencida_estado_texto": text_value(cuota_vencida.get("estado_cuota")),
         "pago_cuota_pendiente_desglose_texto": cuota_desglose_texto,
+        "pago_cuota_pendiente_pagos_texto": pagos_cuota_pendiente_texto,
         "pago_cuota_pendiente_explicacion_consolidacion_texto": explicacion,
         "pago_detalle_cuotas_texto": detalle_cuotas_texto,
         "pago_data_contexto_ia": contexto_ia,
