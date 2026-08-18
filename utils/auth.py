@@ -10,6 +10,21 @@ from utils.external_client import ExternalClient
 logger = logging.getLogger(__name__)
 
 
+def _sanitizar_auth_log(value):
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in ("token", "secret", "password", "authorization")):
+                sanitized[key] = "***REDACTED***"
+            else:
+                sanitized[key] = _sanitizar_auth_log(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitizar_auth_log(item) for item in value]
+    return value
+
+
 def _store_token(data: dict) -> str:
     # Normaliza la respuesta de auth y persiste el token en cache local.
     access = data.get("access_token") or data.get("accessToken") or data.get("token")
@@ -81,7 +96,7 @@ async def obtener_token(client: Optional[httpx.AsyncClient] = None) -> str:
         # Ejecuta la peticion via cliente generico y valida la respuesta.
         response = await ext_client.run()
         
-        logger.info(f"Respuesta de auth obtenida: {response}")
+        logger.info("Respuesta de auth obtenida: %s", _sanitizar_auth_log(response))
         if not isinstance(response, dict):
             raise Exception("Respuesta invalida del servicio de auth")
         

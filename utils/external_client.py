@@ -12,12 +12,40 @@ from utils.servicios_externos_service import obtener_servicio_externo_por_codigo
 logger = logging.getLogger(__name__)
 
 
-def redactar_headers_sensibles(headers: Dict[str, Any]) -> Dict[str, Any]:
-    """Crea una copia segura para logs sin exponer credenciales."""
-    return {
-        key: "[REDACTED]" if str(key).lower() == "authorization" else value
-        for key, value in (headers or {}).items()
-    }
+SENSITIVE_KEY_PARTS = (
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "pass",
+    "client_secret",
+)
+
+
+def _sanitize_for_log(value: Any) -> Any:
+    """Redacta credenciales antes de escribir logs o persistir trazas."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in SENSITIVE_KEY_PARTS):
+                sanitized[key] = "***REDACTED***"
+            else:
+                sanitized[key] = _sanitize_for_log(item)
+        return sanitized
+
+    if isinstance(value, list):
+        return [_sanitize_for_log(item) for item in value]
+
+    return value
+
+
+def _truncate_for_log(value: Any, max_chars: int = 4000) -> str:
+    """Convierte un valor a texto seguro y limita respuestas grandes."""
+    text = json.dumps(_sanitize_for_log(value), ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncado]"
 
 
 class ExternalClient:
@@ -51,6 +79,7 @@ class ExternalClient:
         self.body = body or {}
         self.dynamic_values = {}  # Variables dinámicas a reemplazar
         self.client_id = None  # Para logging
+        self._last_final_body = {}
 
     @classmethod
     async def from_code(cls, codigo: str, client_id: Optional[str] = None) -> "ExternalClient":
@@ -70,7 +99,11 @@ class ExternalClient:
 
         servicio = await consultar_servicio_externo(codigo)
         
-        logger.info(f"Servicio externo obtenido de BD para código '{codigo}': {servicio} \n")
+        logger.info(
+            "Servicio externo obtenido de BD para código '%s': %s \n",
+            codigo,
+            _truncate_for_log(servicio),
+        )
         if not servicio:
             raise ValueError(f"Servicio externo '{codigo}' no encontrado en BD")
 
@@ -198,13 +231,20 @@ class ExternalClient:
 
             # Reemplazar variables en body
             final_body = self._process_dict(self.body) if self.body else {}
+            self._last_final_body = final_body
 
             # Logs de depuración
             logger.info(f"[{self.codigo}] URL final: {final_url} \n")
+            logger.info(f"[{self.codigo}] Encabezados: {_sanitize_for_log(final_headers)}\n")
+            logger.info(f"[{self.codigo}] Cuerpo final: {_sanitize_for_log(final_body)}\n")
             logger.info(
-                f"[{self.codigo}] Headers: {redactar_headers_sensibles(final_headers)}\n"
+                "[PETICION_SALIENTE] codigo_servicio=%s | metodo_http=%s | api=%s | encabezados=%s | cuerpo=%s",
+                self.codigo,
+                self.metodo,
+                final_url,
+                _truncate_for_log(final_headers),
+                _truncate_for_log(final_body),
             )
-            logger.info(f"[{self.codigo}] Body final: {final_body}\n")
             
             await info_notify(
                 method_name=f"external_client:{self.codigo}",
@@ -242,7 +282,11 @@ class ExternalClient:
                     await info_notify(
                         method_name=f"external_client:{self.codigo}",
                         client_id=self.client_id or "N/A",
-                        info_message=f"Respuesta JSON recibida del servicio externo '{self.nombre_servicio}' para código '{self.codigo}', respuesta: {data} \n"
+                        info_message=(
+                            f"Respuesta JSON recibida del servicio externo '{self.nombre_servicio}' "
+                            f"para código '{self.codigo}', respuesta: "
+                            f"{_truncate_for_log(data)} \n"
+                        )
                     )
                 except Exception:
                     data = {"raw_text": response.text}
@@ -306,6 +350,11 @@ class ExternalClient:
     ):
         """Registra errores en la BD"""
         try:
+            try:
+                response_for_log = json.loads(response_text)
+            except Exception:
+                response_for_log = {"raw_response": response_text}
+
             await insertar_log(
                 method_name=f"external_client:{self.codigo}",
                 client_id=self.client_id or "N/A",
@@ -314,10 +363,14 @@ class ExternalClient:
                 tipo="error",
                 nombre_archivo="utils/external_client.py",
                 traceback_str=traceback.format_exc(),
-                respuesta_api=response_text,
+                respuesta_api=_truncate_for_log(response_for_log),
                 payload_enviado=(
-                    json.dumps(payload_enviado, default=str)
-                    if payload_enviado is not None
+                    json.dumps(
+                        _sanitize_for_log(self._last_final_body or self.body),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if (self._last_final_body or self.body)
                     else None
                 ),
             )
@@ -325,7 +378,7 @@ class ExternalClient:
             logger.error("Failed to persist log for external_client", exc_info=True)
 
     def __dict__(self):
-        """Para debugging"""
+        """Para depuración"""
         return {
             "nombre_servicio": self.nombre_servicio,
             "codigo": self.codigo,
@@ -335,5 +388,5 @@ class ExternalClient:
             "reintentos": self.reintentos,
             "header": self.header,
             "body": self.body,
-            "dynamic_values": self.dynamic_values
+            "dynamic_values": _sanitize_for_log(self.dynamic_values)
         }

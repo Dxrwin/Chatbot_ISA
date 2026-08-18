@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import date, datetime
 from typing import Any, Dict
@@ -826,6 +827,19 @@ class ServicioOrdenesPago:
         """
         Construye la respuesta estándar para endpoints internos.
         """
+        metadatos = orden.get("metadatos") or {}
+        if isinstance(metadatos, str):
+            try:
+                metadatos = json.loads(metadatos)
+            except json.JSONDecodeError:
+                metadatos = {}
+
+        monto_legible = (
+            metadatos.get("valor_confirmado_legible")
+            or metadatos.get("valor_confirmado_original")
+            or str(orden["monto"])
+        )
+
         return {
             "id_orden_pago": orden["id"],
             "codigo_orden_interno": orden["codigo_orden_interno"],
@@ -834,6 +848,7 @@ class ServicioOrdenesPago:
             "proveedor": orden["proveedor"],
             "estado": orden["estado"],
             "monto": orden["monto"],
+            "monto_legible": monto_legible,
             "moneda": orden["moneda"],
             "enlace_pago": orden.get("enlace_pago"),
             "id_orden_proveedor": orden.get("id_orden_proveedor"),
