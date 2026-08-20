@@ -60,6 +60,10 @@ _INPUT_VARIABLE_KEYS = frozenset(
         "TOTAL_CREDITO",
         "CORREO_CARTERA",
         "WHATSAPP_DISPONIBLE",
+        "SEGMENTO_CAMPANA",
+        "LINEA_CREDITO",
+        "NOMBRE_TITULAR",
+        "PHONE_NUMBER",
     }
 )
 
@@ -111,6 +115,7 @@ def _canonical_input_field(key: str) -> Optional[str]:
         "objetivo": "OBJETIVO",
         "nombre_estudiante": "NOMBRE",
         "nombre_cliente": "NOMBRE",
+        "nombre_titular": "NOMBRE",
         "cedula_titular": "CEDULA",
         "documento_titular": "CEDULA",
         "numero_identificacion": "IDENTIFICACION_COTITULAR",
@@ -118,6 +123,7 @@ def _canonical_input_field(key: str) -> Optional[str]:
         "identificacion_cliente": "CEDULA",
         "celular": "TELEFONO",
         "phone": "TELEFONO",
+        "phone_number": "TELEFONO",
         "email": "CORREO",
         "universidad": "UNIVERSIDAD",
         "proveedor_pago": "PROVEEDOR_PAGO",
@@ -125,6 +131,8 @@ def _canonical_input_field(key: str) -> Optional[str]:
         "total_credito": "TOTAL_CREDITO",
         "correo_cartera": "CORREO_CARTERA",
         "whatsapp_disponible": "WHATSAPP_DISPONIBLE",
+        "segmento_campana": "SEGMENTO_CAMPANA",
+        "linea_credito": "LINEA_CREDITO",
     }
     return canonical.get(_normalize_key(key))
 
@@ -217,8 +225,8 @@ class BitrixCallInputVariables(BaseModel):
     MORA: Optional[Union[int, float, str]] = None
     CUOTA: Optional[Union[int, float, str]] = None
 
-    CEDULA: Union[int, str] = Field(
-        ...,
+    CEDULA: Optional[Union[int, str]] = Field(
+        None,
         description="Documento de identidad del cliente. Campo Bitrix: UF_CRM_1697774324.",
     )
 
@@ -294,14 +302,14 @@ class BitrixCallInputVariables(BaseModel):
 
     @field_validator("CEDULA", mode="before")
     @classmethod
-    def validate_cedula_required(cls, value: Any) -> Any:
+    def normalize_cedula(cls, value: Any) -> Optional[str]:
         """
         Valida que CEDULA venga presente y no vacía.
         """
 
         if value is None or str(value).strip() == "":
-            raise ValueError("CEDULA es obligatoria para consultar el cliente en Bitrix.")
-        return value
+            return None
+        return str(value).strip()
 
     @field_validator("CORREO", "CORREO_CARTERA", mode="before")
     @classmethod
@@ -347,6 +355,15 @@ class BitrixCallInputVariables(BaseModel):
             return None
 
         return text
+
+    @model_validator(mode="after")
+    def validate_client_identifier(self) -> "BitrixCallInputVariables":
+        if not any((self.CEDULA, self.TELEFONO, self.CORREO)):
+            raise ValueError(
+                "Debe enviar al menos uno de CEDULA, TELEFONO o CORREO "
+                "para consultar el cliente en Bitrix."
+            )
+        return self
 
 
 class BitrixExtractedVariable(BaseModel):
@@ -491,8 +508,8 @@ class BitrixDebugSearchClientRequest(BaseModel):
     Este endpoint no valida intención de pago; solo prueba búsqueda del cliente.
     """
 
-    CEDULA: Union[int, str] = Field(
-        ...,
+    CEDULA: Optional[Union[int, str]] = Field(
+        None,
         description="Documento del cliente. Campo Bitrix: UF_CRM_1697774324.",
     )
 
@@ -518,14 +535,14 @@ class BitrixDebugSearchClientRequest(BaseModel):
 
     @field_validator("CEDULA", mode="before")
     @classmethod
-    def validate_cedula_required(cls, value: Any) -> Any:
+    def normalize_cedula(cls, value: Any) -> Optional[str]:
         """
         Valida que CEDULA venga presente y no vacía.
         """
 
         if value is None or str(value).strip() == "":
-            raise ValueError("CEDULA es obligatoria.")
-        return value
+            return None
+        return str(value).strip()
 
     @field_validator("TELEFONO", "WHATSAPP_DISPONIBLE", mode="before")
     @classmethod
@@ -552,6 +569,12 @@ class BitrixDebugSearchClientRequest(BaseModel):
         """
         return _validate_optional_email(value)
 
+    @model_validator(mode="after")
+    def validate_client_identifier(self) -> "BitrixDebugSearchClientRequest":
+        if not any((self.CEDULA, self.TELEFONO, self.CORREO)):
+            raise ValueError("Debe enviar CEDULA, TELEFONO o CORREO.")
+        return self
+
 
 class BitrixLookupCriteriaResponse(BaseModel):
     """
@@ -565,6 +588,58 @@ class BitrixLookupCriteriaResponse(BaseModel):
     correo: Optional[str] = None
     nombre: Optional[str] = None
     id_libranza: Optional[str] = None
+
+
+class BitrixProcessDestinationRequest(BaseModel):
+    """Destino configurable de los deals para un proceso de llamadas."""
+
+    nombre_proceso: str = Field(..., min_length=1, max_length=150)
+    category_id: int = Field(..., ge=0)
+    stage_id: str = Field(..., min_length=1, max_length=100)
+    activo: bool = True
+
+    @field_validator("nombre_proceso", "stage_id")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("El valor no puede estar vacio.")
+        return text
+
+
+class BitrixProcessFieldMappingRequest(BaseModel):
+    """Sustitucion del codigo UF_CRM asociado a un dato logico del proceso."""
+
+    codigo_campo_bitrix: str = Field(..., min_length=8, max_length=100)
+    tipo_campo: Optional[str] = Field(default=None, min_length=1, max_length=30)
+    valor_positivo: Optional[str] = Field(default=None, max_length=255)
+    valor_negativo: Optional[str] = Field(default=None, max_length=255)
+    activo: bool = True
+
+    @field_validator("codigo_campo_bitrix")
+    @classmethod
+    def validar_codigo_campo_bitrix(cls, value: str) -> str:
+        codigo = str(value).strip().upper()
+        if not re.fullmatch(r"UF_CRM_\d+", codigo):
+            raise ValueError("codigo_campo_bitrix debe tener formato UF_CRM_123456.")
+        return codigo
+
+    @field_validator("tipo_campo")
+    @classmethod
+    def validar_tipo_campo(cls, value: str) -> str:
+        tipo = str(value).strip().lower()
+        permitidos = {"texto", "texto_booleano", "lista", "numero", "fecha", "url"}
+        if tipo not in permitidos:
+            raise ValueError(f"tipo_campo debe ser uno de: {', '.join(sorted(permitidos))}.")
+        return tipo
+
+    @field_validator("valor_positivo", "valor_negativo")
+    @classmethod
+    def limpiar_valor_opcional(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        texto = str(value).strip()
+        return texto or None
 
 
 class BitrixCallCompletedResponse(BaseModel):
@@ -589,3 +664,7 @@ class BitrixCallCompletedResponse(BaseModel):
     bitrix_link_verified: Optional[bool] = None
     bitrix_link_update: Optional[Dict[str, Any]] = None
     agent_context: Optional[Dict[str, Any]] = None
+    codigo_proceso: Optional[str] = None
+    destino_bitrix: Optional[Dict[str, Any]] = None
+    mapeos_campos_bitrix: Optional[Dict[str, Dict[str, Any]]] = None
+    reason: Optional[str] = None

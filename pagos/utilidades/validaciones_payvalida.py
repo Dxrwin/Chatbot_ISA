@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
+from pagos.utilidades.fechas import normalizar_fecha_payvalida
 
 
 class ErrorValidacionPayvalida(Exception):
@@ -184,7 +185,7 @@ def validar_fecha_expiracion_payvalida(fecha_expiracion: Optional[str]) -> None:
     - Debe ser igual o posterior a hoy.
     - No debe superar 30 días calendario.
     """
-    fecha_texto = str(fecha_expiracion or "").strip()
+    fecha_texto = normalizar_fecha_payvalida(fecha_expiracion) or ""
 
     if not fecha_texto:
         raise ErrorValidacionPayvalida(

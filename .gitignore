@@ -10,21 +10,20 @@ dist/
 __pycache__/
 
 documentacion/
-tests/
-!tests/
+sql/
+
+# Tests: ignorar por defecto y conservar las suites mantenidas en Git.
 tests/*
 !tests/test_pagos_mora_cuota_inicial.py
-sql/
-tests*
-!tests/
-tests/*
-tests/test_payables_linea_producto.py
+!tests/test_payables_linea_producto.py
+!tests/test_creditos_activos_one2credit.py
 
 # Compiled Java class files
 *.class
 
 # Compiled Python bytecode
 *.py[cod]
+*.pyc
 
 # Log files
 *.log
