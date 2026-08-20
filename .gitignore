@@ -12,11 +12,8 @@ __pycache__/
 documentacion/
 sql/
 
-# Tests: ignorar por defecto y conservar las suites mantenidas en Git.
-tests/*
-!tests/test_pagos_mora_cuota_inicial.py
-!tests/test_payables_linea_producto.py
-!tests/test_creditos_activos_one2credit.py
+# Pruebas locales: no incluirlas en despliegues ni commits.
+tests/
 
 # Compiled Java class files
 *.class
