@@ -9,6 +9,17 @@ package.json
 dist/
 __pycache__/
 
+documentacion/
+tests/
+!tests/
+tests/*
+!tests/test_pagos_mora_cuota_inicial.py
+sql/
+tests*
+!tests/
+tests/*
+tests/test_payables_linea_producto.py
+
 # Compiled Java class files
 *.class
 

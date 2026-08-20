@@ -1,4 +1,11 @@
-from pydantic import BaseModel, ValidationError, field_validator, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
@@ -180,7 +187,10 @@ class ServicioExternoUpdateRequest(BaseModel):
 
 
 class PayableRequest(BaseModel):
-    creditLineId: str
+    creditLineId: str = Field(
+        validation_alias=AliasChoices("creditLineID", "creditLineId"),
+        serialization_alias="creditLineID",
+    )
     principal: float
     time: int
     paymentFrequency: int
@@ -189,7 +199,24 @@ class PayableRequest(BaseModel):
     source: Optional[str] = None
     redirectUrl: Optional[str] = None
     callbackUrl: Optional[str] = None
-    meta: Optional[Dict[str, Any]] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_credit_line_aliases(cls, data):
+        """Acepta ambos nombres del contrato, pero evita IDs ambiguos."""
+        if isinstance(data, dict):
+            upper_id = data.get("creditLineID")
+            lower_id = data.get("creditLineId")
+            if (
+                upper_id is not None
+                and lower_id is not None
+                and str(upper_id).strip() != str(lower_id).strip()
+            ):
+                raise ValueError(
+                    "creditLineID y creditLineId no pueden contener valores diferentes"
+                )
+        return data
 
     @field_validator("principal", "initialFee", mode="before")
     @classmethod
@@ -220,12 +247,18 @@ class PayableRequest(BaseModel):
     @field_validator("disbursementMethod", mode="before")
     @classmethod
     def validate_disbursement(cls, v):
-        """Valida disbursementMethod, rechaza strings vacíos"""
-        if v == "" or v is None:
+        """Conserva el string vacío porque forma parte del contrato de Kuenta."""
+        if v is None:
             return None
         if isinstance(v, str):
-            return v.strip() if v.strip() else None
+            return v.strip()
         return v
+
+    @field_validator("meta", mode="before")
+    @classmethod
+    def validate_meta(cls, v):
+        """Normaliza metadata ausente o nula a un objeto vacío."""
+        return {} if v is None else v
 
     @field_validator("creditLineId", mode="before")
     @classmethod
@@ -1508,6 +1541,342 @@ def extraer_campos_faltantes(kuenta_response: dict) -> dict:
     }
 
 
+CLAVES_SENSIBLES_DEPURACION = (
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "pass",
+    "client_secret",
+)
+
+
+def sanitizar_depuracion_kuenta(value: Any) -> Any:
+    """Redacta secretos antes de registrar trazas relacionadas con Kuenta."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in CLAVES_SENSIBLES_DEPURACION):
+                sanitized[key] = "***REDACTED***"
+            else:
+                sanitized[key] = sanitizar_depuracion_kuenta(item)
+        return sanitized
+
+    if isinstance(value, list):
+        return [sanitizar_depuracion_kuenta(item) for item in value]
+
+    return value
+
+
+def truncar_depuracion_kuenta(value: Any, max_chars: int = 4000) -> str:
+    """Serializa trazas sanitizadas y limita su tamaño en los logs."""
+    text = json.dumps(sanitizar_depuracion_kuenta(value), ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncado]"
+
+
+def extraer_error_kuenta_create_payable(response_data: Any) -> Dict[str, Any]:
+    """Normaliza los formatos de error que puede devolver Kuenta."""
+    if not isinstance(response_data, dict):
+        return {
+            "codigo": "Unknown",
+            "mensaje": "Kuenta devolvio una respuesta no estructurada.",
+            "detalle": sanitizar_depuracion_kuenta(response_data),
+        }
+
+    data = response_data.get("data")
+    data_dict = data if isinstance(data, dict) else {}
+    codigo = (
+        data_dict.get("code")
+        or response_data.get("code")
+        or response_data.get("CODE")
+        or response_data.get("error")
+        or "Unknown"
+    )
+    mensaje = (
+        data_dict.get("message")
+        or response_data.get("message")
+        or response_data.get("DESC")
+        or response_data.get("error_description")
+        or response_data.get("error")
+        or "Kuenta no informo el detalle del error."
+    )
+    return {
+        "codigo": codigo,
+        "mensaje": mensaje,
+        "detalle": sanitizar_depuracion_kuenta(response_data),
+    }
+
+
+def log_respuesta_create_payable_depuracion(
+    *,
+    codigo_estado_respuesta: int,
+    endpoint: str,
+    metodo_http_externo: str,
+    api_externa: str,
+    cuerpo_enviado: Dict[str, Any],
+    respuesta: Any,
+) -> None:
+    """Registra una traza sanitizada antes de responder desde create_payable."""
+    logger.info(
+        "[RESPUESTA_CREATE_PAYABLE] codigo_estado_respuesta=%s | endpoint=%s | "
+        "metodo_http_externo=%s | api_externa=%s | cuerpo_enviado=%s | respuesta=%s",
+        codigo_estado_respuesta,
+        endpoint,
+        metodo_http_externo,
+        api_externa,
+        truncar_depuracion_kuenta(cuerpo_enviado),
+        truncar_depuracion_kuenta(respuesta),
+    )
+
+
+def _json_respuesta_http_seguro(response: httpx.Response) -> Any:
+    """Evita que respuestas vacías o no JSON oculten el error real de Kuenta."""
+    try:
+        return response.json()
+    except (ValueError, json.JSONDecodeError):
+        return {
+            "code": "InvalidJSONResponse",
+            "message": "Kuenta devolvio una respuesta no JSON.",
+            "contentType": response.headers.get("content-type"),
+            "bodyLength": len(response.content),
+        }
+
+
+def _numero_opcional(valor: Any) -> Optional[float]:
+    """Convierte configuraciones numericas de Kuenta sin asumir que siempre existen."""
+    if valor is None or valor == "":
+        return None
+    try:
+        if isinstance(valor, str):
+            valor = valor.replace(",", ".").strip()
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _frecuencias_permitidas(valor: Any) -> List[int]:
+    valores = valor if isinstance(valor, (list, tuple, set)) else [valor]
+    frecuencias = []
+    for item in valores:
+        numero = _numero_opcional(item)
+        if numero is not None and numero.is_integer():
+            frecuencias.append(int(numero))
+    return frecuencias
+
+
+def construir_restricciones_producto(producto: Dict[str, Any]) -> Dict[str, Any]:
+    """Extrae las reglas relevantes para respuestas de validacion y trazabilidad."""
+    return {
+        "creditLineId": producto.get("ID") or producto.get("id"),
+        "principalMin": producto.get("principalMin"),
+        "principalMax": producto.get("principalMax"),
+        "timeMin": producto.get("timeMin"),
+        "timeMax": producto.get("timeMax"),
+        "timeDefault": producto.get("timeDefault"),
+        "paymentFrequency": producto.get("paymentFrequency"),
+        "initialFee": producto.get("initialFee"),
+        "initialFeeMin": producto.get("initialFeeMin"),
+        "initialFeeMax": producto.get("initialFeeMax"),
+        "initialFeeMinRate": producto.get("initialFeeMinRate"),
+        "initialFeeMaxRate": producto.get("initialFeeMaxRate"),
+    }
+
+
+def _error_validacion_producto(
+    codigo: str,
+    detalles_usuario: str,
+    producto: Dict[str, Any],
+) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "estado": "error",
+            "codigo": codigo,
+            "detalles_usuario": detalles_usuario,
+            "restricciones": construir_restricciones_producto(producto),
+        },
+    )
+
+
+def validar_payable_con_producto(
+    payload: PayableRequest,
+    producto: Dict[str, Any],
+) -> None:
+    """Valida el payable contra la configuracion vigente de la linea en Kuenta."""
+    product_id = producto.get("ID") or producto.get("id")
+    if not product_id or product_id != payload.creditLineId or producto.get("archived") is True:
+        raise _error_validacion_producto(
+            "InvalidCreditLine",
+            "La linea de credito no existe, esta archivada o no coincide con la solicitada.",
+            producto,
+        )
+
+    time_min = _numero_opcional(producto.get("timeMin"))
+    time_max = _numero_opcional(producto.get("timeMax"))
+    if (time_min is not None and payload.time < time_min) or (
+        time_max is not None and payload.time > time_max
+    ):
+        raise _error_validacion_producto(
+            "InvalidDays",
+            f"El plazo {payload.time} dias no es valido para esta linea. "
+            f"Debe estar entre {_valor_texto_linea_producto(producto.get('timeMin'))} y "
+            f"{_valor_texto_linea_producto(producto.get('timeMax'))} dias.",
+            producto,
+        )
+
+    principal_min = _numero_opcional(producto.get("principalMin"))
+    principal_max = _numero_opcional(producto.get("principalMax"))
+    if (principal_min is not None and payload.principal < principal_min) or (
+        principal_max is not None and payload.principal > principal_max
+    ):
+        raise _error_validacion_producto(
+            "InvalidPrincipal",
+            f"El principal {payload.principal:g} no es valido para esta linea. "
+            f"Debe estar entre {_valor_texto_linea_producto(producto.get('principalMin'))} y "
+            f"{_valor_texto_linea_producto(producto.get('principalMax'))}.",
+            producto,
+        )
+
+    frecuencias = _frecuencias_permitidas(producto.get("paymentFrequency"))
+    if frecuencias and payload.paymentFrequency not in frecuencias:
+        raise _error_validacion_producto(
+            "InvalidPaymentFrequency",
+            f"La frecuencia {payload.paymentFrequency} no esta permitida. "
+            f"Frecuencias validas: {', '.join(str(item) for item in frecuencias)}.",
+            producto,
+        )
+
+    if payload.initialFee < 0:
+        raise _error_validacion_producto(
+            "InvalidInitialFee",
+            "La cuota inicial no puede ser negativa.",
+            producto,
+        )
+
+    initial_fee_enabled = producto.get("initialFee")
+    if initial_fee_enabled is True:
+        fee_min = _numero_opcional(producto.get("initialFeeMin"))
+        fee_max = _numero_opcional(producto.get("initialFeeMax"))
+        fee_min_rate = _numero_opcional(producto.get("initialFeeMinRate"))
+        fee_max_rate = _numero_opcional(producto.get("initialFeeMaxRate"))
+        fee_rate = payload.initialFee / payload.principal if payload.principal > 0 else 0
+
+        fee_out_of_range = (
+            (fee_min is not None and fee_min > 0 and payload.initialFee < fee_min)
+            or (fee_max is not None and fee_max > 0 and payload.initialFee > fee_max)
+            or (fee_min_rate is not None and fee_min_rate > 0 and fee_rate < fee_min_rate)
+            or (fee_max_rate is not None and fee_max_rate > 0 and fee_rate > fee_max_rate)
+        )
+        if fee_out_of_range:
+            raise _error_validacion_producto(
+                "InvalidInitialFee",
+                "La cuota inicial esta fuera de los limites permitidos para esta linea.",
+                producto,
+            )
+
+
+def _construir_url_producto_kuenta(base_url: Optional[str], credit_line_id: str) -> str:
+    base = (base_url or API_URL or "https://api.kuenta.co/v1").rstrip("/")
+    for placeholder in (
+        "{linea_producto}",
+        "{creditLineID}",
+        "{creditLineId}",
+        "{credit_line_id}",
+    ):
+        if placeholder in base:
+            return base.replace(placeholder, credit_line_id)
+    if base.endswith("/product-lines"):
+        base = base.rsplit("/", 1)[0]
+    if base.endswith("/products"):
+        return f"{base}/{credit_line_id}"
+    return f"{base}/products/{credit_line_id}"
+
+
+async def obtener_producto_kuenta_para_validacion(
+    client: httpx.AsyncClient,
+    token: str,
+    credit_line_id: str,
+    client_id: str,
+) -> Dict[str, Any]:
+    """Obtiene la linea vigente antes de crear un payable y normaliza su respuesta."""
+    headers = {
+        "Config-Organization-ID": ORG_ID,
+        "Organization-ID": ORG_ID,
+        "Authorization": token,
+    }
+    ext_client_product = None
+    try:
+        ext_client_product = await ExternalClient.from_code(
+            "KUENTA_PRODUCT_GET",
+            client_id=client_id,
+        )
+    except ValueError:
+        pass
+
+    product_url = _construir_url_producto_kuenta(
+        ext_client_product.url if ext_client_product else API_URL,
+        credit_line_id,
+    )
+
+    if ext_client_product:
+        ext_client_product.set_dynamic_values(
+            {
+                "ORG_ID": ORG_ID,
+                "access_token": token,
+                "linea_producto": credit_line_id,
+                "creditLineID": credit_line_id,
+                "creditLineId": credit_line_id,
+            }
+        )
+        ext_client_product.set_headers(headers)
+        ext_client_product.set_url(product_url)
+        ext_client_product.set_body({})
+        external_response = await ext_client_product.run()
+        if not isinstance(external_response, dict):
+            raise HTTPException(status_code=502, detail={
+                "estado": "error",
+                "codigo": "InvalidProductResponse",
+                "detalles_usuario": "Kuenta devolvio una respuesta invalida al consultar la linea.",
+            })
+        status_code = external_response.get("status", 500)
+        response_data = external_response.get("data") or {}
+    else:
+        response = await client.get(product_url, headers=headers)
+        status_code = response.status_code
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = {}
+
+    if status_code == 404:
+        raise HTTPException(status_code=400, detail={
+            "estado": "error",
+            "codigo": "InvalidCreditLine",
+            "detalles_usuario": "La linea de credito indicada no existe en Kuenta.",
+        })
+    if status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail={
+            "estado": "error",
+            "codigo": "ProductServiceUnavailable",
+            "detalles_usuario": "No fue posible validar los limites de la linea de credito.",
+        })
+
+    nested_data = response_data.get("data") if isinstance(response_data, dict) else None
+    producto = nested_data.get("product") if isinstance(nested_data, dict) else None
+    if not isinstance(producto, dict) and isinstance(response_data, dict):
+        producto = response_data.get("product")
+    if not isinstance(producto, dict):
+        raise HTTPException(status_code=502, detail={
+            "estado": "error",
+            "codigo": "InvalidProductResponse",
+            "detalles_usuario": "Kuenta no devolvio la configuracion esperada de la linea.",
+        })
+    return producto
+
+
 @app.post("/payables/{client_id}")
 async def create_payable(client_id: str, payload: PayableRequest):
     """
@@ -1535,11 +1904,9 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
             # Construir payload para Kuenta
             new_payload = {
-                "creditLineId": payload.creditLineId,
+                "creditLineID": payload.creditLineId,
                 "principal": principal,
                 "time": payload.time,
-                "disbursementMethod": payload.disbursementMethod,
-                "initialFee": initial_fee,
                 "paymentFrequency": payload.paymentFrequency,
                 "source": payload.source,
                 "redirectUrl": payload.redirectUrl,
@@ -1547,7 +1914,20 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 "meta": payload.meta,
             }
 
-            # Eliminar campos None
+            if producto.get("initialFee") is True:
+                new_payload["initialFee"] = initial_fee
+            else:
+                logger.info(
+                    "La linea %s tiene initialFee deshabilitado; el campo se omite "
+                    "sin modificar principal.",
+                    payload.creditLineId,
+                )
+
+            # Kuenta distingue entre null y string vacío para este campo.
+            if payload.disbursementMethod is not None:
+                new_payload["disbursementMethod"] = payload.disbursementMethod
+
+            # Eliminar campos None restantes antes de enviar a Kuenta.
             new_payload = {k: v for k, v in new_payload.items() if v is not None}
 
             logger.info(f"Payload para Kuenta: {new_payload}")
@@ -1571,7 +1951,10 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # ===== REINTENTOS PARA POST PAYABLE =====
             max_retries = 3
             response_credit_id = None
-            # last_error_response = None
+            status_code = 500
+            error_code = "Unknown"
+            error_message = "No fue posible crear el payable"
+            ultimo_error_kuenta = None
 
             for attempt in range(max_retries):
                 try:
@@ -1585,19 +1968,16 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         # Inyectar variables dinámicas ANTES de ejecutar
                         # IMPORTANTE: Estas variables se usarán tanto para headers como para body
                         dynamic_vars = {
-                            "creditLineId": payload.creditLineId,  # Corregido: minúscula
-                            "principal": principal,
-                            "time": payload.time,
-                            "paymentFrequency": payload.paymentFrequency,
-                            "initialFee": initial_fee,
-                            "disbursementMethod": payload.disbursementMethod,
-                            "source": payload.source,
-                            "redirectUrl": payload.redirectUrl,
-                            "callbackUrl": payload.callbackUrl,
-                            "meta": payload.meta,
+                            **new_payload,
+                            "creditLineId": payload.creditLineId,
+                            "access_token": token,
+                            "ORG_ID": ORG_ID,
                         }
 
-                        logger.info(f"Variables dinámicas a inyectar: {dynamic_vars}")
+                        logger.info(
+                            "Variables dinámicas a inyectar (sanitizadas): %s",
+                            truncar_depuracion_kuenta(dynamic_vars),
+                        )
                         ext_client_post.set_dynamic_values(dynamic_vars)
 
                         # header dinámicos
@@ -1611,40 +1991,82 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         response = await ext_client_post.run()
 
                         if not isinstance(response, dict):
-                            raise Exception("Respuesta invalida del servicio externo")
+                            raise HTTPException(
+                                status_code=502,
+                                detail={
+                                    "estado": "error",
+                                    "codigo": "InvalidPayableResponse",
+                                    "detalles_usuario": "Kuenta devolvio una respuesta invalida al crear el credito.",
+                                },
+                            )
                         status_code = response.get("status", 500)
-                        response_data = response.get("data") or "no se accedio a data"
-                        if not isinstance(response_data, dict):
+                        response_data = response.get("data")
+                        if response_data is None:
                             response_data = {}
                     else:
                         response = await client.post(
                             PAYABLE_URL, json=new_payload, headers=headers
                         )
-                        response_data = response.json()
+                        response_data = _json_respuesta_http_seguro(response)
                         status_code = response.status_code
 
                     # logger.info(f"   Response Data: {str(response_data)}")
 
                     # ===== CASO 1: ÉXITO (200 o 201) =====
                     if status_code in (200, 201):
-                        credit = response_data.get("data", {}).get("credit", {})
+                        response_dict = response_data if isinstance(response_data, dict) else {}
+                        response_nested = response_dict.get("data")
+                        response_nested = (
+                            response_nested if isinstance(response_nested, dict) else {}
+                        )
+                        credit = response_nested.get("credit") or response_dict.get("credit")
+                        credit = credit if isinstance(credit, dict) else {}
                         response_credit_id = credit.get("ID")
                         logger.info(
                             f"Response: HTTP {status_code}, \n ID del credito: {response_credit_id}"
                         )
-                        break  # ¡Salió bien! Rompemos el ciclo.
+                        if not response_credit_id:
+                            ultimo_error_kuenta = {
+                                "operacion": "KUENTA_PAYABLE_CREATE",
+                                "codigo_estado_kuenta": status_code,
+                                "codigo_error_kuenta": "InvalidPayableResponse",
+                                "mensaje_error_kuenta": "Kuenta no devolvio el ID del credito creado.",
+                                "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                                "respuesta_kuenta": sanitizar_depuracion_kuenta(response_data),
+                                "intento": attempt + 1,
+                            }
+                            logger.error(
+                                "Respuesta exitosa de Kuenta sin ID de credito | %s",
+                                truncar_depuracion_kuenta(ultimo_error_kuenta),
+                            )
+                            raise HTTPException(
+                                status_code=502,
+                                detail={
+                                    "estado": "error",
+                                    "codigo": "InvalidPayableResponse",
+                                    "detalles_usuario": "Kuenta no confirmo el credito creado.",
+                                },
+                            )
+                        break
 
                     # ===== CASO 2: ERROR DEL CLIENTE O REGLA DE NEGOCIO (400, 409, 422) =====
                     elif status_code in (400, 409, 422):
-                        error_code = response_data.get("data", {}).get(
-                            "code", "Unknown"
-                        )
-                        error_message = response_data.get("data", {}).get(
-                            "message", "Unknown"
-                        )
+                        error_info = extraer_error_kuenta_create_payable(response_data)
+                        error_code = error_info["codigo"]
+                        error_message = error_info["mensaje"]
+                        ultimo_error_kuenta = {
+                            "operacion": "KUENTA_PAYABLE_CREATE",
+                            "codigo_estado_kuenta": status_code,
+                            "codigo_error_kuenta": error_code,
+                            "mensaje_error_kuenta": error_message,
+                            "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                            "respuesta_kuenta": error_info["detalle"],
+                            "intento": attempt + 1,
+                        }
 
                         logger.error(
-                            f"HTTP {status_code} - Code: {error_code}, Msg: {error_message}"
+                            "KUENTA_PAYABLE_CREATE fallo sin reintento | %s",
+                            truncar_depuracion_kuenta(ultimo_error_kuenta),
                         )
 
                         # Lógica de traducción para el Frontend
@@ -1715,6 +2137,15 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                         if attempt < max_retries - 1:
                             token = await obtener_token(client)
+                            if not token:
+                                raise HTTPException(
+                                    status_code=401,
+                                    detail={
+                                        "estado": "error",
+                                        "codigo": "AuthenticationError",
+                                        "detalles_usuario": "No fue posible renovar la autorizacion con Kuenta.",
+                                    },
+                                )
                             headers["Authorization"] = token
                             if ext_client_post:
                                 ext_client_post.set_headers(headers)
@@ -1731,8 +2162,17 @@ async def create_payable(client_id: str, payload: PayableRequest):
                                 detail="Fallo de autorización tras 3 intentos",
                             )
 
-                    # ===== CASO 4: ERRORES DE SERVIDOR O DESCONOCIDOS (5XX) =====
-                    else:
+                    # ===== CASO 4: ERRORES DE SERVIDOR (5XX) =====
+                    elif 500 <= status_code <= 599:
+                        ultimo_error_kuenta = {
+                            "operacion": "KUENTA_PAYABLE_CREATE",
+                            "codigo_estado_kuenta": status_code,
+                            "codigo_error_kuenta": "error_servidor_o_estado_no_esperado",
+                            "mensaje_error_kuenta": "Error del servidor Kuenta o estado no esperado",
+                            "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                            "respuesta_kuenta": sanitizar_depuracion_kuenta(response_data),
+                            "intento": attempt + 1,
+                        }
                         logger.error(
                             f"Error del servidor Kuenta HTTP {status_code}: {response_data}"
                         )
@@ -1745,14 +2185,50 @@ async def create_payable(client_id: str, payload: PayableRequest):
                             await asyncio.sleep(2**attempt)
                             continue
 
+                    # Otros estados no se reintentan: no son errores transitorios conocidos.
+                    else:
+                        error_info = extraer_error_kuenta_create_payable(response_data)
+                        ultimo_error_kuenta = {
+                            "operacion": "KUENTA_PAYABLE_CREATE",
+                            "codigo_estado_kuenta": status_code,
+                            "codigo_error_kuenta": error_info["codigo"],
+                            "mensaje_error_kuenta": error_info["mensaje"],
+                            "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                            "respuesta_kuenta": error_info["detalle"],
+                            "intento": attempt + 1,
+                        }
+                        logger.error(
+                            "Estado no reintentable de Kuenta | %s",
+                            truncar_depuracion_kuenta(ultimo_error_kuenta),
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "estado": "error",
+                                "codigo": "KuentaRequestRejected",
+                                "detalles_usuario": "Kuenta rechazo la solicitud con un estado no esperado.",
+                            },
+                        )
+
                 except httpx.TimeoutException as e:
+                    status_code = 504
+                    ultimo_error_kuenta = {
+                        "operacion": "KUENTA_PAYABLE_CREATE",
+                        "codigo_estado_kuenta": 504,
+                        "codigo_error_kuenta": "tiempo_espera_agotado",
+                        "mensaje_error_kuenta": str(e),
+                        "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                        "respuesta_kuenta": None,
+                        "intento": attempt + 1,
+                    }
                     if attempt < max_retries - 1:
                         wait_time = 2**attempt
                         logger.info(f"Reintentando en {wait_time}s...")
                         await asyncio.sleep(wait_time)
+                        continue
 
-                except (httpx.TimeoutException, httpx.RequestError) as e:
-                    # Errores puros de red. Los registramos y reintentamos.
+                except httpx.RequestError as e:
+                    status_code = 502
                     error_traceback = traceback.format_exc()
                     logger.error(f"Error de red en intento {attempt + 1}: {str(e)}")
                     await error_notify(
@@ -1776,12 +2252,35 @@ async def create_payable(client_id: str, payload: PayableRequest):
             # Si el ciclo for terminó y no obtuvimos un ID, significa que se agotaron los reintentos
             # y todo falló. Matamos el proceso aquí para no hacer un GET a `/payables/None`.
             if not response_credit_id:
+                detalle_fallo_payable = ultimo_error_kuenta or {
+                    "operacion": "KUENTA_PAYABLE_CREATE",
+                    "codigo_estado_kuenta": status_code or 500,
+                    "codigo_error_kuenta": error_code,
+                    "mensaje_error_kuenta": error_message,
+                    "cuerpo_enviado": sanitizar_depuracion_kuenta(new_payload),
+                    "respuesta_kuenta": None,
+                    "intento": max_retries,
+                }
+                logger.error(
+                    "KUENTA_PAYABLE_CREATE agotó sus reintentos | %s",
+                    truncar_depuracion_kuenta(detalle_fallo_payable),
+                )
+                codigo_publico = (
+                    504
+                    if detalle_fallo_payable.get("codigo_estado_kuenta") == 504
+                    else 502
+                )
                 raise HTTPException(
-                    status_code=status_code or 500,
+                    status_code=codigo_publico,
                     detail={
                         "estado": "error",
-                        "codigo": error_code,
-                        "detalles_usuario": error_message,
+                        "operacion": "KUENTA_PAYABLE_CREATE",
+                        "codigo": detalle_fallo_payable.get("codigo_error_kuenta", error_code),
+                        "detalles_usuario": (
+                            "Kuenta no respondio dentro del tiempo esperado."
+                            if codigo_publico == 504
+                            else "No fue posible crear el credito en Kuenta."
+                        ),
                     },
                 )
 
@@ -1818,7 +2317,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         res_simulacion = await ext_client_get.run()
 
                         if not isinstance(res_simulacion, dict):
-                            raise Exception("Respuesta inválida en simulación externa")
+                            raise ValueError("Respuesta invalida en simulacion externa")
 
                         status_code_simulacion = res_simulacion.get("status", 500)
                         simulacion_data = res_simulacion.get("data", {})
@@ -1827,9 +2326,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                             f"{PAYABLE_URL}/{response_credit_id}", headers=headers
                         )
                         status_code_simulacion = res_simulacion.status_code
-                        simulacion_data = (
-                            res_simulacion.json() if res_simulacion.text else {}
-                        )
+                        simulacion_data = _json_respuesta_http_seguro(res_simulacion)
 
                     # Éxito en la simulación
                     if status_code_simulacion in (200, 201):
@@ -1838,20 +2335,31 @@ async def create_payable(client_id: str, payload: PayableRequest):
                         )
                         break
 
-                    # Error en la simulación, dormimos 5s y reintentamos (tal vez Kuenta no la generó tan rápido)
-                    else:
+                    # Solo los 5xx se consideran transitorios en la simulacion.
+                    elif 500 <= status_code_simulacion <= 599:
                         logger.warning(
                             f"GET simulación status {status_code_simulacion}. Reintentando..."
                         )
                         if attempt_get < max_retries_simulacion - 1:
                             await asyncio.sleep(5)
                             continue
+                        break
 
-                except (httpx.TimeoutException, httpx.RequestError, Exception) as e:
+                    else:
+                        logger.error(
+                            "GET simulacion devolvio un estado no reintentable: %s",
+                            status_code_simulacion,
+                        )
+                        break
+
+                except (httpx.TimeoutException, httpx.RequestError) as e:
                     logger.error(f"Fallo de conexión en GET simulación: {str(e)}")
                     if attempt_get < max_retries_simulacion - 1:
                         await asyncio.sleep(5)
                         continue
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Respuesta invalida en GET simulacion: {str(e)}")
+                    break
 
             if status_code_simulacion not in (200, 201) or not simulacion_data:
                 await error_notify(
@@ -1892,7 +2400,7 @@ async def create_payable(client_id: str, payload: PayableRequest):
                 installments = credit_data.get("installments", [])
 
                 # logger.info(f"Installments obtenidas: {installments} \n")
-                cuota_inicial = credit_data.get("initialFee")
+                cuota_inicial = _numero_opcional(credit_data.get("initialFee")) or 0
                 ID_credito = credit_data.get("ID")
                 logger.info(f"ID del crédito obtenido: {ID_credito} \n")
                 referencia_credito = credit_data.get("reference")
@@ -1971,6 +2479,8 @@ async def create_payable(client_id: str, payload: PayableRequest):
 
                 return response_data
 
+            except HTTPException:
+                raise
             except Exception as e:
                 # Este bloque catch atrapa si la data de Kuenta cambió y nos rompe la extracción
                 logger.error(f"Error procesando JSON de simulación: {str(e)}")
@@ -6274,6 +6784,10 @@ def evaluar_gestion_universal(
 KUENTA_ONE2CREDIT_ORG_ID = ORG_ID or "beafcbd8-bba7-4303-ad8d-cf33026717b3"
 KUENTA_RECEIVABLES_URL = "https://api.kuenta.co/v1/receivables"
 ESTADOS_CREDITO_ONE2CREDIT_CONSULTA_MORA = {7, 10, 16}
+ESTADOS_CREDITO_ACTIVO_ONE2CREDIT = {
+    7: "DESEMBOLSADO",
+    10: "MORA",
+}
 
 
 def construir_headers_kuenta_one2credit(token: str) -> Dict[str, str]:
@@ -6311,17 +6825,386 @@ def extraer_datos_credito_mora_one2credit(credito: Dict[str, Any]) -> Dict[str, 
     }
 
 
-async def consultar_creditos_one2credit_por_cedula(cedula: str) -> Dict[str, Any]:
+def obtener_estado_credito_one2credit(credito: Dict[str, Any]) -> Optional[int]:
+    try:
+        return int(credito.get("status"))
+    except (TypeError, ValueError):
+        return None
+
+
+def seleccionar_creditos_activos_one2credit(
+    creditos: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Conserva el orden de Kuenta y filtra los estados de credito activos."""
+    return [
+        credito
+        for credito in creditos
+        if obtener_estado_credito_one2credit(credito)
+        in ESTADOS_CREDITO_ACTIVO_ONE2CREDIT
+    ]
+
+
+def normalizar_importe_resumen_one2credit(valor: Any) -> Any:
+    return valor_original_para_json(valor)
+
+
+CAMPOS_MONETARIOS_RESUMEN_ONE2CREDIT = {
+    "capital_inicial",
+    "total_credito",
+    "total_pagado",
+    "saldo_general",
+    "capital_pagado",
+    "capital_pendiente",
+    "intereses_pendientes",
+    "intereses_mora_pendientes",
+    "cargos_cobranza_pendientes",
+    "deuda_vencida",
+    "valor_cuota",
+    "valor_pagado",
+    "saldo_restante",
+    "capital",
+    "intereses_corrientes",
+    "intereses_adicionales",
+    "mora_heredada",
+    "intereses_mora",
+    "cargos_cobranza",
+    "costos",
+    "impuestos",
+    "monto_registrado",
+    "valor_aplicado_cuota",
+}
+
+
+def formatear_importe_resumen_one2credit(valor: Any) -> Optional[str]:
+    valor_redondeado = redondear_valor_cuota(valor)
+    if valor_redondeado is None:
+        return None
+    return f"{valor_redondeado:,}".replace(",", ".")
+
+
+def agregar_formatos_importes_one2credit(valor: Any) -> Any:
+    """Agrega campo_format junto a cada importe monetario del resumen."""
+    if isinstance(valor, list):
+        return [agregar_formatos_importes_one2credit(item) for item in valor]
+    if not isinstance(valor, dict):
+        return valor
+
+    resultado: Dict[str, Any] = {}
+    for campo, contenido in valor.items():
+        resultado[campo] = agregar_formatos_importes_one2credit(contenido)
+        if campo in CAMPOS_MONETARIOS_RESUMEN_ONE2CREDIT:
+            resultado[f"{campo}_format"] = formatear_importe_resumen_one2credit(
+                contenido
+            )
+    return resultado
+
+
+def calcular_saldo_restante_cuota_one2credit(
+    cuota: Dict[str, Any],
+) -> Any:
+    valor_cuota = decimal_pago_o_cero(cuota.get("payment"))
+    valor_pagado = decimal_pago_o_cero(cuota.get("valuePaid"))
+    saldo = max(valor_cuota - valor_pagado, Decimal("0"))
+    return normalizar_importe_resumen_one2credit(saldo)
+
+
+def construir_resumen_pago_cuota_one2credit(
+    pago: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "fecha_registro": pago.get("registeredAt"),
+        "fecha_referencia": pago.get("referencedAt"),
+        "id_orden": pago.get("orderId"),
+        "monto_registrado": normalizar_importe_resumen_one2credit(
+            pago.get("amount")
+        ),
+        "valor_aplicado_cuota": normalizar_importe_resumen_one2credit(
+            pago.get("valuePaid")
+        ),
+        "desglose_aplicado": {
+            "capital": normalizar_importe_resumen_one2credit(
+                pago.get("capitalPaid")
+            ),
+            "intereses_corrientes": normalizar_importe_resumen_one2credit(
+                pago.get("interestPaid")
+            ),
+            "intereses_adicionales": normalizar_importe_resumen_one2credit(
+                pago.get("additionalInterestPaid")
+            ),
+            "intereses_mora": normalizar_importe_resumen_one2credit(
+                pago.get("debtInterestPaid")
+            ),
+            "cargos_cobranza": normalizar_importe_resumen_one2credit(
+                pago.get("penaltyPaid")
+            ),
+            "costos": normalizar_importe_resumen_one2credit(
+                pago.get("costsPaid")
+            ),
+            "impuestos": normalizar_importe_resumen_one2credit(
+                pago.get("taxesPaid")
+            ),
+        },
+        "metodo_pago": pago.get("paymentMethod"),
+        "metodo_payvalida": pago.get("payvalidaMethod"),
+        "es_pago_tardio": bool(pago.get("isLate")),
+        "completo_cuota": bool(pago.get("isCompletion")),
+    }
+
+
+def construir_resumen_cuota_one2credit(
+    cuota: Dict[str, Any],
+) -> Dict[str, Any]:
+    estado = mapear_estado_cuota(cuota.get("status"))
+    pagos_raw = cuota.get("payments")
+    pagos = (
+        [pago for pago in pagos_raw if isinstance(pago, dict)]
+        if isinstance(pagos_raw, list)
+        else []
+    )
+    resumen = {
+        "id": cuota.get("id"),
+        "numero": cuota.get("number"),
+        "estado": {
+            "id": estado.get("estado_codigo"),
+            "nombre": estado.get("estado_descripcion"),
+        },
+        "fecha_vencimiento": cuota.get("date"),
+        "fecha_pago_completo": cuota.get("paidAt"),
+        "valor_cuota": normalizar_importe_resumen_one2credit(
+            cuota.get("payment")
+        ),
+        "valor_pagado": normalizar_importe_resumen_one2credit(
+            cuota.get("valuePaid")
+        ),
+        "saldo_restante": calcular_saldo_restante_cuota_one2credit(cuota),
+        "desglose_cuota": {
+            "capital": normalizar_importe_resumen_one2credit(
+                cuota.get("capital")
+            ),
+            "intereses_corrientes": normalizar_importe_resumen_one2credit(
+                cuota.get("interest")
+            ),
+            "intereses_adicionales": normalizar_importe_resumen_one2credit(
+                cuota.get("additionalInterest")
+            ),
+            "mora_heredada": normalizar_importe_resumen_one2credit(
+                cuota.get("debtPayment")
+            ),
+            "intereses_mora": normalizar_importe_resumen_one2credit(
+                cuota.get("debtInterest")
+            ),
+            "cargos_cobranza": normalizar_importe_resumen_one2credit(
+                cuota.get("penalty")
+            ),
+            "costos": normalizar_importe_resumen_one2credit(
+                cuota.get("costs")
+            ),
+            "impuestos": normalizar_importe_resumen_one2credit(
+                cuota.get("taxes")
+            ),
+        },
+        "desglose_pagado_acumulado": {
+            "capital": normalizar_importe_resumen_one2credit(
+                cuota.get("capitalPaid")
+            ),
+            "intereses_corrientes": normalizar_importe_resumen_one2credit(
+                cuota.get("interestPaid")
+            ),
+            "intereses_adicionales": normalizar_importe_resumen_one2credit(
+                cuota.get("additionalInterestPaid")
+            ),
+            "intereses_mora": normalizar_importe_resumen_one2credit(
+                cuota.get("debtInterestPaid")
+            ),
+            "cargos_cobranza": normalizar_importe_resumen_one2credit(
+                cuota.get("penaltyPaid")
+            ),
+            "costos": normalizar_importe_resumen_one2credit(
+                cuota.get("costsPaid")
+            ),
+            "impuestos": normalizar_importe_resumen_one2credit(
+                cuota.get("taxesPaid")
+            ),
+        },
+        "cantidad_pagos_registrados": len(pagos),
+    }
+    if pagos:
+        resumen["pagos_registrados"] = [
+            construir_resumen_pago_cuota_one2credit(pago)
+            for pago in pagos
+        ]
+    return resumen
+
+
+def construir_resumen_credito_activo_one2credit(
+    credito: Dict[str, Any],
+) -> Dict[str, Any]:
+    debtor = credito.get("debtor") if isinstance(credito.get("debtor"), dict) else {}
+    debtor_profile = (
+        credito.get("debtorProfile")
+        if isinstance(credito.get("debtorProfile"), dict)
+        else {}
+    )
+    natural = (
+        debtor_profile.get("natural")
+        if isinstance(debtor_profile.get("natural"), dict)
+        else {}
+    )
+    credit_line = (
+        credito.get("creditLine")
+        if isinstance(credito.get("creditLine"), dict)
+        else {}
+    )
+    summary = (
+        credito.get("summary")
+        if isinstance(credito.get("summary"), dict)
+        else {}
+    )
+    installments_raw = credito.get("installments")
+    installments = (
+        sorted(
+            [cuota for cuota in installments_raw if isinstance(cuota, dict)],
+            key=numero_cuota_int,
+        )
+        if isinstance(installments_raw, list)
+        else []
+    )
+    cuotas_resumidas = [
+        construir_resumen_cuota_one2credit(cuota)
+        for cuota in installments
+    ]
+    cuotas_pagadas = [
+        cuota for cuota in cuotas_resumidas if get_nested(cuota, "estado", "id") == 1
+    ]
+    cuotas_pendientes = [
+        cuota for cuota in cuotas_resumidas if get_nested(cuota, "estado", "id") == 3
+    ]
+    cuotas_vencidas = [
+        cuota for cuota in cuotas_resumidas if get_nested(cuota, "estado", "id") == 4
+    ]
+    cuotas_inactivas = [
+        cuota for cuota in cuotas_resumidas if get_nested(cuota, "estado", "id") == 0
+    ]
+    estado_credito = obtener_estado_credito_one2credit(credito)
+    primer_nombre = natural.get("firstName")
+    apellidos = natural.get("lastName")
+    nombre_completo = " ".join(
+        str(valor).strip()
+        for valor in (primer_nombre, apellidos)
+        if valor is not None and str(valor).strip()
+    )
+
+    resumen = {
+        "cliente": {
+            "id_deudor": credito.get("debtorID") or debtor.get("ID"),
+            "id_perfil": credito.get("debtorProfileID") or debtor_profile.get("ID"),
+            "nombre_completo": nombre_completo,
+            "nombres": primer_nombre,
+            "apellidos": apellidos,
+            "tipo_documento": natural.get("idType"),
+            "numero_documento": natural.get("idNumber"),
+            "telefono": debtor.get("phone"),
+            "correo": natural.get("email") or debtor.get("email"),
+        },
+        "linea_credito": {
+            "id": credito.get("creditLineID") or credit_line.get("ID"),
+            "nombre": credit_line.get("title") or credit_line.get("name"),
+        },
+        "credito": {
+            "id": credito.get("ID") or credito.get("id"),
+            "referencia": credito.get("reference"),
+            "consecutivo": credito.get("consecutive"),
+            "estado": {
+                "id": estado_credito,
+                "nombre": ESTADOS_CREDITO_ACTIVO_ONE2CREDIT.get(estado_credito),
+            },
+            "capital_inicial": normalizar_importe_resumen_one2credit(
+                credito.get("principal")
+            ),
+            "fecha_creacion": credito.get("createdAt"),
+            "fecha_desembolso": credito.get("disbursedAt"),
+        },
+        "saldo": {
+            "total_credito": normalizar_importe_resumen_one2credit(
+                summary.get("total")
+            ),
+            "total_pagado": normalizar_importe_resumen_one2credit(
+                summary.get("paid")
+            ),
+            "saldo_general": normalizar_importe_resumen_one2credit(
+                summary.get("balance")
+            ),
+            "capital_pagado": normalizar_importe_resumen_one2credit(
+                summary.get("capitalPaid")
+            ),
+            "capital_pendiente": normalizar_importe_resumen_one2credit(
+                summary.get("capitalBalance")
+            ),
+            "intereses_pendientes": normalizar_importe_resumen_one2credit(
+                summary.get("interestBalance")
+            ),
+            "intereses_mora_pendientes": normalizar_importe_resumen_one2credit(
+                summary.get("debtInterestBalance")
+            ),
+            "cargos_cobranza_pendientes": normalizar_importe_resumen_one2credit(
+                summary.get("penaltyBalance")
+            ),
+            "deuda_vencida": normalizar_importe_resumen_one2credit(
+                summary.get("debt")
+            ),
+            "dias_mora": summary.get("debtDays"),
+        },
+        "cuotas": {
+            "total": len(cuotas_resumidas),
+            "pagadas": len(cuotas_pagadas),
+            "pendientes": len(cuotas_pendientes),
+            "vencidas": len(cuotas_vencidas),
+            "inactivas": len(cuotas_inactivas),
+            "cuota_pendiente": cuotas_pendientes[0] if cuotas_pendientes else None,
+            "cuotas_vencidas": cuotas_vencidas,
+            "detalle": cuotas_resumidas,
+        },
+    }
+    return agregar_formatos_importes_one2credit(resumen)
+
+
+def construir_credito_activo_one2credit(credito: Dict[str, Any]) -> Dict[str, Any]:
+    estado_id = obtener_estado_credito_one2credit(credito)
+    return {
+        "estado": {
+            "id": estado_id,
+            "nombre": ESTADOS_CREDITO_ACTIVO_ONE2CREDIT.get(estado_id),
+        },
+        "datos_credito": extraer_datos_credito_mora_one2credit(credito),
+        "resumen_credito": construir_resumen_credito_activo_one2credit(credito),
+        "credito": credito,
+    }
+
+
+async def consultar_creditos_one2credit_por_cedula(
+    cedula: str,
+    estados: Optional[List[int]] = None,
+    order: str = "created_at:desc",
+    status_counts: bool = False,
+) -> Dict[str, Any]:
     method_name = "consultar_creditos_one2credit_por_cedula"
     token = await obtener_token()
     headers = construir_headers_kuenta_one2credit(token)
+    estados_consulta = (
+        ",".join(str(estado) for estado in estados)
+        if estados
+        else "0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22"
+    )
     params = {
+        "offset": 0,
         "limit": 10,
         "include": "summary,installments",
-        "status": "0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22",
+        "status": estados_consulta,
         "q": cedula,
-        "order": "created_at:desc",
+        "order": order,
     }
+    if status_counts:
+        params["statusCounts"] = "true"
 
     logger.info(
         "Consultando creditos One2Credit por cedula | cedula=%s | url=%s | params=%s",
@@ -6383,8 +7266,73 @@ async def consultar_creditos_one2credit_por_cedula(cedula: str) -> Dict[str, Any
     datos_credito = extraer_datos_credito_mora_one2credit(credito)
     return {
         "credito": credito,
+        "creditos": creditos,
         "datos_credito": datos_credito,
         "respuesta_proveedor": data,
+    }
+
+
+@app.get(
+    "/one2credit/creditos-activos",
+    tags=["One2Credit"],
+    summary="Consultar creditos activos One2Credit por cedula",
+)
+async def consultar_creditos_activos_one2credit_endpoint(
+    cedula: str = Query(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Cedula o documento del titular del credito.",
+    ),
+):
+    cedula_limpia = cedula.strip()
+    if not cedula_limpia:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "tipo_error": "cedula_requerida_one2credit",
+                "mensaje": "La cedula no puede estar vacia.",
+            },
+        )
+
+    consulta = await consultar_creditos_one2credit_por_cedula(
+        cedula_limpia,
+        estados=list(ESTADOS_CREDITO_ACTIVO_ONE2CREDIT),
+        order="updated_at:desc",
+        status_counts=True,
+    )
+    creditos_consultados = consulta.get("creditos")
+    if not isinstance(creditos_consultados, list):
+        creditos_consultados = extraer_lista_creditos_one2credit(
+            consulta.get("respuesta_proveedor", {})
+        )
+
+    creditos_activos = seleccionar_creditos_activos_one2credit(
+        creditos_consultados
+    )
+    resultados = [
+        construir_credito_activo_one2credit(credito)
+        for credito in creditos_activos
+    ]
+    total_activos = len(resultados)
+
+    if total_activos == 0:
+        tipo_resultado = "sin_creditos_activos"
+    elif total_activos == 1:
+        tipo_resultado = "credito_activo_unico"
+    else:
+        tipo_resultado = "multiples_creditos_activos"
+
+    return {
+        "ok": True,
+        "cedula": cedula_limpia,
+        "tipo_resultado": tipo_resultado,
+        "estados_considerados_activos": ESTADOS_CREDITO_ACTIVO_ONE2CREDIT,
+        "total_creditos_consultados": len(creditos_consultados),
+        "total_creditos_activos": total_activos,
+        "credito_seleccionado": resultados[0] if total_activos == 1 else None,
+        "creditos_activos": resultados,
     }
 
 
