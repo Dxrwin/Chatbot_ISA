@@ -9594,6 +9594,237 @@ def construir_credito_activo_one2credit(credito: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def construir_pago_compacto_one2credit(pago: Dict[str, Any]) -> Dict[str, Any]:
+    monto = normalizar_importe_resumen_one2credit(pago.get("amount"))
+    valor_aplicado = normalizar_importe_resumen_one2credit(
+        pago.get("valuePaid")
+    )
+    return {
+        "fecha": pago.get("registeredAt") or pago.get("referencedAt"),
+        "monto": monto,
+        "monto_format": formatear_importe_resumen_one2credit(monto),
+        "valor_aplicado": valor_aplicado,
+        "valor_aplicado_format": formatear_importe_resumen_one2credit(
+            valor_aplicado
+        ),
+        "completo": bool(pago.get("isCompletion")),
+    }
+
+
+def construir_cuota_inicial_compacta_one2credit(
+    credito: Dict[str, Any],
+    installments: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    evaluacion = evaluar_cuota_inicial_mora(credito, installments)
+    if not evaluacion.get("aplica"):
+        return None
+
+    valor = normalizar_importe_resumen_one2credit(evaluacion.get("amount"))
+    flow_payment = buscar_flow_payment_cuota_inicial(credito) or {}
+    pagos: List[Dict[str, Any]] = []
+    if evaluacion.get("approved"):
+        pagos.append(
+            {
+                "fecha": (
+                    evaluacion.get("approvedAt")
+                    or flow_payment.get("registeredAt")
+                    or flow_payment.get("referencedAt")
+                ),
+                "monto": valor,
+                "monto_format": formatear_importe_resumen_one2credit(valor),
+                "valor_aplicado": valor,
+                "valor_aplicado_format": formatear_importe_resumen_one2credit(
+                    valor
+                ),
+                "completo": True,
+            }
+        )
+
+    return {
+        "estado": evaluacion.get("estado"),
+        "valor": valor,
+        "valor_format": formatear_importe_resumen_one2credit(valor),
+        "pagos": pagos,
+    }
+
+
+def obtener_dias_mora_compacto_one2credit(credito: Dict[str, Any]) -> int:
+    installment_info = (
+        credito.get("installmentInfo")
+        if isinstance(credito.get("installmentInfo"), dict)
+        else {}
+    )
+    next_installment = (
+        installment_info.get("nextInstallment")
+        if isinstance(installment_info.get("nextInstallment"), dict)
+        else {}
+    )
+    summary = (
+        credito.get("summary")
+        if isinstance(credito.get("summary"), dict)
+        else {}
+    )
+    for valor in (
+        installment_info.get("debtDays"),
+        next_installment.get("daysOverdue"),
+        summary.get("debtDays"),
+    ):
+        if valor is not None:
+            return to_int(valor)
+    return 0
+
+
+def seleccionar_cuota_objetivo_one2credit(
+    installments: List[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    cuotas_ordenadas = sorted(
+        installments,
+        key=lambda cuota: (numero_cuota_int(cuota), str(cuota.get("date") or "")),
+    )
+    cuotas_vencidas = [
+        cuota for cuota in cuotas_ordenadas if status_cuota_int(cuota) == 4
+    ]
+    cuotas_pendientes = [
+        cuota for cuota in cuotas_ordenadas if status_cuota_int(cuota) == 3
+    ]
+
+    if cuotas_vencidas:
+        ultima_vencida = cuotas_vencidas[-1]
+        numero_ultima_vencida = numero_cuota_int(ultima_vencida)
+        pendientes_posteriores = [
+            cuota
+            for cuota in cuotas_pendientes
+            if numero_cuota_int(cuota) > numero_ultima_vencida
+        ]
+        if pendientes_posteriores:
+            return (
+                pendientes_posteriores[0],
+                "primera_pendiente_posterior_a_vencida",
+            )
+        return ultima_vencida, "ultima_vencida_fallback"
+
+    if cuotas_pendientes:
+        return cuotas_pendientes[0], "primera_pendiente"
+    return None, None
+
+
+def construir_cuota_compacta_one2credit(
+    cuota: Dict[str, Any],
+    es_objetivo: bool,
+) -> Dict[str, Any]:
+    estado = mapear_estado_cuota(cuota.get("status"))
+    valor = normalizar_importe_resumen_one2credit(cuota.get("payment"))
+    valor_pagado = normalizar_importe_resumen_one2credit(
+        cuota.get("valuePaid")
+    )
+    saldo_restante = calcular_saldo_restante_cuota_one2credit(cuota)
+    pagos_raw = cuota.get("payments")
+    pagos = (
+        [
+            construir_pago_compacto_one2credit(pago)
+            for pago in pagos_raw
+            if isinstance(pago, dict)
+        ]
+        if isinstance(pagos_raw, list)
+        else []
+    )
+    return {
+        "id": cuota.get("id"),
+        "numero": cuota.get("number"),
+        "estado": estado.get("estado_descripcion"),
+        "fecha_vencimiento": cuota.get("date"),
+        "fecha_pago_completo": cuota.get("paidAt"),
+        "valor": valor,
+        "valor_format": formatear_importe_resumen_one2credit(valor),
+        "valor_pagado": valor_pagado,
+        "valor_pagado_format": formatear_importe_resumen_one2credit(
+            valor_pagado
+        ),
+        "saldo_restante_aproximado": saldo_restante,
+        "saldo_restante_aproximado_format": formatear_importe_resumen_one2credit(
+            saldo_restante
+        ),
+        "es_objetivo": es_objetivo,
+        "pagos": pagos,
+    }
+
+
+def construir_credito_compacto_one2credit(
+    credito: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary = (
+        credito.get("summary")
+        if isinstance(credito.get("summary"), dict)
+        else {}
+    )
+    installments_raw = credito.get("installments")
+    installments = (
+        sorted(
+            [cuota for cuota in installments_raw if isinstance(cuota, dict)],
+            key=lambda cuota: (
+                numero_cuota_int(cuota),
+                str(cuota.get("date") or ""),
+            ),
+        )
+        if isinstance(installments_raw, list)
+        else []
+    )
+    cuota_objetivo, criterio_objetivo = seleccionar_cuota_objetivo_one2credit(
+        installments
+    )
+    valor_financiado = normalizar_importe_resumen_one2credit(
+        credito.get("principal")
+    )
+    valor_restante = normalizar_importe_resumen_one2credit(
+        summary.get("balance")
+    )
+    estado_credito = obtener_estado_credito_one2credit(credito)
+
+    return {
+        "id": credito.get("ID") or credito.get("id"),
+        "referencia": credito.get("reference"),
+        "estado": ESTADOS_CREDITO_ACTIVO_ONE2CREDIT.get(estado_credito),
+        "valor_financiado": valor_financiado,
+        "valor_financiado_format": formatear_importe_resumen_one2credit(
+            valor_financiado
+        ),
+        "valor_restante": valor_restante,
+        "valor_restante_format": formatear_importe_resumen_one2credit(
+            valor_restante
+        ),
+        "dias_mora": obtener_dias_mora_compacto_one2credit(credito),
+        "criterio_cuota_objetivo": criterio_objetivo,
+        "cuota_inicial": construir_cuota_inicial_compacta_one2credit(
+            credito,
+            installments,
+        ),
+        "cuotas": [
+            construir_cuota_compacta_one2credit(
+                cuota,
+                cuota is cuota_objetivo,
+            )
+            for cuota in installments
+        ],
+    }
+
+
+def extraer_credito_detalle_one2credit(
+    respuesta_detalle: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    data = (
+        respuesta_detalle.get("data")
+        if isinstance(respuesta_detalle, dict)
+        else None
+    )
+    if isinstance(data, dict) and isinstance(data.get("credit"), dict):
+        return data["credit"]
+    if isinstance(respuesta_detalle, dict) and isinstance(
+        respuesta_detalle.get("credit"), dict
+    ):
+        return respuesta_detalle["credit"]
+    return None
+
+
 async def consultar_creditos_one2credit_por_cedula(
     cedula: str,
     estados: Optional[List[int]] = None,
@@ -9709,12 +9940,27 @@ async def consultar_creditos_activos_one2credit_endpoint(
             },
         )
 
-    consulta = await consultar_creditos_one2credit_por_cedula(
-        cedula_limpia,
-        estados=list(ESTADOS_CREDITO_ACTIVO_ONE2CREDIT),
-        order="updated_at:desc",
-        status_counts=True,
-    )
+    try:
+        consulta = await consultar_creditos_one2credit_por_cedula(
+            cedula_limpia,
+            estados=list(ESTADOS_CREDITO_ACTIVO_ONE2CREDIT),
+            order="updated_at:desc",
+            status_counts=True,
+        )
+    except HTTPException as exc:
+        detalle_error = exc.detail if isinstance(exc.detail, dict) else {}
+        if (
+            exc.status_code == 404
+            and detalle_error.get("tipo_error")
+            == "credito_one2credit_no_encontrado"
+        ):
+            return {
+                "ok": True,
+                "cedula": cedula_limpia,
+                "total_creditos": 0,
+                "creditos": [],
+            }
+        raise
     creditos_consultados = consulta.get("creditos")
     if not isinstance(creditos_consultados, list):
         creditos_consultados = extraer_lista_creditos_one2credit(
@@ -9724,28 +9970,141 @@ async def consultar_creditos_activos_one2credit_endpoint(
     creditos_activos = seleccionar_creditos_activos_one2credit(
         creditos_consultados
     )
-    resultados = [
-        construir_credito_activo_one2credit(credito)
-        for credito in creditos_activos
-    ]
-    total_activos = len(resultados)
+    if not creditos_activos:
+        return {
+            "ok": True,
+            "cedula": cedula_limpia,
+            "total_creditos": 0,
+            "creditos": [],
+        }
 
-    if total_activos == 0:
-        tipo_resultado = "sin_creditos_activos"
-    elif total_activos == 1:
-        tipo_resultado = "credito_activo_unico"
-    else:
-        tipo_resultado = "multiples_creditos_activos"
+    try:
+        token = await obtener_token()
+        headers = construir_headers_kuenta_one2credit(token)
+    except Exception as exc:
+        logger.error(
+            "Error obteniendo token para detalle de creditos activos | cedula=%s | error=%s",
+            cedula_limpia,
+            str(exc),
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "ok": False,
+                "tipo_error": "error_detalle_credito_one2credit",
+                "msj": "Error al obtener la data, vuelva a consultar",
+                "cedula": cedula_limpia,
+                "id_credito": None,
+            },
+        )
+
+    ids_creditos = [
+        credito.get("ID") or credito.get("id") for credito in creditos_activos
+    ]
+    if any(not id_credito for id_credito in ids_creditos):
+        return JSONResponse(
+            status_code=502,
+            content={
+                "ok": False,
+                "tipo_error": "error_detalle_credito_one2credit",
+                "msj": "Error al obtener la data, vuelva a consultar",
+                "cedula": cedula_limpia,
+                "id_credito": next(
+                    (
+                        id_credito
+                        for id_credito in ids_creditos
+                        if not id_credito
+                    ),
+                    None,
+                ),
+            },
+        )
+
+    respuestas_detalle = await asyncio.gather(
+        *[
+            consultar_detalle_receivable_mora(
+                str(id_credito),
+                headers,
+                cedula_limpia,
+            )
+            for id_credito in ids_creditos
+        ],
+        return_exceptions=True,
+    )
+
+    creditos_detallados: List[Dict[str, Any]] = []
+    for credito_lista, id_credito, respuesta_detalle in zip(
+        creditos_activos,
+        ids_creditos,
+        respuestas_detalle,
+    ):
+        if isinstance(respuesta_detalle, Exception):
+            logger.error(
+                "Error consultando detalle de credito activo | cedula=%s | id_credito=%s | error=%s",
+                cedula_limpia,
+                id_credito,
+                str(respuesta_detalle),
+            )
+            detalle_status = None
+            credito_detallado = None
+        else:
+            detalle_status = respuesta_detalle.get("status")
+            credito_detallado = extraer_credito_detalle_one2credit(
+                respuesta_detalle.get("data", {})
+            )
+
+        id_credito_detallado = (
+            credito_detallado.get("ID") or credito_detallado.get("id")
+            if isinstance(credito_detallado, dict)
+            else None
+        )
+        if (
+            detalle_status != 200
+            or not credito_detallado
+            or str(id_credito_detallado) != str(id_credito)
+        ):
+            logger.error(
+                "Detalle de credito activo invalido | cedula=%s | id_credito=%s | status=%s | id_recibido=%s",
+                cedula_limpia,
+                id_credito,
+                detalle_status,
+                id_credito_detallado,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "ok": False,
+                    "tipo_error": "error_detalle_credito_one2credit",
+                    "msj": "Error al obtener la data, vuelva a consultar",
+                    "cedula": cedula_limpia,
+                    "id_credito": id_credito,
+                },
+            )
+        credito_enriquecido = dict(credito_lista)
+        credito_enriquecido.update(credito_detallado)
+        if (
+            obtener_estado_credito_one2credit(credito_enriquecido)
+            not in ESTADOS_CREDITO_ACTIVO_ONE2CREDIT
+        ):
+            logger.info(
+                "Credito excluido porque dejo de estar activo al consultar el detalle | cedula=%s | id_credito=%s | estado=%s",
+                cedula_limpia,
+                id_credito,
+                credito_enriquecido.get("status"),
+            )
+            continue
+        creditos_detallados.append(credito_enriquecido)
+
+    resultados = [
+        construir_credito_compacto_one2credit(credito)
+        for credito in creditos_detallados
+    ]
 
     return {
         "ok": True,
         "cedula": cedula_limpia,
-        "tipo_resultado": tipo_resultado,
-        "estados_considerados_activos": ESTADOS_CREDITO_ACTIVO_ONE2CREDIT,
-        "total_creditos_consultados": len(creditos_consultados),
-        "total_creditos_activos": total_activos,
-        "credito_seleccionado": resultados[0] if total_activos == 1 else None,
-        "creditos_activos": resultados,
+        "total_creditos": len(resultados),
+        "creditos": resultados,
     }
 
 
